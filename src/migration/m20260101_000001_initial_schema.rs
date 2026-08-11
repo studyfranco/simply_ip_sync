@@ -1,0 +1,564 @@
+//! Initial schema: all 9 `SCHEMA.MD` tables, their foreign keys, and the mandatory indexes.
+//! `api_keys.master_marker` is added separately by
+//! `m20260101_000002_derive_master_marker`, since a generated column cannot be expressed through
+//! `ColumnDef` and must be raw DDL.
+
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(ApiKeys::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(ApiKeys::Id).uuid().not_null().primary_key())
+                    .col(ColumnDef::new(ApiKeys::Name).string().not_null())
+                    .col(ColumnDef::new(ApiKeys::KeyHash).string().not_null().unique_key())
+                    .col(ColumnDef::new(ApiKeys::SigningSecret).text())
+                    .col(ColumnDef::new(ApiKeys::Prefix).string().not_null())
+                    .col(
+                        ColumnDef::new(ApiKeys::IsMaster)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeys::CanManageKeys)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeys::CanManageSources)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeys::CanManageVaults)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(ColumnDef::new(ApiKeys::ParentKeyId).uuid())
+                    .col(ColumnDef::new(ApiKeys::BoundIps).text())
+                    .col(ColumnDef::new(ApiKeys::CreatedAt).timestamp_with_time_zone().not_null())
+                    .col(ColumnDef::new(ApiKeys::UpdatedAt).timestamp_with_time_zone().not_null())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-api_keys-prefix")
+                    .table(ApiKeys::Table)
+                    .col(ApiKeys::Prefix)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-api_keys-parent_key_id")
+                    .table(ApiKeys::Table)
+                    .col(ApiKeys::ParentKeyId)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(VaultEndpoints::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(VaultEndpoints::Id).uuid().not_null().primary_key())
+                    .col(ColumnDef::new(VaultEndpoints::Name).string().not_null().unique_key())
+                    .col(ColumnDef::new(VaultEndpoints::TargetUrl).string().not_null())
+                    .col(ColumnDef::new(VaultEndpoints::ApiKey).text().not_null())
+                    .col(ColumnDef::new(VaultEndpoints::SigningSecret).text().not_null())
+                    .col(ColumnDef::new(VaultEndpoints::Description).text())
+                    .col(ColumnDef::new(VaultEndpoints::OwnerKeyId).uuid())
+                    .col(
+                        ColumnDef::new(VaultEndpoints::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultEndpoints::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-vault_endpoints-owner_key_id")
+                    .table(VaultEndpoints::Table)
+                    .col(VaultEndpoints::OwnerKeyId)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ExternalSources::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(ExternalSources::Id).uuid().not_null().primary_key())
+                    .col(ColumnDef::new(ExternalSources::Name).string().not_null().unique_key())
+                    .col(ColumnDef::new(ExternalSources::SourceUrl).string().not_null())
+                    .col(
+                        ColumnDef::new(ExternalSources::ParserType)
+                            .string()
+                            .not_null()
+                            .default("REGEX_LINE"),
+                    )
+                    .col(ColumnDef::new(ExternalSources::ParserConfigJson).text())
+                    .col(ColumnDef::new(ExternalSources::CronSchedule).string().not_null())
+                    .col(ColumnDef::new(ExternalSources::TargetGroupName).string().not_null())
+                    .col(
+                        ColumnDef::new(ExternalSources::Mode)
+                            .string()
+                            .not_null()
+                            .default("upsert"),
+                    )
+                    .col(
+                        ColumnDef::new(ExternalSources::IsActive)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(ColumnDef::new(ExternalSources::LastRunAt).timestamp_with_time_zone())
+                    .col(ColumnDef::new(ExternalSources::OwnerKeyId).uuid())
+                    .col(
+                        ColumnDef::new(ExternalSources::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ExternalSources::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-external_sources-owner_key_id")
+                    .table(ExternalSources::Table)
+                    .col(ExternalSources::OwnerKeyId)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ExternalSourceVaultTargets::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(ExternalSourceVaultTargets::ExternalSourceId).uuid().not_null())
+                    .col(ColumnDef::new(ExternalSourceVaultTargets::VaultEndpointId).uuid().not_null())
+                    .col(ColumnDef::new(ExternalSourceVaultTargets::TargetGroupName).text())
+                    .primary_key(
+                        Index::create()
+                            .col(ExternalSourceVaultTargets::ExternalSourceId)
+                            .col(ExternalSourceVaultTargets::VaultEndpointId),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-esvt-external_source")
+                            .from(ExternalSourceVaultTargets::Table, ExternalSourceVaultTargets::ExternalSourceId)
+                            .to(ExternalSources::Table, ExternalSources::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-esvt-vault_endpoint")
+                            .from(ExternalSourceVaultTargets::Table, ExternalSourceVaultTargets::VaultEndpointId)
+                            .to(VaultEndpoints::Table, VaultEndpoints::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(VaultSyncTasks::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(VaultSyncTasks::Id).uuid().not_null().primary_key())
+                    .col(ColumnDef::new(VaultSyncTasks::Name).string().not_null().unique_key())
+                    .col(ColumnDef::new(VaultSyncTasks::SourceVaultId).uuid().not_null())
+                    .col(ColumnDef::new(VaultSyncTasks::SourceGroupName).string().not_null())
+                    .col(ColumnDef::new(VaultSyncTasks::TargetGroupName).string().not_null())
+                    .col(ColumnDef::new(VaultSyncTasks::CronSchedule).string().not_null())
+                    .col(ColumnDef::new(VaultSyncTasks::LastSyncAt).timestamp_with_time_zone())
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::Mode)
+                            .string()
+                            .not_null()
+                            .default("upsert"),
+                    )
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::IsActive)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(ColumnDef::new(VaultSyncTasks::OwnerKeyId).uuid())
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-vault_sync_tasks-source_vault")
+                            .from(VaultSyncTasks::Table, VaultSyncTasks::SourceVaultId)
+                            .to(VaultEndpoints::Table, VaultEndpoints::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-vault_sync_tasks-owner_key_id")
+                    .table(VaultSyncTasks::Table)
+                    .col(VaultSyncTasks::OwnerKeyId)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(VaultSyncTaskTargets::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(VaultSyncTaskTargets::VaultSyncTaskId).uuid().not_null())
+                    .col(ColumnDef::new(VaultSyncTaskTargets::TargetVaultId).uuid().not_null())
+                    .col(ColumnDef::new(VaultSyncTaskTargets::TargetGroupName).text())
+                    .primary_key(
+                        Index::create()
+                            .col(VaultSyncTaskTargets::VaultSyncTaskId)
+                            .col(VaultSyncTaskTargets::TargetVaultId),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-vstt-vault_sync_task")
+                            .from(VaultSyncTaskTargets::Table, VaultSyncTaskTargets::VaultSyncTaskId)
+                            .to(VaultSyncTasks::Table, VaultSyncTasks::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-vstt-target_vault")
+                            .from(VaultSyncTaskTargets::Table, VaultSyncTaskTargets::TargetVaultId)
+                            .to(VaultEndpoints::Table, VaultEndpoints::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ApiKeySyncPermissions::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(ApiKeySyncPermissions::Id).uuid().not_null().primary_key())
+                    .col(ColumnDef::new(ApiKeySyncPermissions::ApiKeyId).uuid().not_null())
+                    .col(ColumnDef::new(ApiKeySyncPermissions::ResourceType).string().not_null())
+                    .col(ColumnDef::new(ApiKeySyncPermissions::ResourceId).uuid().not_null())
+                    .col(
+                        ColumnDef::new(ApiKeySyncPermissions::CanSync)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeySyncPermissions::CanManage)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeySyncPermissions::CanViewLogs)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeySyncPermissions::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-aksp-api_key")
+                            .from(ApiKeySyncPermissions::Table, ApiKeySyncPermissions::ApiKeyId)
+                            .to(ApiKeys::Table, ApiKeys::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-api_key_sync_permissions-unique")
+                    .table(ApiKeySyncPermissions::Table)
+                    .col(ApiKeySyncPermissions::ApiKeyId)
+                    .col(ApiKeySyncPermissions::ResourceType)
+                    .col(ApiKeySyncPermissions::ResourceId)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(SyncLogs::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(SyncLogs::Id).uuid().not_null().primary_key())
+                    .col(ColumnDef::new(SyncLogs::JobType).string().not_null())
+                    .col(ColumnDef::new(SyncLogs::JobId).uuid().not_null())
+                    .col(ColumnDef::new(SyncLogs::JobName).string().not_null())
+                    .col(ColumnDef::new(SyncLogs::Status).string().not_null())
+                    .col(
+                        ColumnDef::new(SyncLogs::ItemsProcessed)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(SyncLogs::ChunksSent)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(ColumnDef::new(SyncLogs::DurationMs).integer().not_null())
+                    .col(ColumnDef::new(SyncLogs::ErrorMessage).text())
+                    .col(ColumnDef::new(SyncLogs::Timestamp).timestamp_with_time_zone().not_null())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-sync_logs-job_type_job_id")
+                    .table(SyncLogs::Table)
+                    .col(SyncLogs::JobType)
+                    .col(SyncLogs::JobId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-sync_logs-timestamp")
+                    .table(SyncLogs::Table)
+                    .col(SyncLogs::Timestamp)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(AuditLogs::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(AuditLogs::Id).uuid().not_null().primary_key())
+                    .col(ColumnDef::new(AuditLogs::ApiKeyId).uuid())
+                    .col(ColumnDef::new(AuditLogs::ApiKeyName).string())
+                    .col(ColumnDef::new(AuditLogs::ApiKeyPrefix).string())
+                    .col(ColumnDef::new(AuditLogs::ClientIp).string())
+                    .col(ColumnDef::new(AuditLogs::Action).string().not_null())
+                    .col(ColumnDef::new(AuditLogs::TargetResource).string())
+                    .col(ColumnDef::new(AuditLogs::Details).text())
+                    .col(ColumnDef::new(AuditLogs::Timestamp).timestamp_with_time_zone().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-audit_logs-api_key")
+                            .from(AuditLogs::Table, AuditLogs::ApiKeyId)
+                            .to(ApiKeys::Table, ApiKeys::Id)
+                            .on_delete(ForeignKeyAction::SetNull),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx-audit_logs-action_timestamp")
+                    .table(AuditLogs::Table)
+                    .col(AuditLogs::Action)
+                    .col(AuditLogs::Timestamp)
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager.drop_table(Table::drop().table(AuditLogs::Table).to_owned()).await?;
+        manager.drop_table(Table::drop().table(SyncLogs::Table).to_owned()).await?;
+        manager
+            .drop_table(Table::drop().table(ApiKeySyncPermissions::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(VaultSyncTaskTargets::Table).to_owned())
+            .await?;
+        manager.drop_table(Table::drop().table(VaultSyncTasks::Table).to_owned()).await?;
+        manager
+            .drop_table(Table::drop().table(ExternalSourceVaultTargets::Table).to_owned())
+            .await?;
+        manager.drop_table(Table::drop().table(ExternalSources::Table).to_owned()).await?;
+        manager.drop_table(Table::drop().table(VaultEndpoints::Table).to_owned()).await?;
+        manager.drop_table(Table::drop().table(ApiKeys::Table).to_owned()).await?;
+        Ok(())
+    }
+}
+
+#[derive(DeriveIden)]
+enum ApiKeys {
+    Table,
+    Id,
+    Name,
+    KeyHash,
+    SigningSecret,
+    Prefix,
+    IsMaster,
+    CanManageKeys,
+    CanManageSources,
+    CanManageVaults,
+    ParentKeyId,
+    BoundIps,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum VaultEndpoints {
+    Table,
+    Id,
+    Name,
+    TargetUrl,
+    ApiKey,
+    SigningSecret,
+    Description,
+    OwnerKeyId,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum ExternalSources {
+    Table,
+    Id,
+    Name,
+    SourceUrl,
+    ParserType,
+    ParserConfigJson,
+    CronSchedule,
+    TargetGroupName,
+    Mode,
+    IsActive,
+    LastRunAt,
+    OwnerKeyId,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum ExternalSourceVaultTargets {
+    Table,
+    ExternalSourceId,
+    VaultEndpointId,
+    TargetGroupName,
+}
+
+#[derive(DeriveIden)]
+enum VaultSyncTasks {
+    Table,
+    Id,
+    Name,
+    SourceVaultId,
+    SourceGroupName,
+    TargetGroupName,
+    CronSchedule,
+    LastSyncAt,
+    Mode,
+    IsActive,
+    OwnerKeyId,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum VaultSyncTaskTargets {
+    Table,
+    VaultSyncTaskId,
+    TargetVaultId,
+    TargetGroupName,
+}
+
+#[derive(DeriveIden)]
+enum ApiKeySyncPermissions {
+    Table,
+    Id,
+    ApiKeyId,
+    ResourceType,
+    ResourceId,
+    CanSync,
+    CanManage,
+    CanViewLogs,
+    CreatedAt,
+}
+
+#[derive(DeriveIden)]
+enum SyncLogs {
+    Table,
+    Id,
+    JobType,
+    JobId,
+    JobName,
+    Status,
+    ItemsProcessed,
+    ChunksSent,
+    DurationMs,
+    ErrorMessage,
+    Timestamp,
+}
+
+#[derive(DeriveIden)]
+enum AuditLogs {
+    Table,
+    Id,
+    ApiKeyId,
+    ApiKeyName,
+    ApiKeyPrefix,
+    ClientIp,
+    Action,
+    TargetResource,
+    Details,
+    Timestamp,
+}

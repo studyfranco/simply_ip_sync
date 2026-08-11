@@ -1,0 +1,168 @@
+# Simply IP Sync - AI Agent Context & Directives
+
+Hello AI Agent! You are assisting with the development of `simply_ip_sync`. Read and strictly adhere to these guidelines before inspecting or writing any code.
+
+---
+
+## 📄 Document & Context Hierarchy
+
+1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, in-memory cache design, and testing directives.
+2. **`SCHEMA.MD`**: Official Database Schema (configuration only), SeaORM Entity relations, and Enum specifications.
+3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
+4. **`example/`**: Reference implementations from linked projects (`simply_ip_vault`, `simply_hook_executor`).
+
+---
+
+## 🔄 Peer Repository Synchronization
+
+`example/` holds live checkouts of the peer projects this service converges against
+(`simply_ip_vault`, `simply_hook_executor`), each its own git repository with a configured
+`origin`. Their working trees can go stale between sessions — a peer's `AGENT.MD`, `RBAC_MODEL.md`,
+or source may have moved on since the last checkout in this tree was made.
+
+**Mandatory:** before reading any file under `example/<peer_repo>/` for the purpose of an audit,
+structural/security comparison, or convergence analysis, run:
+
+```sh
+git -C example/<peer_repo> pull
+```
+
+for every peer repo you are about to consult. Skipping this and analyzing a stale checkout risks
+comparing against code the peer project has already changed, producing a "convergence" report that
+is convergent with the past rather than the present. This does not apply to routine work that
+merely *uses* `example/` as a pattern reference during normal feature implementation (as opposed to
+producing a comparison/audit artifact) — use judgment, but default to pulling first when in doubt.
+
+`scripts/verify_convergence.sh` automates this at the start of every run for any `example/*`
+directory that contains a `.git` — see that script for the graceful offline-mode fallback.
+
+---
+
+## 🎯 Project Overview
+
+`simply_ip_sync` is an enterprise-grade threat intelligence ingestion orchestrator and multi-site inter-vault replication daemon written in Rust. It serves as the active synchronization engine in the ecosystem:
+- **External Feeds Ingestion:** Periodically downloads, parses, and cleans threat lists from external HTTP/HTTPS sources (e.g., Spamhaus, FireHOL, AbuseIPDB JSON) and pushes them in batch to one or multiple target `simply_ip_vault` instances.
+- **Inter-Vault Replication:** Orchestrates delta-based replication between pairs of `simply_ip_vault` instances using temporal filtering (`since`) and tombstone handling (`is_deleted`, `deleted_at`).
+- **Control & Audit:** Exposes a Vanilla JS dashboard and a REST API protected by full HMAC-SHA256 authentication and granular RBAC, allowing manual triggers of sync jobs on demand by authorized keys.
+
+---
+
+## 🛠️ Tech Stack & Constraints
+
+- **Backend:** Rust + Axum (0.8+) + Tokio (1.x).
+- **Default Port:** `3003` (`BIND_HOST` / `PORT`).
+- **Encryption Key:** `SYNC_ENCRYPTION_KEY` (XChaCha20-Poly1305, 64 hex characters).
+- **ORM (SQL-Agnostic):** SeaORM (2.0+). Defaults to **SQLite** for zero-config local development/testing, but MUST remain strictly **SQL-agnostic** (PostgreSQL-ready). **Never write vendor-specific raw SQL queries.**
+  - **Zero raw SQL for DML in `src/`.** Use typed entity methods (`Entity::find()`, `ActiveModel`) or SeaQuery builders.
+  - Exceptions: `src/migration/` for DDL generated columns, and SQLite `PRAGMA` setup in `src/db.rs`.
+- **Database Setup (`src/db.rs`):** SQLite connection pool pinned to `max_connections = 1` with 4 WAL session pragmas (`foreign_keys=ON`, `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`).
+- **Frontend:** STRICTLY Vanilla JS, HTML5, and CSS3. **NO external dependencies** (No React, Vue, Tailwind, Bootstrap, CDN links, or Axios). Native `fetch()` only.
+- **Quality & Safety:**
+  - Zero compiler warnings, zero `clippy` warnings.
+  - **Zero `.unwrap()` or `.expect()`** in production or HTTP handlers. Use structured `AppError` and Axum's `IntoResponse`.
+  - **Mandatory `rustdoc`**: Document all public items with `///`. Enforce `#![warn(missing_docs)]` in `lib.rs`.
+
+---
+
+## 🏛️ Core Architectural Rules
+
+### 1. Security & Network (Zero-Trust)
+
+#### Inbound Requests (To `simply_ip_sync`)
+- **Middleware Protection:** All `/api/*` routes pass through custom authentication middleware (`src/middleware.rs`).
+- **Authentication (HMAC-SHA256):** Every inbound request MUST carry **three** headers:
+  - `X-API-Key`: Plaintext API Key (matched via Argon2/SHA-256 hash).
+  - `X-Timestamp`: UTC Unix time in seconds.
+  - `X-Signature-256`: `sha256=<hex>` HMAC over `CANONICAL_V1` string (`METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`).
+- **Anti-Replay Guard:** Monotonic 300-second symmetric freshness window + raw digest single-use cache (`replay::ReplayGuard`).
+- **Secrets at Rest (`SYNC_ENCRYPTION_KEY`):** Encrypt stored API key signing secrets AND remote Vault credentials (`signing_secret` of `vault_endpoints`) using **XChaCha20-Poly1305** (`v1.xchacha20poly1305.<nonce>.<ct>`). Requires 64 hex character key.
+- **CIDR Restriction & IP Extraction:** Standard `bound_ips` verification and right-to-left `TRUSTED_PROXIES` header parsing.
+
+#### Outbound Requests (From `simply_ip_sync` to remote `ip_vault` endpoints)
+- When communicating with remote `ip_vault` instances, `simply_ip_sync` acts as a client and MUST generate valid `CANONICAL_V1` HMAC signatures (`X-API-Key`, `X-Timestamp`, `X-Signature-256`) using the stored `api_key` and decrypted `signing_secret` of the target `vault_endpoint`.
+
+#### IP Extraction & Trusted Proxies
+- Respect `X-Forwarded-For` / `X-Real-IP` **only** when TCP peer is in `TRUSTED_PROXIES`.
+- Walk `X-Forwarded-For` right-to-left, skipping trusted proxy hops.
+- Invalid syntax in `TRUSTED_PROXIES` is fatal at startup.
+
+---
+
+### 2. Extensible Parsing Engine (External Sources)
+
+`simply_ip_sync` supports fetching external threat intelligence over HTTP/HTTPS with modular parsers:
+
+1. **`REGEX_LINE` (Text / Line-by-Line):**
+   - Strips comments (lines starting with `#`, `;`, `//`).
+   - Extracts valid IPv4/IPv6 addresses and CIDR subnets using strict IP regex patterns line by line.
+2. **`JSON_PATH` (Structured JSON):**
+   - Parses JSON payloads (e.g., AbuseIPDB API response, pfSense JSON exports).
+   - Configured via `parser_config_json` containing the JSON path/pointer to the array of items and target key field (e.g., `{"array_path": "data", "ip_field": "ipAddress"}`).
+3. **Extensible Trait (`FeedParser`):**
+   - Modular architecture allowing simple addition of future parsers (e.g., CSV, XML, STIX/TAXII).
+
+---
+
+### 3. Synchronization & Ingestion Pipeline
+
+#### A. External Ingestion Pipeline
+1. **Fetch:** HTTP GET to `external_sources.source_url` with optional custom headers/user-agent.
+2. **Parse:** Execute configured `FeedParser` to extract normalized IP/CIDR strings.
+3. **Chunking & Batching:** Split extracted records into chunks of **5,000 items maximum** to comply with `ip_vault`'s `MAX_REQUEST_BODY_BYTES` (3 MiB limit).
+4. **Push:** Send each chunk via `POST /api/records/batch` in mode `"upsert"` to all associated target `vault_endpoints` (defined in `external_source_vault_targets`). Mode is strictly `"upsert"` to preserve deleted entries in `ip_vault` for the full retention period (92 days).
+5. **Log:** Write detailed outcome to `sync_logs`.
+
+#### B. Inter-Vault Sync Pipeline (Vault-to-Vault Delta)
+1. **Fetch Delta:** Query source Vault via `GET /api/ips?group_name=X&since=<last_sync_at>&include_deleted=true`.
+2. **Chunking & Batching:** Group incoming delta records (including soft-deleted tombstones) into lots of 5,000 records.
+3. **Replicate:** Post chunked payload to `POST /api/records/batch` in mode `"upsert"` on all target Vaults (defined in `vault_sync_task_targets`).
+4. **Timestamp Update:** On success across all targets, update `vault_sync_tasks.last_sync_at` to the job start timestamp.
+
+---
+
+### 4. Scheduler & Manual Execution
+
+- **Background Cron Scheduler:** Uses an in-process async scheduler (`tokio-cron-scheduler`) reading active `external_sources` and `vault_sync_tasks` schedules.
+- **Manual Trigger Endpoints:**
+  - `POST /api/sources/{id}/trigger`
+  - `POST /api/sync-tasks/{id}/trigger`
+- **Execution Rights:** Non-master keys holding `can_sync = true` permission on a specific source or sync task can manually trigger immediate execution outside the cron schedule.
+
+---
+
+### 5. Granular Multi-Tenant RBAC (M:N)
+
+Implements `RBAC_MODEL.md` (Master / Parent / Daughter):
+- **Master (`is_master`):** Full administrative rights. Identity pinned at boot. Single master enforced via database-generated `master_marker`.
+- **Parent (`can_manage_keys`):** Can manage Daughter keys and assign resource permissions up to its own scope.
+- **Daughter:** Cannot create keys. Can hold operational rights (`can_sync`, `can_manage`, `can_view_logs`) on specific sources, sync tasks, or vault endpoints via `api_key_sync_permissions`.
+- **Conjunction (R2):** Managing a resource's permissions requires global `can_manage_keys` **AND** `can_manage = true` on that resource's permission row.
+
+---
+
+### 6. Audit Trail
+
+Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync Task CRUD, Permission updates) writes an entry to `audit_logs` storing denormalized actor details (`api_key_id`, `api_key_name`, `api_key_prefix`, `client_ip`), `action`, `target_resource`, and timestamp.
+
+---
+
+## 🌐 Public Probes
+
+- `GET /health` or `/healthz`: Liveness probe (HTTP 200 `{"status":"ok","service":"simply_ip_sync"}`). No DB query.
+- `GET /ready` or `/readyz`: Readiness probe (HTTP 200 if DB is up and master key pinned, HTTP 503 otherwise).
+
+---
+
+## 🧪 Testing & Validation Standards
+
+- **Integration Tests:** Located in `tests/`. SQLite in-memory (`sqlite::memory:`).
+- **Required Coverage:**
+  1. Inbound HMAC validation & anti-replay tests.
+  2. Outbound HMAC signature generation correctness against mock `ip_vault` endpoints.
+  3. External feed parsing correctness (`REGEX_LINE` and `JSON_PATH`).
+  4. Batch chunking (verifying payloads never exceed 5,000 records).
+  5. Inter-vault delta replication and tombstone propagation.
+  6. Manual trigger permissions (`can_sync` vs unauthorized 403).
+  7. Adversarial infrastructure tests (`ADVERSARIAL(§N)` for master uniqueness).
+
+*End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*

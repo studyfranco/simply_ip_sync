@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simply_ip_sync</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="panel">
+    <div class="panel-header"><h2>simply_ip_sync</h2></div>
+    <p style="color:var(--text-dim);font-size:13px;">Sign in with an API key and its signing secret. Credentials are kept only in this browser tab's memory.</p>
+    <form id="login-form" class="inline-form">
+      <label class="span-2">API Key
+        <input type="text" id="login-api-key" autocomplete="off" required>
+      </label>
+      <label class="span-2">Signing Secret
+        <input type="text" id="login-signing-secret" autocomplete="off" required>
+      </label>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Sign in</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>simply_ip_sync <span class="sub">threat sync orchestrator</span></h1>
+    <div id="identity"></div>
+  </header>
+  <nav id="tabs">
+    <button data-tab="sources" class="active">Sources</button>
+    <button data-tab="sync-tasks">Sync Tasks</button>
+    <button data-tab="vaults">Vaults</button>
+    <button data-tab="keys">Keys</button>
+    <button data-tab="sync-logs">Sync Logs</button>
+    <button data-tab="audit-logs">Audit Logs</button>
+  </nav>
+  <main>
+    <section id="tab-sources" class="tab-panel"></section>
+    <section id="tab-sync-tasks" class="tab-panel hidden"></section>
+    <section id="tab-vaults" class="tab-panel hidden"></section>
+    <section id="tab-keys" class="tab-panel hidden"></section>
+    <section id="tab-sync-logs" class="tab-panel hidden"></section>
+    <section id="tab-audit-logs" class="tab-panel hidden"></section>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
