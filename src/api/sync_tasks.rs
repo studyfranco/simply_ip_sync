@@ -178,6 +178,8 @@ pub async fn create_vault_sync_task(
     StrictJson(payload): StrictJson<CreateVaultSyncTaskPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_resource_creation(&caller, caller.can_manage_vaults)?;
+    crate::scheduler::validate_cron_expression(&payload.cron_schedule)
+        .map_err(|e| AppError::InvalidInput(format!("invalid cron_schedule: {e}")))?;
 
     let now = Utc::now();
     let id = Uuid::new_v4();
@@ -234,6 +236,11 @@ pub async fn update_vault_sync_task(
     let existing = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     let permission = find_permission(&state.db, caller.id, RESOURCE_SYNC_TASK, id).await?;
     guard_resource_manage(&caller, permission.as_ref())?;
+
+    if let Some(cron) = &payload.cron_schedule {
+        crate::scheduler::validate_cron_expression(cron)
+            .map_err(|e| AppError::InvalidInput(format!("invalid cron_schedule: {e}")))?;
+    }
 
     let txn = state.db.begin().await?;
     let mut active: vault_sync_task::ActiveModel = existing.into();

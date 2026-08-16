@@ -24,6 +24,26 @@ fn normalize_cron(expr: &str) -> String {
     }
 }
 
+/// Validates a `cron_schedule` string the same way `normalize_cron` plus the scheduler's own
+/// parser will interpret it, so anything this function accepts is guaranteed schedulable and
+/// anything it rejects genuinely could never run. Called from the `POST`/`PATCH` handlers in
+/// `api/sources.rs` and `api/sync_tasks.rs` *before* any database write, so a malformed
+/// expression never reaches persistence — a source or task that can never be scheduled is not a
+/// source or task, it is silent data corruption waiting to be noticed at the next cron tick that
+/// never comes.
+pub fn validate_cron_expression(expr: &str) -> Result<(), String> {
+    if expr.trim().is_empty() {
+        return Err("cron_schedule must not be empty".to_owned());
+    }
+    let normalized = normalize_cron(expr);
+    croner::Cron::new(&normalized)
+        .with_seconds_required()
+        .with_dom_and_dow()
+        .parse()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Wraps a running `JobScheduler` plus the mapping from this service's own resource ids to the
 /// scheduler's internal job ids, so a resource can be rescheduled or removed by its own id.
 pub struct SchedulerHandle {
@@ -166,5 +186,26 @@ mod tests {
     #[test]
     fn normalize_cron_leaves_6_field_expression_unchanged() {
         assert_eq!(normalize_cron("*/30 * * * * *"), "*/30 * * * * *");
+    }
+
+    #[test]
+    fn validate_cron_expression_accepts_conventional_5_field_forms() {
+        assert!(validate_cron_expression("0 0 * * *").is_ok());
+        assert!(validate_cron_expression("*/15 * * * *").is_ok());
+        assert!(validate_cron_expression("0 3 * * 1").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_expression_accepts_6_field_forms() {
+        assert!(validate_cron_expression("0 */5 * * * *").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_expression_rejects_garbage() {
+        assert!(validate_cron_expression("invalid_cron").is_err());
+        assert!(validate_cron_expression("* * *").is_err());
+        assert!(validate_cron_expression("").is_err());
+        assert!(validate_cron_expression("   ").is_err());
+        assert!(validate_cron_expression("99 99 99 * *").is_err());
     }
 }

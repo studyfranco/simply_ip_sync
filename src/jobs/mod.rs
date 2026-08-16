@@ -2,6 +2,7 @@
 //! Both are plain async functions taking `(&AppState, Uuid)`, callable identically from the cron
 //! scheduler and from the manual-trigger HTTP handlers.
 
+pub mod decompress;
 pub mod external_ingestion;
 pub mod vault_sync;
 

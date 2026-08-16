@@ -104,6 +104,21 @@ async fn execute(
         }
     };
 
+    // Transparent to every parser type: a feed distributed as a `.zip` (e.g. StopForumSpam's
+    // downloads) is decompressed here, before any parser ever sees it.
+    let body = match super::decompress::decompress_if_zip(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            return JobSummary {
+                status: "FAILED",
+                items_processed: 0,
+                chunks_sent: 0,
+                duration_ms: start.elapsed().as_millis() as i32,
+                error_message: Some(e.to_string()),
+            };
+        }
+    };
+
     let effective_config = source.parser_config_json.clone();
 
     let parser = match parsers::for_type(&source.parser_type) {

@@ -75,14 +75,26 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     };
 
     let cipher = simply_ip_sync::crypto::SecretCipher::from_env()?;
-    let signing_secret = simply_ip_sync::crypto::generate_signing_secret();
-    // Rotation is refused for the Master key through the API (RBAC §5: rotation always returns a
-    // fresh credential, and the Master's is never reachable that way). This log line is therefore
-    // the only time this secret is ever knowable — it must be surfaced unconditionally, not only
-    // in the generated-key branch above.
-    tracing::warn!(
-        "Master signing secret (X-Signature-256 HMAC key) — save this now, it cannot be recovered or rotated: {signing_secret}"
-    );
+    let signing_secret = match std::env::var(simply_ip_sync::config::INITIAL_MASTER_SIGNING_SECRET_ENV) {
+        Ok(raw) => {
+            simply_ip_sync::config::validate_initial_master_signing_secret(&raw)?;
+            raw
+        }
+        Err(_) => {
+            let generated = simply_ip_sync::crypto::generate_signing_secret();
+            // Rotation is refused for the Master key through the API (RBAC §5: rotation always
+            // returns a fresh credential, and the Master's is never reachable that way). This log
+            // line is therefore the only time a *generated* secret is ever knowable — it must be
+            // surfaced unconditionally in this branch. (When the operator supplied one via
+            // INITIAL_MASTER_SIGNING_SECRET instead, they already have it and logging it back
+            // would just be needless secret exposure in the log stream.)
+            tracing::warn!(
+                "No {} set; generated a one-time Master signing secret. This will not be shown again: {generated}",
+                simply_ip_sync::config::INITIAL_MASTER_SIGNING_SECRET_ENV
+            );
+            generated
+        }
+    };
     let now = Utc::now();
 
     let model = api_key::ActiveModel {

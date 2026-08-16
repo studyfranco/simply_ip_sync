@@ -55,12 +55,14 @@ RUST_LOG=info \
 
 On first boot, if no Master key exists yet, the service bootstraps one:
 - If `INITIAL_MASTER_KEY` is set, it becomes the Master's plaintext API key (must be exactly 64
-  hex characters).
-- Otherwise, a random one is generated and logged **once** — copy it immediately, it is never
-  shown again.
-- The Master's HMAC **signing secret** is always freshly generated at bootstrap and logged once,
-  regardless of which path above was taken — rotation is refused for the Master key through the
-  API (see `RBAC_MODEL.md` §5), so this log line is the only time it is ever knowable.
+  hex characters). Otherwise, a random one is generated and logged **once** — copy it
+  immediately, it is never shown again.
+- Likewise, if `INITIAL_MASTER_SIGNING_SECRET` is set, it becomes the Master's HMAC signing
+  secret; otherwise one is generated and logged once. Rotation is refused for the Master key
+  through the API (see `RBAC_MODEL.md` §5), so whichever path is taken, that log line (or the
+  env var you set) is the only way this secret is ever knowable. Setting both env vars
+  deterministically is mainly useful for test harnesses (e.g. `scripts/test_e2e.sh`) that need to
+  sign requests as Master without scraping a redirected server log.
 
 Open `http://<host>:3003/` for the dashboard, or drive the API directly (see **Signing a request
 by hand** below).
@@ -74,6 +76,7 @@ by hand** below).
 | `DATABASE_URL` | `sqlite://simply_ip_sync.db?mode=rwc` | SeaORM connection string. SQLite, PostgreSQL, and MySQL are supported; SQLite is pinned to a single pooled connection with WAL/NORMAL/foreign_keys pragmas. |
 | `SYNC_ENCRYPTION_KEY` | *(unset)* | 64 hex character XChaCha20-Poly1305 key. When unset, secrets are stored under a self-describing plaintext envelope (`v1.plain.<hex>`) rather than failing to boot — set this in production. |
 | `INITIAL_MASTER_KEY` | *(unset)* | Bootstrap Master API key. Must be exactly 64 hex characters if set; malformed values are a fatal startup error. |
+| `INITIAL_MASTER_SIGNING_SECRET` | *(unset)* | Bootstrap Master HMAC signing secret. Must be exactly 64 hex characters if set; malformed values are a fatal startup error. |
 | `TRUSTED_PROXIES` | *(unset — nothing trusted)* | Comma-separated CIDR ranges/addresses whose `X-Forwarded-For`/`X-Real-IP` headers are honoured. Malformed entries are a fatal startup error. |
 | `MAX_BODY_SIZE_MIB` | `10` | Maximum accepted request body size. Shared by the router's body limit and the signed-body buffer in the auth middleware, so the two can never drift apart. |
 | `RUST_LOG` | *(unset)* | Standard `tracing-subscriber` env filter. |
@@ -156,12 +159,30 @@ of the parser: `user_agent` and `headers` (an object of extra request headers).
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo test -- --ignored     # live network feed tests, normally skipped
 cargo doc --no-deps
+./scripts/test_e2e.sh       # boots the real binary; see below
 ```
 
 Integration tests (`tests/`) run entirely against an in-memory SQLite database and a real router
 via `tower::ServiceExt::oneshot`; outbound calls to remote vaults are exercised against
-`wiremock`-backed mock servers, so no network access or external services are required.
+`wiremock`-backed mock servers, so no network access or external services are required. A handful
+of tests in `tests/live_feed_ingestion_tests.rs` are `#[ignore]`d because they hit real, public
+threat-intelligence feeds over the network — run them explicitly with `cargo test -- --ignored`
+when network access is available; they are not part of the default `cargo test` run.
+
+`scripts/test_e2e.sh` is the one gate that exercises the **actual compiled binary** end-to-end
+rather than the in-process router: it boots `target/debug/simply_ip_sync` against an isolated
+temporary SQLite database and port, drives it with real `curl` requests carrying hand-computed
+`CANONICAL_V1` HMAC signatures, spins up local Python mock `simply_ip_vault` servers to verify
+real multi-vault delivery over the wire (including a partial-failure scenario), exercises live and
+local-fixture feed ingestion, and confirms a clean `SIGTERM` shutdown. It requires `cargo`, `curl`,
+`openssl`, `jq`, and (for the mock-vault and local-fixture sections; soft dependency, those
+sections warn and skip without it) `python3`. Run it from the repository root:
+
+```sh
+./scripts/test_e2e.sh
+```
 
 ## License
 

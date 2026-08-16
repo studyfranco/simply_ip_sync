@@ -117,18 +117,29 @@ own examples) to the 6-field `sec min hour dom month dow` form the underlying cr
 `mod.rs`: the `FeedParser` trait, `normalize_ip_or_cidr`, `for_type` (parser_type string →
 implementation). `regex_line.rs`: `REGEX_LINE` (comment-stripping, IPv4/IPv6/CIDR token
 extraction). `json_path.rs`: `JSON_PATH` (dotted `array_path` traversal, per-element `ip_field`
-pull). Both re-validate every extracted token through `normalize_ip_or_cidr` rather than trusting
-the extraction pattern alone.
+pull; also a `"jsonl": true` mode for newline-delimited JSON feeds — Spamhaus DROP's actual wire
+format, one object per line with no enclosing array, verified against the real download). Both
+re-validate every extracted token through `normalize_ip_or_cidr` rather than trusting the
+extraction pattern alone.
 
 ## `src/jobs/` — execution pipelines
 
 `mod.rs`: `chunk_records` (`MAX_BATCH_SIZE = 5_000`), `JobSummary`, `write_sync_log`.
-`external_ingestion.rs`: fetch → parse → dedupe → chunk → push to every configured target vault,
-one `sync_logs` row per execution, `last_run_at` always updated (it means "last execution", not
-"last successful execution"). `vault_sync.rs`: delta fetch (including tombstones) → chunk → push,
-`last_sync_at` only advances when **every** target succeeds. Both are plain `(&AppState, Uuid) ->
-Result<JobSummary, AppError>` functions, callable identically from `scheduler.rs` and from the
-manual-trigger HTTP handlers.
+`decompress.rs`: `decompress_if_zip`/`is_zip` — transparent ZIP-archive decompression inserted
+into `external_ingestion.rs` before any parser runs, so ZIP-distributed feeds (e.g. StopForumSpam)
+work with every parser type without the parser layer knowing archives exist; a pure passthrough
+for the (overwhelmingly common) non-ZIP case.
+`external_ingestion.rs`: fetch → decompress-if-zip → parse → dedupe → chunk → push to every
+configured target vault, one `sync_logs` row per execution, `last_run_at` always updated (it means
+"last execution", not "last successful execution"). `vault_sync.rs`: delta fetch (including
+tombstones) → chunk → push, `last_sync_at` only advances when **every** target succeeds. Both are
+plain `(&AppState, Uuid) -> Result<JobSummary, AppError>` functions, callable identically from
+`scheduler.rs` and from the manual-trigger HTTP handlers.
+
+`scheduler.rs` additionally exposes `validate_cron_expression` — called from the `POST`/`PATCH`
+handlers in `api/sources.rs` and `api/sync_tasks.rs` *before* any database write, via the same
+normalize-then-parse path the scheduler itself uses, so anything it accepts is guaranteed
+schedulable and a malformed `cron_schedule` never reaches persistence.
 
 ---
 
@@ -188,8 +199,15 @@ two or more Master rows.
 | :--- | :--- |
 | `common/mod.rs` | Shared harness: in-memory DB + pinned Master, `insert_key` (mints credentials directly against the database), `sign`/`signed_request` (real `CANONICAL_V1` signing) |
 | `security_tests.rs` | Inbound HMAC verification, replay, `bound_ips`, and outbound signature generation against a `wiremock`-mocked vault |
-| `parser_tests.rs` | `REGEX_LINE`/`JSON_PATH` black-box behavior through the public `parsers` API |
+| `parser_tests.rs` | `REGEX_LINE`/`JSON_PATH` black-box behavior through the public `parsers` API, plus local fixtures reproducing StopForumSpam's ZIP and Spamhaus's JSONL feed shapes (both inspected against the real downloads) via `tempfile::tempdir()` for automatic cleanup |
 | `chunking_tests.rs` | Batch chunking never exceeds `MAX_BATCH_SIZE` at any boundary |
-| `vault_sync_tests.rs` | Tombstone propagation through a full fetch→push cycle; `last_sync_at` only advances on total success |
+| `api_validation_tests.rs` | Malformed `cron_schedule` on `POST`/`PATCH` for both `/api/sources` and `/api/sync-tasks` is rejected with `400` before any database write |
+| `vault_sync_tests.rs` | Tombstone propagation through a full fetch→push cycle; `last_sync_at` only advances on total success; multi-vault fan-out (both targets receive the batch) and partial-failure resilience (`PARTIAL` status, `last_sync_at` withheld, the healthy target still gets delivered to) |
+| `live_feed_ingestion_tests.rs` | `#[ignore]`d — real network calls to the four feeds named in `AGENT_NOTES.MD`, both via the parser directly and through the full `jobs::external_ingestion::run` pipeline. Run explicitly with `cargo test -- --ignored` |
 | `rbac_tests.rs` | `can_sync` manual-trigger allow/403, R4 scope elevation, §5 Master immutability/rotation refusal, §3 owner-only lifecycle |
 | `schema_integrity_tests.rs` | Migrations apply cleanly; `ADVERSARIAL(§5)` — a raw-SQL insert with the marker column absent is rejected by the database itself; FK cascade on a junction table |
+| `source_hygiene.rs` | `static/app.js` parses as valid ECMAScript (`oxc_parser`, self-tested against a known-broken fixture); every literal `document.getElementById()` reference resolves against `index.html` or an id `app.js` injects itself; the one dynamic id-construction pattern is verified against its actual invariant (every nav button's `data-tab` has a matching panel id) |
+
+`scripts/test_e2e.sh` (repository root, not under `tests/`) is the complementary black-box gate:
+it boots the real compiled binary and drives it with `curl` over a real socket, which none of the
+above can do. See its own header comment and `AGENT_NOTES.MD` session 2 for what it covers.

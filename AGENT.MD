@@ -16,7 +16,7 @@ Hello AI Agent! You are assisting with the development of `simply_ip_sync`. Read
 ## 🔄 Peer Repository Synchronization
 
 `example/` holds live checkouts of the peer projects this service converges against
-(`simply_ip_vault`, `simply_hook_executor`), each its own git repository with a configured
+(`simply_ip_vault`, `simply_hook_executor`, ...), each its own git repository with a configured
 `origin`. Their working trees can go stale between sessions — a peer's `AGENT.MD`, `RBAC_MODEL.md`,
 or source may have moved on since the last checkout in this tree was made.
 
@@ -159,10 +159,26 @@ Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync
 - **Required Coverage:**
   1. Inbound HMAC validation & anti-replay tests.
   2. Outbound HMAC signature generation correctness against mock `ip_vault` endpoints.
-  3. External feed parsing correctness (`REGEX_LINE` and `JSON_PATH`).
+  3. External feed parsing correctness (`REGEX_LINE` and `JSON_PATH`, including ZIP-archived and
+     newline-delimited-JSON feed shapes via local fixtures — never against the live rate-limited
+     source).
   4. Batch chunking (verifying payloads never exceed 5,000 records).
-  5. Inter-vault delta replication and tombstone propagation.
+  5. Inter-vault delta replication and tombstone propagation, including multi-vault fan-out and
+     partial-failure resilience (one target failing must report `PARTIAL`/`FAILED` and must not
+     advance `last_sync_at`).
   6. Manual trigger permissions (`can_sync` vs unauthorized 403).
   7. Adversarial infrastructure tests (`ADVERSARIAL(§N)` for master uniqueness).
+  8. Cron expression validation: `POST /api/sources` and `POST /api/sync-tasks` must reject a
+     malformed `cron_schedule` with `400` before any database write.
+  9. `static/app.js` source hygiene: zero JavaScript syntax errors, and every
+     `document.getElementById()` reference resolvable against `static/index.html` (statically or
+     dynamically injected).
+- **Live network tests** (`tests/live_feed_ingestion_tests.rs`) are `#[ignore]`d and excluded from
+  the default `cargo test` run; they must still pass when run explicitly via
+  `cargo test -- --ignored` before merging a change that touches the parser or ingestion pipeline.
+- **`./scripts/test_e2e.sh`** is a mandatory quality gate alongside `cargo check`/`clippy`/`test`.
+  It boots the real compiled binary (not the in-process router) against an isolated temp database
+  and port, drives it with hand-signed `curl` requests, and is the only gate that proves actual
+  multi-vault delivery over a real socket and a clean process shutdown on `SIGTERM`.
 
 *End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*

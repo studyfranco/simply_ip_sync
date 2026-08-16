@@ -18,6 +18,13 @@ pub const MASTER_KEY_HEX_LEN: usize = 64;
 /// Environment variable carrying an operator-supplied bootstrap Master key.
 pub const INITIAL_MASTER_KEY_ENV: &str = "INITIAL_MASTER_KEY";
 
+/// Environment variable carrying an operator-supplied bootstrap Master HMAC signing secret.
+/// Optional: when unset, one is generated randomly and logged once at boot (see
+/// `main.rs::bootstrap_master_key`). Setting this deterministically is useful for test harnesses
+/// (e.g. `scripts/test_e2e.sh`) that need to sign requests as Master without scraping a
+/// buffered/redirected server log — the same reasoning `INITIAL_MASTER_KEY` itself exists for.
+pub const INITIAL_MASTER_SIGNING_SECRET_ENV: &str = "INITIAL_MASTER_SIGNING_SECRET";
+
 /// Default maximum request body size, in mebibytes, when `MAX_BODY_SIZE_MIB` is unset.
 pub const DEFAULT_MAX_BODY_MIB: usize = 10;
 
@@ -30,6 +37,11 @@ pub struct InvalidTrustedProxies(pub String);
 #[derive(Debug, thiserror::Error)]
 #[error("INITIAL_MASTER_KEY must be exactly {MASTER_KEY_HEX_LEN} hex characters")]
 pub struct InvalidInitialMasterKey;
+
+/// `INITIAL_MASTER_SIGNING_SECRET` was set but is not exactly `MASTER_KEY_HEX_LEN` hex characters.
+#[derive(Debug, thiserror::Error)]
+#[error("INITIAL_MASTER_SIGNING_SECRET must be exactly {MASTER_KEY_HEX_LEN} hex characters")]
+pub struct InvalidInitialMasterSigningSecret;
 
 /// Parses `TRUSTED_PROXIES` into a list of CIDR networks. Malformed entries are a hard error —
 /// this is a security boundary, not a tuning knob.
@@ -113,6 +125,18 @@ pub fn validate_initial_master_key(raw: &str) -> Result<(), InvalidInitialMaster
         Ok(())
     } else {
         Err(InvalidInitialMasterKey)
+    }
+}
+
+/// Validates an operator-supplied `INITIAL_MASTER_SIGNING_SECRET`. Fatal on failure, for the same
+/// reason as `validate_initial_master_key`: a malformed value here would otherwise boot with a
+/// broken Master identity that can never sign a request, and rotation is refused for the Master
+/// key through the API (RBAC §5), so there would be no recovery path short of deleting the row.
+pub fn validate_initial_master_signing_secret(raw: &str) -> Result<(), InvalidInitialMasterSigningSecret> {
+    if raw.len() == MASTER_KEY_HEX_LEN && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(InvalidInitialMasterSigningSecret)
     }
 }
 
@@ -213,6 +237,17 @@ mod tests {
     fn validate_initial_master_key_rejects_non_hex() {
         let key = "z".repeat(64);
         assert!(validate_initial_master_key(&key).is_err());
+    }
+
+    #[test]
+    fn validate_initial_master_signing_secret_accepts_64_hex_chars() {
+        let secret = "b".repeat(64);
+        assert!(validate_initial_master_signing_secret(&secret).is_ok());
+    }
+
+    #[test]
+    fn validate_initial_master_signing_secret_rejects_wrong_length() {
+        assert!(validate_initial_master_signing_secret("abcd").is_err());
     }
 
     #[test]

@@ -204,6 +204,8 @@ pub async fn create_external_source(
     if payload.parser_type != "REGEX_LINE" && payload.parser_type != "JSON_PATH" {
         return Err(AppError::InvalidInput("parser_type must be REGEX_LINE or JSON_PATH".to_owned()));
     }
+    crate::scheduler::validate_cron_expression(&payload.cron_schedule)
+        .map_err(|e| AppError::InvalidInput(format!("invalid cron_schedule: {e}")))?;
 
     let now = Utc::now();
     let id = Uuid::new_v4();
@@ -262,6 +264,17 @@ pub async fn update_external_source(
     let permission = find_permission(&state.db, caller.id, RESOURCE_EXTERNAL_SOURCE, id).await?;
     guard_resource_manage(&caller, permission.as_ref())?;
 
+    if let Some(parser_type) = &payload.parser_type
+        && parser_type != "REGEX_LINE"
+        && parser_type != "JSON_PATH"
+    {
+        return Err(AppError::InvalidInput("parser_type must be REGEX_LINE or JSON_PATH".to_owned()));
+    }
+    if let Some(cron) = &payload.cron_schedule {
+        crate::scheduler::validate_cron_expression(cron)
+            .map_err(|e| AppError::InvalidInput(format!("invalid cron_schedule: {e}")))?;
+    }
+
     let txn = state.db.begin().await?;
     let mut active: external_source::ActiveModel = existing.into();
     if let Some(name) = payload.name {
@@ -271,9 +284,6 @@ pub async fn update_external_source(
         active.source_url = Set(source_url);
     }
     if let Some(parser_type) = payload.parser_type {
-        if parser_type != "REGEX_LINE" && parser_type != "JSON_PATH" {
-            return Err(AppError::InvalidInput("parser_type must be REGEX_LINE or JSON_PATH".to_owned()));
-        }
         active.parser_type = Set(parser_type);
     }
     if let Some(config) = payload.parser_config_json {
