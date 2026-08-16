@@ -186,6 +186,37 @@ pub fn max_body_bytes() -> usize {
     })
 }
 
+/// Default outbound HTTP timeout, in seconds, when `OUTBOUND_HTTP_TIMEOUT_SECS` is unset.
+pub const DEFAULT_OUTBOUND_HTTP_TIMEOUT_SECS: u64 = 60;
+
+fn outbound_http_timeout_cell() -> &'static OnceLock<u64> {
+    static CELL: OnceLock<u64> = OnceLock::new();
+    &CELL
+}
+
+/// Total per-request timeout, in seconds, for outbound calls to remote vault endpoints
+/// (`client::build_http_client`). Read once from `OUTBOUND_HTTP_TIMEOUT_SECS` (default
+/// [`DEFAULT_OUTBOUND_HTTP_TIMEOUT_SECS`], clamped to at least 1s) — a tuning value, not a
+/// security boundary, so a malformed setting fails soft to the default with a logged warning
+/// rather than refusing to boot. A hung remote target must never stall a scheduled job
+/// indefinitely; this is the bound that guarantees it eventually gives up and reports `FAILED`.
+pub fn outbound_http_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(*outbound_http_timeout_cell().get_or_init(|| {
+        std::env::var("OUTBOUND_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or_else(|| {
+                if std::env::var("OUTBOUND_HTTP_TIMEOUT_SECS").is_ok() {
+                    tracing::warn!(
+                        "OUTBOUND_HTTP_TIMEOUT_SECS is not a valid positive integer, using default of {DEFAULT_OUTBOUND_HTTP_TIMEOUT_SECS}s"
+                    );
+                }
+                DEFAULT_OUTBOUND_HTTP_TIMEOUT_SECS
+            })
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

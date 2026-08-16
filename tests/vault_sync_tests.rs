@@ -321,3 +321,140 @@ async fn last_sync_at_does_not_advance_when_a_target_fails() {
     let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
     assert!(updated_task.last_sync_at.is_none(), "a failed delivery must not advance the high-water mark");
 }
+
+/// A task-target with an explicit `target_group_name` override (`vault_sync_task_targets`, per
+/// `SCHEMA.MD`'s junction table) must receive the batch under that group, while a sibling target
+/// with no override falls back to the task's own `target_group_name`.
+#[tokio::test]
+async fn per_target_group_name_override_is_honored_independently_of_the_default() {
+    let (conn, state, _master) = common::setup().await;
+
+    let source_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(single_delta_record_response()))
+        .mount(&source_mock)
+        .await;
+
+    let default_target_mock = MockServer::start().await;
+    let override_target_mock = MockServer::start().await;
+    for mock in [&default_target_mock, &override_target_mock] {
+        Mock::given(method("POST"))
+            .and(path("/api/records/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    let source_id = insert_vault(&conn, "source", &source_mock.uri()).await;
+    let default_target_id = insert_vault(&conn, "default-target", &default_target_mock.uri()).await;
+    let override_target_id = insert_vault(&conn, "override-target", &override_target_mock.uri()).await;
+
+    let task_id = Uuid::new_v4();
+    let now = Utc::now();
+    let task = vault_sync_task::ActiveModel {
+        id: Set(task_id),
+        name: Set(format!("override-task-{task_id}")),
+        source_vault_id: Set(source_id),
+        source_group_name: Set("source-group".to_owned()),
+        target_group_name: Set("DEFAULT_GROUP".to_owned()),
+        cron_schedule: Set("0 0 * * *".to_owned()),
+        last_sync_at: Set(None),
+        mode: Set("upsert".to_owned()),
+        is_active: Set(true),
+        owner_key_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    task.insert(&conn).await.expect("insert task");
+    vault_sync_task_target::ActiveModel {
+        vault_sync_task_id: Set(task_id),
+        target_vault_id: Set(default_target_id),
+        target_group_name: Set(None),
+    }
+    .insert(&conn)
+    .await
+    .expect("insert default target");
+    vault_sync_task_target::ActiveModel {
+        vault_sync_task_id: Set(task_id),
+        target_vault_id: Set(override_target_id),
+        target_group_name: Set(Some("OVERRIDDEN_GROUP".to_owned())),
+    }
+    .insert(&conn)
+    .await
+    .expect("insert override target");
+
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    assert_eq!(summary.status, "SUCCESS");
+
+    let default_received = default_target_mock.received_requests().await.expect("recording enabled");
+    let default_body: serde_json::Value = serde_json::from_slice(&default_received[0].body).expect("json");
+    assert_eq!(default_body["group_name"], serde_json::json!("DEFAULT_GROUP"), "no override falls back to the task's default target_group_name");
+
+    let override_received = override_target_mock.received_requests().await.expect("recording enabled");
+    let override_body: serde_json::Value = serde_json::from_slice(&override_received[0].body).expect("json");
+    assert_eq!(
+        override_body["group_name"],
+        serde_json::json!("OVERRIDDEN_GROUP"),
+        "an explicit per-target override must win over the task's default target_group_name"
+    );
+}
+
+/// Task 3: a target vault that accepts the connection but never responds (or responds far slower
+/// than the configured timeout) to `POST /api/records/batch` must be aborted on the client's own
+/// schedule, not left to hang a Tokio worker — the job must complete quickly and report `FAILED`,
+/// and `last_sync_at` must not advance. Mirrors
+/// `external_ingestion_tests.rs::slow_target_vault_is_aborted_by_the_client_timeout_not_left_hanging`
+/// for the inter-vault push path specifically (the two pipelines share `client::post_batch`, but
+/// each has its own job-level status/`sync_logs`/high-water-mark bookkeeping worth pinning).
+#[tokio::test]
+async fn slow_target_vault_is_aborted_and_last_sync_at_is_withheld() {
+    let (conn, mut state, _master) = common::setup().await;
+
+    let source_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(single_delta_record_response()))
+        .mount(&source_mock)
+        .await;
+
+    let slow_target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1
+                }))
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&slow_target_mock)
+        .await;
+
+    // Hermetic short timeout on this test's own client — see client::build_http_client's doc
+    // comment for why this overrides AppState.http directly rather than the env-var-backed cache.
+    state.http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+        .expect("client builds");
+
+    let source_id = insert_vault(&conn, "source", &source_mock.uri()).await;
+    let target_id = insert_vault(&conn, "slow-target", &slow_target_mock.uri()).await;
+    let task_id = insert_task(&conn, source_id, target_id).await;
+
+    let start = std::time::Instant::now();
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job completes rather than hanging");
+    let elapsed = start.elapsed();
+
+    assert_eq!(summary.status, "FAILED");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the job must abort on the client's own timeout, not wait out the mock's 5s delay; took {elapsed:?}"
+    );
+
+    let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
+    assert!(updated_task.last_sync_at.is_none(), "a timed-out delivery must not advance the high-water mark");
+}

@@ -65,7 +65,11 @@ async fn trigger_with_granted_can_sync_succeeds() {
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/feed.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("# no IPs\n"))
+        // A genuinely non-empty body: a comment-only feed would parse to zero entries and report
+        // PARTIAL (see jobs::external_ingestion's zero-items handling), which would make this
+        // test's final assertion ambiguous between "the RBAC gate worked" (what it actually
+        // checks) and "the trigger reported SUCCESS" (a fact about feed content, not permissions).
+        .respond_with(ResponseTemplate::new(200).set_body_string("# comment\n203.0.113.5\n"))
         .mount(&feed_mock)
         .await;
     let source_id = insert_source(&conn, &format!("{}/feed.txt", feed_mock.uri()), master.id).await;

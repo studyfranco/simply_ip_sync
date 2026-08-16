@@ -79,6 +79,7 @@ by hand** below).
 | `INITIAL_MASTER_SIGNING_SECRET` | *(unset)* | Bootstrap Master HMAC signing secret. Must be exactly 64 hex characters if set; malformed values are a fatal startup error. |
 | `TRUSTED_PROXIES` | *(unset — nothing trusted)* | Comma-separated CIDR ranges/addresses whose `X-Forwarded-For`/`X-Real-IP` headers are honoured. Malformed entries are a fatal startup error. |
 | `MAX_BODY_SIZE_MIB` | `10` | Maximum accepted request body size. Shared by the router's body limit and the signed-body buffer in the auth middleware, so the two can never drift apart. |
+| `OUTBOUND_HTTP_TIMEOUT_SECS` | `60` | Per-request timeout for outbound calls to remote vault endpoints. A hung target is aborted on this schedule rather than stalling a scheduled job indefinitely. |
 | `RUST_LOG` | *(unset)* | Standard `tracing-subscriber` env filter. |
 
 ## API endpoints

@@ -13,6 +13,7 @@ use reqwest::Client;
 use sea_orm::DatabaseConnection;
 
 use crate::crypto::SecretCipher;
+use crate::jobs::RunningJobs;
 use crate::master::MasterPin;
 use crate::replay::ReplayGuard;
 use crate::scheduler::SchedulerHandle;
@@ -51,6 +52,9 @@ pub struct AppState {
     pub http: Client,
     /// The cron scheduler handle.
     pub scheduler: Arc<SchedulerHandle>,
+    /// Resource ids with a sync job currently executing (`jobs::try_start_job`/`JobGuard`) — guards
+    /// against two overlapping executions of the same external source or sync task.
+    pub running_jobs: RunningJobs,
 }
 
 impl AppState {
@@ -73,6 +77,7 @@ impl AppState {
             trusted_proxies: Arc::new(trusted_proxies),
             http,
             scheduler: Arc::new(scheduler),
+            running_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -90,6 +95,7 @@ impl AppState {
             trusted_proxies: Arc::new(Vec::new()),
             http: crate::client::build_http_client().expect("http client builds"),
             scheduler: Arc::new(scheduler),
+            running_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 }

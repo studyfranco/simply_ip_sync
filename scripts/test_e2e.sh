@@ -680,8 +680,90 @@ if [[ "$MULTI_VAULT_AVAILABLE" -eq 1 ]]; then
     check_jq ".last_sync_at" "$LAST_SYNC_AFTER_SUCCESS" "last_sync_at is still untouched after a total failure"
     echo "ok" > "$TARGET1_MODE"
     echo "ok" > "$TARGET2_MODE"
+
+    log_section "7a. Target group name override"
+
+    api_call POST "/api/sync-tasks" "$MASTER_KEY" \
+        "{\"name\":\"override-e2e-task\",\"source_vault_id\":\"$SOURCE_VAULT_ID\",\"source_group_name\":\"src-group\",\"target_group_name\":\"DEFAULT_E2E_GROUP\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$TARGET1_VAULT_ID\",\"target_group_name\":\"OVERRIDDEN_E2E_GROUP\"}]}"
+    check "200" "create a sync task with a per-target group_name override"
+    OVERRIDE_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    check_jq ".targets[0].target_group_name" "OVERRIDDEN_E2E_GROUP" "the created task reports the override back"
+
+    api_call POST "/api/sync-tasks/$OVERRIDE_TASK_ID/trigger" "$MASTER_KEY"
+    check "200" "trigger the override task"
+    check_jq ".status" "SUCCESS" "override task ingestion succeeds"
+
+    OVERRIDE_GROUP_SEEN=$(tail -n1 "$TARGET1_LOG" | jq -r '.body | fromjson | .group_name')
+    check_local "$OVERRIDE_GROUP_SEEN" "OVERRIDDEN_E2E_GROUP" \
+        "the batch pushed for the override task used OVERRIDDEN_E2E_GROUP, not the task's own default"
+
+    api_call DELETE "/api/sync-tasks/$OVERRIDE_TASK_ID" "$MASTER_KEY"
+    check "204" "clean up the override task"
+
+    log_section "7b. On-the-fly credential rotation"
+
+    ROTATED_API_KEY="rotated-mock-key-$RANDOM"
+    api_call PATCH "/api/vaults/$TARGET1_VAULT_ID" "$MASTER_KEY" \
+        "{\"api_key\":\"$ROTATED_API_KEY\",\"signing_secret\":\"rotated-mock-secret-$RANDOM\"}"
+    check "200" "rotate target 1's api_key/signing_secret via the API while the daemon is running"
+
+    api_call POST "/api/sync-tasks/$SYNC_TASK_ID/trigger" "$MASTER_KEY"
+    check "200" "re-trigger the original multi-vault task after rotating one target's credentials"
+    check_jq ".status" "SUCCESS" "the sync still succeeds — the client re-reads credentials from the DB on every run, no restart needed"
+
+    ROTATED_KEY_SEEN=$(tail -n1 "$TARGET1_LOG" | jq -r '.api_key')
+    check_local "$ROTATED_KEY_SEEN" "$ROTATED_API_KEY" \
+        "the outbound request used the newly rotated api_key immediately, without a daemon restart"
+
+    log_section "7c. Concurrent job triggers"
+
+    CONCURRENT_DIR="$WORK_DIR/concurrent"
+    mkdir -p "$CONCURRENT_DIR"
+    CONCURRENT_PIDS=()
+    for i in 1 2 3 4 5; do
+        next_timestamp
+        c_ts="$SIGNED_TS"
+        c_sig=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/sync-tasks/$SYNC_TASK_ID/trigger" "$c_ts" "")
+        (
+            curl -s -o "$CONCURRENT_DIR/body_$i" -w "%{http_code}" -X POST \
+                -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $c_ts" -H "X-Signature-256: $c_sig" \
+                "$BASE_URL/api/sync-tasks/$SYNC_TASK_ID/trigger" > "$CONCURRENT_DIR/status_$i"
+        ) &
+        CONCURRENT_PIDS+=($!)
+    done
+    for pid in "${CONCURRENT_PIDS[@]}"; do
+        wait "$pid"
+    done
+
+    CONCURRENT_200=0
+    CONCURRENT_409=0
+    CONCURRENT_OTHER=0
+    for i in 1 2 3 4 5; do
+        code=$(cat "$CONCURRENT_DIR/status_$i" 2>/dev/null || echo "?")
+        case "$code" in
+            200) CONCURRENT_200=$((CONCURRENT_200 + 1)) ;;
+            409) CONCURRENT_409=$((CONCURRENT_409 + 1)) ;;
+            *) CONCURRENT_OTHER=$((CONCURRENT_OTHER + 1)); warn "concurrent trigger $i returned unexpected status '$code'" ;;
+        esac
+    done
+    log "Concurrent triggers: $CONCURRENT_200 succeeded (200), $CONCURRENT_409 rejected as already-in-progress (409), $CONCURRENT_OTHER unexpected"
+    check_local "$CONCURRENT_OTHER" "0" "no concurrent trigger produced an unexpected status (no 500s, no hangs, no SQLite lock errors surfaced to the caller)"
+    check_local "$([[ "$CONCURRENT_200" -ge 1 ]] && echo yes || echo no)" "yes" "at least one concurrent trigger completed successfully"
+    check_local "$((CONCURRENT_200 + CONCURRENT_409))" "5" "every concurrent trigger was either accepted or cleanly refused as a duplicate — none fell through as something else"
+
+    log_section "7d. Truncated / malformed signature header"
+
+    TRUNC_TS=$(date +%s)
+    raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $TRUNC_TS" -H "X-Signature-256: sha256=ab"
+    check "401" "a truncated (2 hex char) X-Signature-256 is rejected cleanly, not a 500 from a hex-decode panic"
+
+    raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $TRUNC_TS" -H "X-Signature-256: not-even-hex-at-all"
+    check "401" "a X-Signature-256 that isn't hex at all is rejected cleanly"
+
+    raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $TRUNC_TS" -H "X-Signature-256: "
+    check "401" "an empty X-Signature-256 value is rejected cleanly"
 else
-    skip "sections 6-7 (multi-vault sync success/partial-failure): mock vaults unavailable"
+    skip "sections 6-7d (multi-vault sync, target overrides, credential rotation, concurrency): mock vaults unavailable"
 fi
 
 # ── 8. External feed ingestion — live feeds ─────────────────────────────────
@@ -789,6 +871,36 @@ if [[ "$PYTHON3_AVAILABLE" -eq 1 ]] && command -v zip >/dev/null 2>&1; then
             "all ${#SPAMHAUS_CIDRS[@]} CIDRs extracted, metadata footer line correctly skipped"
         api_call DELETE "/api/sources/$JSONL_SOURCE_ID" "$MASTER_KEY"
         check "204" "clean up the JSONL fixture source"
+
+        # Task 4: a feed host returning 200 OK with an HTML block/error page instead of its real
+        # content — the same shape as a Cloudflare challenge, WAF block, or captive-portal redirect.
+        cat > "$FIXTURE_DIR/html_masquerade.txt" <<'HTMLEOF'
+<!DOCTYPE html>
+<html>
+<head><title>Attention Required! | Cloudflare</title></head>
+<body>
+<div class="cf-error-details">
+  <h1>Sorry, you have been blocked</h1>
+  <p>You are unable to access this site.</p>
+  <p>Ray ID: 8f2a1c9d4b3e7f10</p>
+</div>
+</body>
+</html>
+HTMLEOF
+        api_call POST "/api/sources" "$MASTER_KEY" \
+            "{\"name\":\"fixture-html-masquerade\",\"source_url\":\"$FIXTURE_BASE/html_masquerade.txt\",\"parser_type\":\"REGEX_LINE\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false}"
+        check "200" "register a source pointed at an HTML block-page fixture (200 OK, no real feed content)"
+        HTML_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+        api_call POST "/api/sources/$HTML_SOURCE_ID/trigger" "$MASTER_KEY"
+        check "200" "triggering ingestion of the HTML masquerade does not crash the daemon (no 500)"
+        check_jq ".status" "PARTIAL" "an HTML body yielding zero parseable entries is flagged PARTIAL, not silently SUCCESS"
+        check_jq ".items_processed" "0" "zero IP-shaped tokens are extracted from the HTML block page"
+
+        api_call GET "/api/sync-logs?job_id=$HTML_SOURCE_ID" "$MASTER_KEY"
+        check_jq ".[0].status" "PARTIAL" "sync_logs records the PARTIAL outcome for the HTML masquerade"
+
+        api_call DELETE "/api/sources/$HTML_SOURCE_ID" "$MASTER_KEY"
+        check "204" "clean up the HTML masquerade fixture source"
     else
         warn "Local fixture file server failed to start; skipping fixture ingestion checks."
     fi

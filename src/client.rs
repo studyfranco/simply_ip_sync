@@ -127,12 +127,20 @@ pub struct IpRecordResponse {
     pub last_seen_at: Option<chrono::NaiveDateTime>,
 }
 
-/// Builds a `reqwest::Client` suitable for outbound calls to vault endpoints: redirects refused,
-/// a bounded timeout so a hung remote cannot stall a scheduled job indefinitely.
+/// Builds a `reqwest::Client` suitable for outbound calls to vault endpoints: redirects refused, a
+/// bounded timeout (`config::outbound_http_timeout`, default 60s) so a hung remote cannot stall a
+/// scheduled job indefinitely, and transparent response decompression (gzip/deflate/brotli/zstd)
+/// — many HTTP feed hosts and CDNs compress responses by default, and without this a compressed
+/// body would be handed to a `FeedParser` as opaque bytes: `REGEX_LINE` would silently extract
+/// zero addresses (compressed bytes essentially never contain an IP-shaped ASCII substring) and
+/// `JSON_PATH` would fail to parse, both indistinguishable from the feed genuinely being empty or
+/// broken. Tests that need to control the timeout precisely (e.g. against a deliberately slow
+/// mock) should build their own `Client` and override `AppState.http` directly rather than going
+/// through the process-wide `OUTBOUND_HTTP_TIMEOUT_SECS` cache this function reads.
 pub fn build_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(crate::config::outbound_http_timeout())
         .build()
 }
 

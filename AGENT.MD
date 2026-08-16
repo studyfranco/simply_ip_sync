@@ -9,7 +9,7 @@ Hello AI Agent! You are assisting with the development of `simply_ip_sync`. Read
 1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, in-memory cache design, and testing directives.
 2. **`SCHEMA.MD`**: Official Database Schema (configuration only), SeaORM Entity relations, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
-4. **`example/`**: Reference implementations from linked projects (`simply_ip_vault`, `simply_hook_executor`).
+4. **`example/`**: Reference implementations from linked projects (`simply_ip_vault`, `simply_hook_executor`, ...).
 
 ---
 

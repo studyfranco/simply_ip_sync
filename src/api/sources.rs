@@ -353,6 +353,13 @@ pub async fn trigger_external_source(
     let permission = find_permission(&state.db, caller.id, RESOURCE_EXTERNAL_SOURCE, id).await?;
     guard_can_sync(&caller, permission.as_ref())?;
 
+    // Refuses a second concurrent run of the same source rather than letting two overlapping
+    // executions race — e.g. a manual trigger landing while a cron tick for the same source is
+    // still fetching. The guard is released automatically when `_job_guard` drops at the end of
+    // this function, on every exit path including the `?` below.
+    let _job_guard = crate::jobs::try_start_job(&state.running_jobs, id)
+        .ok_or_else(|| AppError::Conflict("a sync for this source is already in progress".to_owned()))?;
+
     create_audit_log(&state.db, &caller, client_ip.0, "SOURCE_TRIGGER", Some(existing.name.clone()), None).await?;
     let summary = crate::jobs::external_ingestion::run(&state, id).await?;
     Ok(Json(serde_json::json!({

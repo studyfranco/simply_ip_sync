@@ -317,6 +317,11 @@ pub async fn trigger_vault_sync_task(
     let permission = find_permission(&state.db, caller.id, RESOURCE_SYNC_TASK, id).await?;
     guard_can_sync(&caller, permission.as_ref())?;
 
+    // See api/sources.rs::trigger_external_source for why this guard exists: refuses a second
+    // concurrent run of the same task rather than racing two overlapping executions.
+    let _job_guard = crate::jobs::try_start_job(&state.running_jobs, id)
+        .ok_or_else(|| AppError::Conflict("a sync for this task is already in progress".to_owned()))?;
+
     create_audit_log(&state.db, &caller, client_ip.0, "SYNC_TASK_TRIGGER", Some(existing.name.clone()), None).await?;
     let summary = crate::jobs::vault_sync::run(&state, id).await?;
     Ok(Json(serde_json::json!({

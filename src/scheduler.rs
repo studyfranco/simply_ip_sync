@@ -98,6 +98,12 @@ impl SchedulerHandle {
         let job = match Job::new_async(cron.as_str(), move |_uuid, _lock| {
             let state = state.clone();
             Box::pin(async move {
+                let Some(_guard) = crate::jobs::try_start_job(&state.running_jobs, source_id) else {
+                    tracing::warn!(
+                        "skipping scheduled external ingestion for {source_id}: a run (manual trigger or a slow prior tick) is already in progress"
+                    );
+                    return;
+                };
                 if let Err(e) = crate::jobs::external_ingestion::run(&state, source_id).await {
                     tracing::error!("scheduled external ingestion job {source_id} failed: {e}");
                 }
@@ -142,6 +148,12 @@ impl SchedulerHandle {
         let job = match Job::new_async(cron.as_str(), move |_uuid, _lock| {
             let state = state.clone();
             Box::pin(async move {
+                let Some(_guard) = crate::jobs::try_start_job(&state.running_jobs, task_id) else {
+                    tracing::warn!(
+                        "skipping scheduled vault sync for {task_id}: a run (manual trigger or a slow prior tick) is already in progress"
+                    );
+                    return;
+                };
                 if let Err(e) = crate::jobs::vault_sync::run(&state, task_id).await {
                     tracing::error!("scheduled vault sync job {task_id} failed: {e}");
                 }

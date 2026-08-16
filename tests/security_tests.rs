@@ -121,6 +121,91 @@ async fn bound_ips_restricts_access_to_permitted_cidr() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// Builds a signed `GET /api/auth/me` request from `peer`, optionally carrying an
+/// `X-Forwarded-For` header — used by the trusted-proxy tests below, which need control over the
+/// TCP peer address that `common::signed_request` always fixes at `127.0.0.1:55555`.
+fn signed_request_from_peer(
+    key: &common::TestKey,
+    peer: std::net::IpAddr,
+    forwarded_for: Option<&str>,
+) -> Request<Body> {
+    let target = "/api/auth/me";
+    let (api_key, timestamp, signature) = common::sign(key, "GET", target, b"");
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(target)
+        .header("X-API-Key", api_key)
+        .header("X-Timestamp", timestamp)
+        .header("X-Signature-256", signature);
+    if let Some(xff) = forwarded_for {
+        builder = builder.header("X-Forwarded-For", xff);
+    }
+    let mut req = builder.body(Body::empty()).expect("build");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(peer, 55555)));
+    req
+}
+
+/// A caller reaching the service through a proxy address listed in `TRUSTED_PROXIES` may supply
+/// `X-Forwarded-For`, and the resolved client IP (the *forwarded* address, not the proxy's own) is
+/// what `bound_ips` is checked against — this is what lets a key be scoped to real end-client
+/// ranges sitting behind a load balancer.
+#[tokio::test]
+async fn trusted_proxy_forwarded_client_ip_is_checked_against_bound_ips() {
+    use sea_orm::{ActiveModelTrait, IntoActiveModel};
+    let (conn, mut state, master) = common::setup().await;
+
+    let daughter = common::insert_key(&conn, "ProxiedCaller", false, false, false, false, Some(master.id)).await;
+    let key_row = simply_ip_sync::entities::prelude::ApiKey::find_by_id(daughter.id).one(&conn).await.unwrap().unwrap();
+    let mut active = key_row.into_active_model();
+    active.bound_ips = sea_orm::Set(Some("203.0.113.0/24".to_owned()));
+    active.update(&conn).await.unwrap();
+
+    // The peer (127.0.0.1) is a trusted load balancer; the real client sits behind it.
+    state.trusted_proxies = std::sync::Arc::new(vec!["127.0.0.1/32".parse().unwrap()]);
+
+    let app = simply_ip_sync::create_app(state);
+    let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let req = signed_request_from_peer(&daughter, peer, Some("203.0.113.7"));
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a forwarded client IP inside bound_ips, relayed through a trusted proxy, must be permitted"
+    );
+}
+
+/// The zero-trust counterpart of the test above: a caller connecting from an **untrusted** peer
+/// cannot use `X-Forwarded-For` to spoof its way past `bound_ips` by simply claiming to be an
+/// address the key is scoped to — `resolve_client_ip` must ignore the header entirely unless the
+/// TCP peer itself is a trusted proxy, falling back to the (here, disallowed) peer address.
+#[tokio::test]
+async fn spoofed_forwarded_for_from_an_untrusted_peer_does_not_bypass_bound_ips() {
+    use sea_orm::{ActiveModelTrait, IntoActiveModel};
+    let (conn, mut state, master) = common::setup().await;
+
+    let daughter = common::insert_key(&conn, "SpoofAttempt", false, false, false, false, Some(master.id)).await;
+    let key_row = simply_ip_sync::entities::prelude::ApiKey::find_by_id(daughter.id).one(&conn).await.unwrap().unwrap();
+    let mut active = key_row.into_active_model();
+    active.bound_ips = sea_orm::Set(Some("203.0.113.0/24".to_owned()));
+    active.update(&conn).await.unwrap();
+
+    // Nothing is trusted — the peer below must be evaluated on its own address, never on a
+    // header it supplies about itself.
+    state.trusted_proxies = std::sync::Arc::new(Vec::new());
+
+    let app = simply_ip_sync::create_app(state);
+    let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    // Forges an X-Forwarded-For claiming to be an address inside bound_ips.
+    let req = signed_request_from_peer(&daughter, peer, Some("203.0.113.7"));
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a forged X-Forwarded-For from an untrusted peer must never widen bound_ips access"
+    );
+}
+
 /// Outbound signature generation: `client::post_batch` must sign requests to a remote vault with
 /// a `CANONICAL_V1` HMAC the remote side can verify with the shared secret.
 #[tokio::test]

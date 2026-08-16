@@ -226,3 +226,131 @@ here rather than silently skipped or fabricated.
   mock-vault/fixture sections without python3, and for the live-feed section without network).
 - `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo doc --no-deps`:
   all clean, zero warnings.
+
+---
+
+## Session 3 (2026-08-16): resilience hardening — timeouts, concurrency, compression, group overrides
+
+Requested as a hardening pass over the session-2 suite: network delays, proxy spoofing, target
+group overrides, secrets rotation, HTML-masquerading-as-200, concurrent job execution. Landed four
+production-code changes (not just tests) plus new coverage across `tests/` and
+`scripts/test_e2e.sh`.
+
+**Production code changes, each driven by a task that turned out to expose a real gap:**
+
+1. **`OUTBOUND_HTTP_TIMEOUT_SECS` config** (`config::outbound_http_timeout`,
+   `client::build_http_client`). The 60s timeout already existed (session 1) but was hardcoded;
+   made configurable the same way `MAX_BODY_SIZE_MIB` already is (fail-soft, `OnceLock`-cached).
+   **Tests deliberately do not rely on this env var/cache to control timing** — a
+   process-wide `OnceLock` set by one test would leak into every other test sharing the binary.
+   Instead, timeout tests override `AppState.http` directly with a purpose-built short-timeout
+   `Client` (both `AppState` and `reqwest::Client` are already plain, publicly-fielded/cloneable
+   types, so this needed no new test-only constructor). Documented directly in
+   `build_http_client`'s doc comment so the next person reaching for
+   `OUTBOUND_HTTP_TIMEOUT_SECS` in a test doesn't rediscover the hazard the hard way.
+2. **Response decompression enabled on the outbound `reqwest` client** (`gzip`, `deflate`,
+   `brotli`, `zstd` Cargo features). This was a **real latent bug**, not a defensive
+   just-in-case: `reqwest`'s compression support is opt-in per feature flag, and none were enabled
+   — a feed host or CDN compressing its response (common) would have handed a `FeedParser`
+   opaque compressed bytes. For `REGEX_LINE` this fails *silently*: compressed bytes essentially
+   never contain an ASCII IP-shaped substring, so the job would report `SUCCESS` with 0 items
+   pushed, indistinguishable from a genuinely empty feed. For `JSON_PATH` it would report `FAILED`
+   with a confusing "invalid JSON" error that gives no hint the real problem is Content-Encoding.
+   Found while working the autonomy directive's "unexpected payload compression formats" item, not
+   by an explicit task — confirmed as a real gap before fixing (checked `Cargo.toml`, found no
+   compression feature enabled on `reqwest`), not assumed.
+3. **Job-concurrency guard** (`jobs::{RunningJobs, JobGuard, try_start_job}`,
+   `AppState.running_jobs`). Task 6 asked for concurrent-trigger safety; rather than only proving
+   SQLite's `busy_timeout` absorbs contention (true, but only tests robustness against a problem,
+   not a real product decision), added an explicit per-resource "one execution at a time" guard:
+   a `HashSet<Uuid>` behind a `std::sync::Mutex` (never held across an `.await`, so no deadlock
+   risk), claimed via a `try_start_job` returning an RAII `JobGuard` that releases the slot on
+   drop — safe against every early-return path including `?`. Wired into both manual-trigger HTTP
+   handlers (a second concurrent trigger gets `409 Conflict`, not a queued duplicate run) and the
+   scheduler's cron closures (a slow-running prior tick causes the next one to skip with a logged
+   warning, not stack up). This also happens to be the *correct* fix for the literal race the task
+   describes — two overlapping executions of the same source/task pushing interleaved,
+   possibly-conflicting batches to the same target group — rather than merely tolerating it.
+4. **`external_ingestion`: a zero-item successful fetch+parse is now `PARTIAL`, not `SUCCESS`**
+   (`jobs/external_ingestion.rs`). This is a genuine product-behavior change, made deliberately and
+   documented in-line: unlike `vault_sync` (an incremental delta puller, where "zero new records
+   since last time" is routine and expected), `external_ingestion` re-fetches a feed's *entire*
+   current content on every run — a real, previously non-trivial threat list dropping to
+   genuinely zero entries between runs is itself anomalous, and is exactly what an HTML
+   error/captive-portal/WAF-block page served with `200 OK` looks like to `REGEX_LINE` (valid
+   UTF-8 text, no parse error, just no IP-shaped tokens). `JSON_PATH` already got this right for
+   free (HTML isn't valid JSON, so it hits the existing hard-`FAILED` parse-error path) — this
+   change only affects `REGEX_LINE`'s silent-empty-success case. **Broke one existing test**
+   (`rbac_tests.rs::trigger_with_granted_can_sync_succeeds`, which used a comment-only fixture body
+   that now correctly reports `PARTIAL`) — fixed by giving that fixture a real IP, since the
+   test's actual subject is the RBAC gate, not ingestion content semantics; recorded here rather
+   than silently patched, since "a test broke and I changed the fixture" is exactly the kind of
+   edit that deserves a one-line trail.
+
+**New test files / major additions:**
+
+- `tests/external_ingestion_tests.rs` (new file, 6 tests): per-target `target_group_name`
+  override independent of the source's default; HTML-masquerade-as-200 via `REGEX_LINE` (zero
+  items, `PARTIAL`, no panic) and via `JSON_PATH` (hard `FAILED`, confirming the two parsers fail
+  the way each one's contract predicts); gzip-compressed response transparently decompressed;
+  slow/hung target aborted by the client's own timeout in `<2s` wall-clock despite a 5s mock delay
+  (proves no worker-thread hang, not just that an error eventually surfaces); the job-guard
+  primitive exercised directly (second claim on a live id refused, unrelated id unaffected,
+  released on drop).
+- `tests/vault_sync_tests.rs` (+2 tests): the same per-target `target_group_name` override for
+  `vault_sync_task_targets` specifically (session 2 only covered the "both targets get the same
+  group" case); the same slow/hung-target timeout scenario for the inter-vault push path
+  specifically, since Task 3 named `vault_sync_tests.rs` explicitly and the two pipelines, while
+  sharing `client::post_batch`, have independent `sync_logs`/`last_sync_at` bookkeeping worth
+  pinning separately.
+- `tests/security_tests.rs` (+2 tests): a forwarded client IP from a *trusted* proxy is checked
+  against `bound_ips` (and permitted when inside range); the zero-trust counterpart — an identical
+  forged `X-Forwarded-For` from an *untrusted* peer must not bypass `bound_ips` at all, falling
+  back to the peer's own (disallowed) address. Together these are the actual security property
+  worth pinning: not just "bound_ips works", but "a header alone, without a trusted network path,
+  can never widen what a header alone should never be able to widen."
+- `tests/parser_tests.rs` (+4 tests): a realistic Cloudflare-block-page fixture through
+  `REGEX_LINE` (zero matches) and `JSON_PATH` (hard failure); a captive-portal page whose redirect
+  URL happens to *contain* a private IP literal, confirming the line-oriented scanner still
+  extracts it correctly rather than getting confused by surrounding markup (documented as
+  intentional — `normalize_ip_or_cidr` re-validates every candidate regardless); a 50,000-line
+  synthetic HTML body as a bounded-time/no-blowup proxy for "no unbounded memory growth on
+  adversarial input" (an actual memory profiler is out of reach for a unit test, so wall-clock
+  time under a generous 5s ceiling is what's checked).
+- `scripts/test_e2e.sh` (+4 sections, black-box/real-socket versions of the above): §7a target
+  group override observed on the wire (mock vault's received batch body); §7b live credential
+  rotation — `PATCH /api/vaults/{id}` while the daemon keeps running, re-trigger without restart,
+  confirm the *new* `X-API-Key` value on the next outbound request the mock actually receives;
+  §7c five genuinely concurrent trigger requests fired via backgrounded `curl` (signed
+  sequentially beforehand so each gets its own monotonic timestamp, then launched in parallel) —
+  observed 2×`200` + 3×`409` on every run, proving both real concurrency occurred and the guard
+  correctly serialized it, never a `500`; §7d truncated (`sha256=ab`), non-hex, and empty
+  `X-Signature-256` values all cleanly `401` rather than panicking a hex-decode; the HTML-masquerade
+  fixture added alongside the existing ZIP/JSONL ones in §9.
+
+**Test metrics after this session:**
+- `cargo test` (default, offline): **102 tests**, 0 failed (up from 93: +6 `external_ingestion_tests.rs`
+  (new file), +2 `vault_sync_tests.rs`, +2 `security_tests.rs`, +4 `parser_tests.rs` minus the one
+  `rbac_tests.rs` fixture fix which is a same-count edit).
+- `cargo test -- --ignored`: **5 tests**, 0 failed (unchanged — no new live-network tests this
+  session; everything above uses local fixtures/mocks, consistent with session 2's rate-limit
+  avoidance rationale).
+- `./scripts/test_e2e.sh`: **126 checks** (up from 104), 0 failed, 0 skipped, run **3 times
+  consecutively** with an explicit post-run check for lingering processes/temp files after each —
+  clean every time, including the concurrency section (which is the one section whose result
+  legitimately varies run-to-run: the 200-vs-409 split depends on real scheduling, but the
+  *invariants* checked — no unexpected status, at least one success, every response accounted for
+  as either 200 or 409 — held on all three runs).
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo doc --no-deps`:
+  all clean, zero warnings.
+
+**Not done / flagged rather than assumed out of scope:**
+- Genuine "network partition recovery" (a target vault becoming unreachable mid-run, then
+  recovering on a *later* run and the delta catching up correctly) is not covered. The
+  partial-failure tests (session 2 + this session) cover "a target fails this run", and the
+  `last_sync_at`-withholding behavior already guarantees a subsequent successful run replays the
+  full since-last-success delta — so the recovery *mechanism* is exercised, but not end-to-end as
+  its own named scenario. Left for a future session rather than simulated with a fragile
+  process-pause/resume in bash.
+- `./scripts/verify_convergence.sh` still does not exist (see sessions 1–2's decision) and was not
+  requested as a gate this session.

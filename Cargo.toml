@@ -9,7 +9,7 @@ tokio = { version = "1", features = ["full"] }
 sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
 sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 ipnetwork = "0.21"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip", "deflate", "brotli", "zstd"] }
 tokio-cron-scheduler = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -38,3 +38,4 @@ wiremock = "0.6"
 oxc_allocator = "0.143"
 oxc_parser = "0.143"
 oxc_span = "0.143"
+flate2 = "1"

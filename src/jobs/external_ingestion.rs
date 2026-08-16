@@ -195,11 +195,36 @@ async fn execute(
     }
 
     let status = if errors.is_empty() {
-        "SUCCESS"
+        if items_processed == 0 {
+            // A syntactically successful fetch and parse that yields *zero* records is not
+            // trustworthy the way "zero new records" is for a delta sync (jobs::vault_sync) — this
+            // pipeline fetches the feed's full current content on every run, not an incremental
+            // diff, so a real threat-intelligence list going from N entries to genuinely 0 between
+            // runs is itself an anomaly. It is also exactly what a captive portal, an
+            // authentication redirect a client silently follows, or a CDN/WAF error page served
+            // with `200 OK` and an HTML body looks like to `REGEX_LINE`: no parse *error* (HTML is
+            // valid UTF-8 text), just no IP-shaped tokens on any line. Flagging this as PARTIAL
+            // rather than SUCCESS keeps it visible in `sync_logs` for an operator to notice,
+            // without treating a fetch/parse that technically completed as a hard FAILED.
+            "PARTIAL"
+        } else {
+            "SUCCESS"
+        }
     } else if any_success {
         "PARTIAL"
     } else {
         "FAILED"
+    };
+    let error_message = if items_processed == 0 && errors.is_empty() {
+        Some(
+            "feed returned zero parseable entries; the source may be misconfigured, rate-limited, \
+             or returning an error/captive-portal page instead of its real content"
+                .to_owned(),
+        )
+    } else if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
     };
 
     JobSummary {
@@ -207,7 +232,7 @@ async fn execute(
         items_processed: items_processed as i32,
         chunks_sent,
         duration_ms: start.elapsed().as_millis() as i32,
-        error_message: if errors.is_empty() { None } else { Some(errors.join("; ")) },
+        error_message,
     }
 }
 

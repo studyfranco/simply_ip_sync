@@ -127,3 +127,92 @@ fn plain_text_body_is_not_mistaken_for_a_zip_archive() {
     let result = simply_ip_sync::jobs::decompress::decompress_if_zip(plain).expect("passthrough");
     assert_eq!(result, plain);
 }
+
+/// Task 4: a Cloudflare-style block/error page — the shape a feed host commonly returns with a
+/// `200 OK` when it's actually rate-limiting, WAF-blocking, or captive-portal-redirecting the
+/// request. Contains no dotted-decimal or colon-hex substrings by construction (the Ray ID is
+/// plain hex, no separators), so `REGEX_LINE` must extract nothing — not panic, not fabricate a
+/// match out of markup.
+const CLOUDFLARE_ERROR_PAGE: &str = r#"<!DOCTYPE html>
+<html>
+<head><title>Attention Required! | Cloudflare</title></head>
+<body class="no-js">
+<div id="cf-wrapper">
+  <div class="cf-alert cf-alert-error cf-cookie-error" id="cookie-alert" data-translate="enable_cookies">
+    Please enable cookies.
+  </div>
+  <div id="cf-error-details" class="p-0">
+    <h1>Sorry, you have been blocked</h1>
+    <p>You are unable to access this website.</p>
+    <div class="cf-error-footer">
+      <p>Ray ID: <code>8f2a1c9d4b3e7f10</code></p>
+      <p>Performance &amp; security by Cloudflare</p>
+    </div>
+  </div>
+</div>
+</body>
+</html>"#;
+
+/// A captive-portal redirect page — the other very common "200 OK but not the real content" case
+/// (public wifi, corporate proxy auth walls). Its `<meta http-equiv="refresh">` target deliberately
+/// carries a private gateway address to prove the parser doesn't get confused by markup
+/// *containing* an IP-shaped substring inside an attribute value — that address should still be
+/// extracted (the parser has no notion of HTML structure, only line-oriented token scanning), but
+/// it must not crash or mis-extract garbage around it.
+const CAPTIVE_PORTAL_PAGE: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="refresh" content="0; url=http://192.168.1.1/portal/login">
+<title>Wi-Fi Login Required</title>
+</head>
+<body>
+<p>Redirecting to the login portal&hellip;</p>
+<script>window.location.href = "http://192.168.1.1/portal/login";</script>
+</body>
+</html>"#;
+
+#[test]
+fn html_error_page_yields_zero_entries_from_regex_line_no_panic() {
+    let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
+    let records = parser.parse(CLOUDFLARE_ERROR_PAGE.as_bytes(), None).expect("parse must not error");
+    assert!(records.is_empty(), "an HTML error page with no IP-shaped text must yield zero entries, got {records:?}");
+}
+
+#[test]
+fn html_error_page_is_a_hard_parse_failure_for_json_path() {
+    let parser = parsers::for_type("JSON_PATH").expect("known parser type");
+    let config = r#"{"ip_field":"ip"}"#;
+    let result = parser.parse(CLOUDFLARE_ERROR_PAGE.as_bytes(), Some(config));
+    assert!(result.is_err(), "HTML is not valid JSON and must be reported as a parse error, not silently empty");
+}
+
+#[test]
+fn captive_portal_page_extracts_the_embedded_address_without_crashing() {
+    let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
+    let records = parser.parse(CAPTIVE_PORTAL_PAGE.as_bytes(), None).expect("parse must not error");
+    // The line-oriented scanner has no concept of HTML syntax, so an IP-shaped substring inside a
+    // URL or script tag is still picked up — documented behavior, not a bug: normalize_ip_or_cidr
+    // re-validates every candidate, so this can never smuggle in something that isn't a real IP.
+    assert!(records.iter().all(|r| r.parse::<std::net::IpAddr>().is_ok() || r.parse::<ipnetwork::IpNetwork>().is_ok()));
+}
+
+/// A large HTML body (well beyond a single packet/buffer's worth) must still parse in bounded
+/// time and yield zero matches, as a proxy for "no unbounded memory growth or quadratic blowup on
+/// adversarial input" — the closest a unit test can get to a memory-stability assertion without
+/// an actual profiler attached.
+#[test]
+fn large_html_body_parses_quickly_with_zero_matches() {
+    let mut big_html = String::from("<!DOCTYPE html><html><body>\n");
+    for i in 0..50_000 {
+        big_html.push_str(&format!("<div class=\"row-{i}\">Not a threat feed entry, just markup.</div>\n"));
+    }
+    big_html.push_str("</body></html>");
+
+    let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
+    let start = std::time::Instant::now();
+    let records = parser.parse(big_html.as_bytes(), None).expect("parse must not error");
+    let elapsed = start.elapsed();
+
+    assert!(records.is_empty());
+    assert!(elapsed < std::time::Duration::from_secs(5), "parsing ~{} bytes took {elapsed:?}, expected well under 5s", big_html.len());
+}

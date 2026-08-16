@@ -124,17 +124,30 @@ extraction pattern alone.
 
 ## `src/jobs/` — execution pipelines
 
-`mod.rs`: `chunk_records` (`MAX_BATCH_SIZE = 5_000`), `JobSummary`, `write_sync_log`.
+`mod.rs`: `chunk_records` (`MAX_BATCH_SIZE = 5_000`), `JobSummary`, `write_sync_log`, and the
+concurrency guard — `RunningJobs`, `JobGuard`, `try_start_job`. The guard is a
+`HashSet<Uuid>` behind a `std::sync::Mutex` (never held across `.await`), claimed via
+`try_start_job` and released by `JobGuard::drop` on every exit path including an early `?` —
+refuses a second concurrent execution of the same source/task rather than letting two overlapping
+runs push interleaved batches to the same target group. Wired into both manual-trigger HTTP
+handlers (`api/sources.rs`, `api/sync_tasks.rs` — a second concurrent trigger gets `409`) and the
+scheduler's cron closures (a slow prior tick causes the next one to skip with a logged warning).
 `decompress.rs`: `decompress_if_zip`/`is_zip` — transparent ZIP-archive decompression inserted
 into `external_ingestion.rs` before any parser runs, so ZIP-distributed feeds (e.g. StopForumSpam)
 work with every parser type without the parser layer knowing archives exist; a pure passthrough
 for the (overwhelmingly common) non-ZIP case.
 `external_ingestion.rs`: fetch → decompress-if-zip → parse → dedupe → chunk → push to every
 configured target vault, one `sync_logs` row per execution, `last_run_at` always updated (it means
-"last execution", not "last successful execution"). `vault_sync.rs`: delta fetch (including
-tombstones) → chunk → push, `last_sync_at` only advances when **every** target succeeds. Both are
-plain `(&AppState, Uuid) -> Result<JobSummary, AppError>` functions, callable identically from
-`scheduler.rs` and from the manual-trigger HTTP handlers.
+"last execution", not "last successful execution"). A fetch+parse that completes but yields
+**zero** items is deliberately reported as `PARTIAL`, not `SUCCESS` — this pipeline re-fetches a
+feed's full content every run (not an incremental diff), so genuinely zero entries is anomalous
+and is exactly what an HTML error/captive-portal page served with `200 OK` looks like to
+`REGEX_LINE`. `vault_sync.rs`: delta fetch (including tombstones) → chunk → push, `last_sync_at`
+only advances when **every** target succeeds — zero *new* delta records is routine here (it is an
+incremental diff), so that same zero-items flag does not apply. Both are plain
+`(&AppState, Uuid) -> Result<JobSummary, AppError>` functions, callable identically from
+`scheduler.rs` and from the manual-trigger HTTP handlers (both of which claim the concurrency
+guard above before calling in).
 
 `scheduler.rs` additionally exposes `validate_cron_expression` — called from the `POST`/`PATCH`
 handlers in `api/sources.rs` and `api/sync_tasks.rs` *before* any database write, via the same
@@ -198,11 +211,12 @@ two or more Master rows.
 | File | Owns |
 | :--- | :--- |
 | `common/mod.rs` | Shared harness: in-memory DB + pinned Master, `insert_key` (mints credentials directly against the database), `sign`/`signed_request` (real `CANONICAL_V1` signing) |
-| `security_tests.rs` | Inbound HMAC verification, replay, `bound_ips`, and outbound signature generation against a `wiremock`-mocked vault |
-| `parser_tests.rs` | `REGEX_LINE`/`JSON_PATH` black-box behavior through the public `parsers` API, plus local fixtures reproducing StopForumSpam's ZIP and Spamhaus's JSONL feed shapes (both inspected against the real downloads) via `tempfile::tempdir()` for automatic cleanup |
+| `security_tests.rs` | Inbound HMAC verification, replay, `bound_ips`, outbound signature generation against a `wiremock`-mocked vault, and trusted-proxy `X-Forwarded-For` handling (permitted when forwarded through a trusted peer, never a `bound_ips` bypass from an untrusted one) |
+| `parser_tests.rs` | `REGEX_LINE`/`JSON_PATH` black-box behavior through the public `parsers` API, local fixtures reproducing StopForumSpam's ZIP and Spamhaus's JSONL feed shapes (both inspected against the real downloads) via `tempfile::tempdir()` for automatic cleanup, and HTML-masquerading-as-a-feed fixtures (block page, captive portal, a large synthetic body) |
 | `chunking_tests.rs` | Batch chunking never exceeds `MAX_BATCH_SIZE` at any boundary |
 | `api_validation_tests.rs` | Malformed `cron_schedule` on `POST`/`PATCH` for both `/api/sources` and `/api/sync-tasks` is rejected with `400` before any database write |
-| `vault_sync_tests.rs` | Tombstone propagation through a full fetch→push cycle; `last_sync_at` only advances on total success; multi-vault fan-out (both targets receive the batch) and partial-failure resilience (`PARTIAL` status, `last_sync_at` withheld, the healthy target still gets delivered to) |
+| `external_ingestion_tests.rs` | Per-target `target_group_name` override; HTML-masquerade-as-200 via both parser types; gzip-compressed response decompression; a slow/hung target aborted by the client's own timeout rather than hanging; the `try_start_job` concurrency guard exercised directly |
+| `vault_sync_tests.rs` | Tombstone propagation through a full fetch→push cycle; `last_sync_at` only advances on total success; multi-vault fan-out and partial-failure resilience; per-target `target_group_name` override; a slow/hung target vault aborted on the push path specifically |
 | `live_feed_ingestion_tests.rs` | `#[ignore]`d — real network calls to the four feeds named in `AGENT_NOTES.MD`, both via the parser directly and through the full `jobs::external_ingestion::run` pipeline. Run explicitly with `cargo test -- --ignored` |
 | `rbac_tests.rs` | `can_sync` manual-trigger allow/403, R4 scope elevation, §5 Master immutability/rotation refusal, §3 owner-only lifecycle |
 | `schema_integrity_tests.rs` | Migrations apply cleanly; `ADVERSARIAL(§5)` — a raw-SQL insert with the marker column absent is rejected by the database itself; FK cascade on a junction table |

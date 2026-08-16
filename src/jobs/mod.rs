@@ -6,11 +6,54 @@ pub mod decompress;
 pub mod external_ingestion;
 pub mod vault_sync;
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use chrono::Utc;
 use sea_orm::{EntityTrait, Set};
 use uuid::Uuid;
 
 use crate::entities::sync_log;
+
+/// The set of resource ids (external source or sync task) with a job currently in flight.
+/// Prevents two overlapping executions of the *same* resource — a manual trigger racing a cron
+/// tick, two manual triggers fired back to back, or a slow run still executing when its next cron
+/// tick comes due — from running concurrently and pushing overlapping/interleaved batches to the
+/// same target group. Deliberately a plain `std::sync::Mutex` rather than `tokio::sync::Mutex`:
+/// the lock is only ever held for the synchronous insert/remove in [`try_start_job`] and
+/// [`JobGuard::drop`], never across an `.await`, so the lighter-weight std primitive is correct
+/// and cannot deadlock a worker thread.
+pub type RunningJobs = Arc<Mutex<HashSet<Uuid>>>;
+
+/// Holds `id`'s slot in a [`RunningJobs`] set for as long as it lives. Dropping (falling out of
+/// scope, including via an early `?` return) releases the slot — this is what makes the guard
+/// safe to use across a fallible job run without a matching manual "remove" call on every exit
+/// path.
+pub struct JobGuard {
+    set: RunningJobs,
+    id: Uuid,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.id);
+        }
+    }
+}
+
+/// Attempts to claim `id`'s slot in `set`. Returns `None` if a job for `id` is already running
+/// (the caller should treat this as "already in progress", not as an error to retry blindly), or
+/// if the lock was poisoned by a prior panic elsewhere (fails closed: refuses to start a new job
+/// rather than risk running concurrently with whatever left the lock poisoned).
+pub fn try_start_job(set: &RunningJobs, id: Uuid) -> Option<JobGuard> {
+    let mut guard = set.lock().ok()?;
+    if !guard.insert(id) {
+        return None;
+    }
+    drop(guard);
+    Some(JobGuard { set: set.clone(), id })
+}
 
 /// Maximum number of records sent in a single `POST /api/records/batch` chunk. Below
 /// `simply_ip_vault`'s own `MAX_BATCH_RECORDS = 10_000` ceiling, so a full-size chunk is never
