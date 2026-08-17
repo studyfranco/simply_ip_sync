@@ -159,6 +159,219 @@ async fn resource_lifecycle_delete_requires_owner_or_master() {
     assert_eq!(resp_owner.status(), StatusCode::NO_CONTENT, "the owner may always delete their own resource");
 }
 
+/// R1 (non-amplification): a caller may only grant a verb it currently holds itself on the same
+/// resource. A Parent holding `can_manage=true` but not `can_sync` on a source must be refused
+/// when attempting to grant `can_sync` to a daughter key, even though it otherwise satisfies R2
+/// (manage rights on the resource).
+#[tokio::test]
+async fn cannot_grant_can_sync_without_holding_it_yourself_r1() {
+    let (conn, state, master) = common::setup().await;
+    let granter = common::insert_key(&conn, "Granter", false, true, false, false, Some(master.id)).await;
+    let grantee = common::insert_key(&conn, "Grantee", false, false, false, false, Some(master.id)).await;
+    let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
+
+    let granter_permission = api_key_sync_permission::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        api_key_id: Set(granter.id),
+        resource_type: Set("external_source".to_owned()),
+        resource_id: Set(source_id),
+        can_sync: Set(false),
+        can_manage: Set(true),
+        can_view_logs: Set(false),
+        created_at: Set(Utc::now()),
+    };
+    granter_permission.insert(&conn).await.expect("grant manage-only to granter");
+
+    let app = simply_ip_sync::create_app(state);
+    let payload = json!({ "resource_type": "external_source", "resource_id": source_id, "can_sync": true });
+    let req = common::signed_request(&granter, "PUT", &format!("/api/keys/{}/permissions", grantee.id), Some(payload));
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "R1: cannot grant can_sync without holding it yourself on the resource");
+}
+
+/// R6 (revocation is never escalation): revoking a permission requires only R2 (manage rights on
+/// the resource) — the revoker need not hold the verb being removed. A Parent with `can_manage`
+/// but not `can_sync` must still be able to revoke someone else's `can_sync` grant.
+#[tokio::test]
+async fn revocation_requires_only_manage_not_the_verb_itself_r6() {
+    let (conn, state, master) = common::setup().await;
+    let revoker = common::insert_key(&conn, "Revoker", false, true, false, false, Some(master.id)).await;
+    let grantee = common::insert_key(&conn, "Grantee", false, false, false, false, Some(master.id)).await;
+    let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
+
+    let revoker_permission = api_key_sync_permission::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        api_key_id: Set(revoker.id),
+        resource_type: Set("external_source".to_owned()),
+        resource_id: Set(source_id),
+        can_sync: Set(false),
+        can_manage: Set(true),
+        can_view_logs: Set(false),
+        created_at: Set(Utc::now()),
+    };
+    revoker_permission.insert(&conn).await.expect("grant manage-only to revoker");
+
+    let grantee_permission_id = Uuid::new_v4();
+    let grantee_permission = api_key_sync_permission::ActiveModel {
+        id: Set(grantee_permission_id),
+        api_key_id: Set(grantee.id),
+        resource_type: Set("external_source".to_owned()),
+        resource_id: Set(source_id),
+        can_sync: Set(true),
+        can_manage: Set(false),
+        can_view_logs: Set(false),
+        created_at: Set(Utc::now()),
+    };
+    grantee_permission.insert(&conn).await.expect("grant can_sync to grantee");
+
+    let app = simply_ip_sync::create_app(state);
+    let req = common::signed_request(
+        &revoker,
+        "DELETE",
+        &format!("/api/keys/{}/permissions/{}", grantee.id, grantee_permission_id),
+        None,
+    );
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "R6: revocation needs only manage rights, not the verb being removed");
+}
+
+/// A key that still owns a resource cannot be deleted — `delete_api_key` returns `409` with the
+/// resource inventory, rather than deleting the key and leaving `owner_key_id` dangling (this is
+/// precisely why `owner_key_id` carries no FK constraint — see
+/// `tests/referential_integrity.rs::owner_key_id_is_deliberately_unconstrained_by_design` — the
+/// safety here is enforced by this guard, not by the schema).
+#[tokio::test]
+async fn deleting_a_key_that_still_owns_resources_is_blocked_with_inventory() {
+    let (conn, state, master) = common::setup().await;
+    let owner = common::insert_key(&conn, "Owner", false, false, true, false, Some(master.id)).await;
+    let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", owner.id).await;
+
+    let app = simply_ip_sync::create_app(state);
+    let req = common::signed_request(&master, "DELETE", &format!("/api/keys/{}", owner.id), None);
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    let owned = body["owned_resources"].as_array().expect("owned_resources array");
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0]["id"], json!(source_id));
+}
+
+/// The mirror case: a key that owns nothing deletes cleanly.
+#[tokio::test]
+async fn deleting_a_key_with_no_owned_resources_succeeds() {
+    let (conn, state, master) = common::setup().await;
+    let empty_handed = common::insert_key(&conn, "EmptyHanded", false, false, false, false, Some(master.id)).await;
+
+    let app = simply_ip_sync::create_app(state);
+    let req = common::signed_request(&master, "DELETE", &format!("/api/keys/{}", empty_handed.id), None);
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+/// Enumeration resistance (oracle discipline): a vault endpoint that exists but is out of the
+/// caller's visibility scope, and a vault endpoint id that does not exist at all, must be
+/// byte-for-byte indistinguishable — same status, same body. If they differed, an unauthorized
+/// caller could enumerate real resource ids by noticing which ids get a *different* 404 shape than
+/// obviously-random ones.
+#[tokio::test]
+async fn out_of_scope_and_nonexistent_vaults_are_indistinguishable() {
+    let (conn, state, master) = common::setup().await;
+    let stranger = common::insert_key(&conn, "Stranger", false, false, false, false, Some(master.id)).await;
+    let out_of_scope_id = {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext.seal("secret").unwrap();
+        let model = simply_ip_sync::entities::vault_endpoint::ActiveModel {
+            id: Set(id),
+            name: Set("owned-by-master".to_owned()),
+            target_url: Set("http://127.0.0.1:1".to_owned()),
+            api_key: Set("k".to_owned()),
+            signing_secret: Set(sealed),
+            description: Set(None),
+            owner_key_id: Set(Some(master.id)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        model.insert(&conn).await.expect("insert vault owned by someone else");
+        id
+    };
+    let nonexistent_id = Uuid::new_v4();
+
+    let app = simply_ip_sync::create_app(state);
+    let req_out_of_scope = common::signed_request(&stranger, "GET", &format!("/api/vaults/{out_of_scope_id}"), None);
+    let resp_out_of_scope = app.clone().oneshot(req_out_of_scope).await.expect("response");
+    let status_out_of_scope = resp_out_of_scope.status();
+    let body_out_of_scope = body_json(resp_out_of_scope).await;
+
+    let req_nonexistent = common::signed_request(&stranger, "GET", &format!("/api/vaults/{nonexistent_id}"), None);
+    let resp_nonexistent = app.oneshot(req_nonexistent).await.expect("response");
+    let status_nonexistent = resp_nonexistent.status();
+    let body_nonexistent = body_json(resp_nonexistent).await;
+
+    assert_eq!(status_out_of_scope, StatusCode::NOT_FOUND);
+    assert_eq!(status_out_of_scope, status_nonexistent, "an out-of-scope resource must return the same status as one that doesn't exist");
+    assert_eq!(body_out_of_scope, body_nonexistent, "an out-of-scope resource must return the same body as one that doesn't exist");
+}
+
+/// Builds a signed request like `common::signed_request`, but with an explicit timestamp rather
+/// than always "now" — needed so two requests built back-to-back in the same wall-clock second
+/// don't collide into byte-identical `CANONICAL_V1` signatures, which the anti-replay guard would
+/// then (correctly) reject the second of as a replay, an artifact that has nothing to do with
+/// whatever property the test actually wants to exercise concurrently.
+fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestamp: i64) -> axum::http::Request<Body> {
+    let ts = timestamp.to_string();
+    let signature = simply_ip_sync::crypto::compute_signature(&key.signing_secret, method, target, &ts, b"").expect("sign");
+    let mut req = Request::builder()
+        .method(method)
+        .uri(target)
+        .header("X-API-Key", key.plaintext_key.clone())
+        .header("X-Timestamp", ts)
+        .header("X-Signature-256", signature)
+        .body(Body::empty())
+        .expect("build");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+    req
+}
+
+/// Two genuinely concurrent `DELETE` requests for the same resource, fired via `tokio::join!`
+/// against the same shared-state router rather than sequentially — proves the
+/// find-then-delete sequence in `delete_external_source` doesn't let both requests observe the row
+/// as present and both report success. `simply_ip_sync`'s SQLite pool is pinned to a single
+/// connection (`db::SQLITE_MAX_CONNECTIONS`), which serializes the two requests' actual queries
+/// regardless — this test proves the *outcome* end to end (exactly one `204`, exactly one `404`)
+/// rather than assuming that serialization is sufficient from reading the pool config alone.
+#[tokio::test]
+async fn concurrent_deletes_of_the_same_resource_do_not_both_succeed() {
+    let (conn, state, master) = common::setup().await;
+    let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
+
+    let app = simply_ip_sync::create_app(state);
+    let now = Utc::now().timestamp();
+    // Distinct timestamps (not distinct in any way that matters to the property under test — see
+    // this helper's doc comment) so both requests carry distinct, individually-valid signatures.
+    let target = format!("/api/sources/{source_id}");
+    let req_a = signed_request_at(&master, "DELETE", &target, now);
+    let req_b = signed_request_at(&master, "DELETE", &target, now + 1);
+
+    let app_a = app.clone();
+    let app_b = app.clone();
+    let (resp_a, resp_b) = tokio::join!(app_a.oneshot(req_a), app_b.oneshot(req_b));
+    let status_a = resp_a.expect("response a").status();
+    let status_b = resp_b.expect("response b").status();
+
+    let statuses = {
+        let mut s = vec![status_a, status_b];
+        s.sort_by_key(|s| s.as_u16());
+        s
+    };
+    assert_eq!(
+        statuses,
+        vec![StatusCode::NO_CONTENT, StatusCode::NOT_FOUND],
+        "exactly one concurrent delete must succeed (204) and the other must find nothing left to delete (404), never both 204"
+    );
+}
+
 #[tokio::test]
 async fn unauthenticated_request_never_reaches_a_handler() {
     let (_conn, state, _master) = common::setup().await;

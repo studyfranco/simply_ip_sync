@@ -274,4 +274,60 @@ mod tests {
         let digest = verify_signature(secret, "POST", "/x", "1", b"{}", "deadbeef");
         assert!(digest.is_none());
     }
+
+    /// Adapted from a pattern audited in `example/simply_ip_vault/tests/security_tests.rs`
+    /// (2026-08-17 cross-project test audit — see `AGENT_NOTES.MD`): flip every one of a valid
+    /// tag's 256 bits individually and confirm every single mutation fails verification. A hex
+    /// tamper test (like `verify_signature_rejects_tampered_body`, which changes the *body*, not
+    /// the tag) only ever samples 4 of a nibble's 16 possible values and can't isolate a
+    /// short-circuit or word-boundary bug in the comparison itself; a full bit sweep can.
+    #[test]
+    fn every_single_bit_flip_of_a_valid_tag_fails_verification() {
+        let secret = "test-secret";
+        let method = "POST";
+        let target = "/api/records/batch";
+        let timestamp = "1700000000";
+        let body = b"{\"records\":[]}";
+
+        let valid_sig = compute_signature(secret, method, target, timestamp, body).expect("compute");
+        let valid_hex = valid_sig.strip_prefix(SIGNATURE_PREFIX).expect("has prefix");
+        let valid_bytes = hex::decode(valid_hex).expect("valid hex");
+        assert_eq!(valid_bytes.len(), 32, "HMAC-SHA256 tag must be exactly 32 bytes");
+
+        for byte_index in 0..valid_bytes.len() {
+            for bit in 0..8u8 {
+                let mut mutated = valid_bytes.clone();
+                mutated[byte_index] ^= 1 << bit;
+                let mutated_sig = format!("{SIGNATURE_PREFIX}{}", hex::encode(&mutated));
+                let digest = verify_signature(secret, method, target, timestamp, body, &mutated_sig);
+                assert!(
+                    digest.is_none(),
+                    "flipping bit {bit} of byte {byte_index} produced a tag that still verified — constant-time comparison bug?"
+                );
+            }
+        }
+    }
+
+    /// Every wrong tag *length* (not just wrong content) must also fail cleanly — a length
+    /// mismatch is exactly the class of input a naive byte-by-byte comparison loop (rather than
+    /// `subtle`/`hmac`'s fixed-length `verify_slice`) could mishandle (e.g. reading out of bounds,
+    /// or truncating instead of rejecting).
+    #[test]
+    fn every_wrong_tag_length_fails_verification() {
+        let secret = "test-secret";
+        let method = "GET";
+        let target = "/api/auth/me";
+        let timestamp = "1700000000";
+        let body = b"";
+
+        for len in 0..64usize {
+            if len == 32 {
+                continue; // the one correct length, covered by the round-trip test separately
+            }
+            let wrong_length_bytes = vec![0xABu8; len];
+            let wrong_length_sig = format!("{SIGNATURE_PREFIX}{}", hex::encode(&wrong_length_bytes));
+            let digest = verify_signature(secret, method, target, timestamp, body, &wrong_length_sig);
+            assert!(digest.is_none(), "a {len}-byte tag must never verify (only 32 bytes is a valid HMAC-SHA256 length)");
+        }
+    }
 }

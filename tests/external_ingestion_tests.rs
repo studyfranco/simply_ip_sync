@@ -134,6 +134,59 @@ fn synth_ip(i: u32) -> String {
     format!("10.{}.{}.{}", (i / 65536) % 256, (i / 256) % 256, i % 256)
 }
 
+/// Prompted by a bug audited in `example/simply_ip_vault`'s own test suite this session
+/// (2026-08-17 cross-project test audit — see `AGENT_NOTES.MD`): its `POST /api/records/batch`
+/// rejects a whole batch containing two entries that are the *same* address in different notation
+/// (`203.0.113.60` and `203.0.113.60/32`). A feed mixing bare-IP and CIDR-singleton notation for
+/// the same address would trip that rejection unless deduplication happens on *canonical* form,
+/// not raw string equality. `jobs::external_ingestion::execute`'s dedup (`seen.insert(r.clone())`)
+/// operates on whatever each `FeedParser` already returned — and every parser already normalizes
+/// through `parsers::normalize_ip_or_cidr` before returning a candidate (collapsing `/32`→bare,
+/// `/128`→bare, and any equivalent IPv6 spelling to its canonical form) — so this is, by
+/// construction, already correct upstream of the job-layer dedup. This test pins that property
+/// end to end rather than leaving it as an unverified inference from reading two files together.
+#[tokio::test]
+async fn mixed_notation_duplicate_addresses_canonicalize_and_dedupe_to_one_record() {
+    let (conn, state, _master) = common::setup().await;
+
+    // Three notations of two addresses: a bare IPv4 and its /32 CIDR-singleton form (equal), and
+    // an unabbreviated vs. abbreviated IPv6 spelling of the same address (also equal).
+    let feed_body = "203.0.113.60\n203.0.113.60/32\n2001:0db8::0001\n2001:db8::1\n";
+
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(feed_body))
+        .mount(&feed_mock)
+        .await;
+
+    let target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_response()))
+        .mount(&target_mock)
+        .await;
+
+    let source_id = insert_source(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group").await;
+    let vault_id = insert_vault(&conn, "target", &target_mock.uri()).await;
+    insert_target(&conn, source_id, vault_id, None).await;
+
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+    assert_eq!(summary.status, "SUCCESS");
+    assert_eq!(summary.items_processed, 2, "four lines naming only two distinct addresses (in different notations) must dedupe to 2, not 4");
+
+    let received = target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(received.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    let addresses: Vec<String> = body["records"]
+        .as_array()
+        .expect("records array")
+        .iter()
+        .map(|r| r["target_address"].as_str().expect("target_address").to_owned())
+        .collect();
+    assert_eq!(addresses, vec!["203.0.113.60".to_owned(), "2001:db8::1".to_owned()], "each pair must collapse to its single canonical form");
+}
+
 /// Task 4: a `full_replace` source whose feed is large enough to need multiple chunks (12,000
 /// records / `MAX_BATCH_SIZE` 5,000 = 3 chunks of 5000/5000/2000) must only mark the *first* chunk
 /// as `full_replace` on the wire — chunks 2 and 3 of the same run must arrive as `upsert`, or

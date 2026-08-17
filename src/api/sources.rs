@@ -361,7 +361,13 @@ pub async fn delete_external_source(
     guard_resource_lifecycle(&caller, existing.owner_key_id)?;
 
     let name = existing.name.clone();
-    external_source::Entity::delete_by_id(id).exec(&state.db).await?;
+    // Two concurrent deletes of the same id can both pass the `find_by_id` check above before
+    // either's `DELETE` runs; checking `rows_affected` is what keeps only the one that actually
+    // removed a row from reporting success — the other must see 404, not a second, empty 204.
+    let result = external_source::Entity::delete_by_id(id).exec(&state.db).await?;
+    if result.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
     state.scheduler.remove_source(id).await;
     create_audit_log(&state.db, &caller, client_ip.0, "SOURCE_DELETE", Some(name), None).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)

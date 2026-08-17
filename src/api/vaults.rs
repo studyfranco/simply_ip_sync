@@ -207,7 +207,12 @@ pub async fn delete_vault_endpoint(
     guard_resource_lifecycle(&caller, existing.owner_key_id)?;
 
     let name = existing.name.clone();
-    vault_endpoint::Entity::delete_by_id(id).exec(&state.db).await?;
+    // See `sources.rs::delete_external_source`'s identical comment: two concurrent deletes of the
+    // same id can both pass `find_by_id` before either `DELETE` runs.
+    let result = vault_endpoint::Entity::delete_by_id(id).exec(&state.db).await?;
+    if result.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
     create_audit_log(&state.db, &caller, client_ip.0, "VAULT_DELETE", Some(name), None).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

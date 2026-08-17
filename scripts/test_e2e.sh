@@ -1314,6 +1314,64 @@ check "403" "a daughter key without can_manage_sources cannot create an external
 api_call POST "/api/keys" "$DAUGHTER_KEY" '{"name":"privilege-escalation-attempt","can_manage_sources":true}'
 check "403" "a non-master key cannot grant can_manage_sources to a new key it creates (RBAC R4)"
 
+log_section "10a. RBAC delegation (R1/R6) & enumeration resistance (2026-08-17 peer-audit findings)"
+
+# R1 (non-amplification): a Parent-tier key holding only `can_manage` (not `can_sync`) on a
+# resource must be refused when attempting to grant `can_sync` to another key — manage rights
+# alone (R2) are not enough; the granter must hold the verb it's trying to hand out.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"r1-granter-key","can_manage_keys":true}'
+check "200" "create a Parent-tier key for the R1 non-amplification check"
+R1_GRANTER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+R1_GRANTER_SECRET=$(echo "$RESP_BODY" | jq -r '.plaintext_signing_secret')
+R1_GRANTER_ID=$(echo "$RESP_BODY" | jq -r '.key.id')
+register_key_secret "$R1_GRANTER_KEY" "$R1_GRANTER_SECRET"
+
+api_call PUT "/api/keys/$R1_GRANTER_ID/permissions" "$MASTER_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$SCRATCH_VAULT_ID\",\"can_manage\":true}"
+check "200" "grant the R1 granter can_manage (but not can_sync) on the scratch vault"
+
+api_call PUT "/api/keys/$DAUGHTER_ID/permissions" "$R1_GRANTER_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$SCRATCH_VAULT_ID\",\"can_sync\":true}"
+check "403" "R1: cannot grant can_sync without holding it yourself on the resource, even with manage rights (R2)"
+
+# R6 (revocation is never escalation): revoking a permission needs only manage rights on the
+# resource — the revoker need not hold the verb being removed.
+api_call PUT "/api/keys/$DAUGHTER_ID/permissions" "$MASTER_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$SCRATCH_VAULT_ID\",\"can_sync\":true}"
+check "200" "master grants the daughter can_sync directly (bypassing R1 for test setup)"
+DAUGHTER_PERMISSION_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call DELETE "/api/keys/$DAUGHTER_ID/permissions/$DAUGHTER_PERMISSION_ID" "$R1_GRANTER_KEY"
+check "204" "R6: revocation succeeds with only manage rights — the revoker need not hold can_sync itself"
+
+api_call DELETE "/api/keys/$R1_GRANTER_ID" "$MASTER_KEY"
+check "204" "clean up the R1/R6 granter key"
+
+# Enumeration resistance (oracle discipline): a resource the caller has no visibility into and a
+# resource id that doesn't exist at all must be indistinguishable — same status, same body — or an
+# attacker could enumerate real ids by noticing which 404s look subtly different.
+api_call GET "/api/vaults/$SCRATCH_VAULT_ID" "$DAUGHTER_KEY"
+check "404" "a vault the daughter has no visibility into is 404, not 403 (which would itself leak that the id exists)"
+OUT_OF_SCOPE_BODY="$RESP_BODY"
+NONEXISTENT_UUID="00000000-0000-0000-0000-000000000000"
+api_call GET "/api/vaults/$NONEXISTENT_UUID" "$DAUGHTER_KEY"
+check "404" "a vault id that doesn't exist at all is also 404"
+check_local "$OUT_OF_SCOPE_BODY" "$RESP_BODY" "an out-of-scope vault and a nonexistent one return byte-identical response bodies"
+
+# An oversized inbound body must be rejected cleanly (400), not a 500 or a hang — regardless of
+# whether the (deliberately garbage) signature would have verified, since the body-size check in
+# auth_middleware runs before signature verification. Written to a file rather than passed as a
+# shell argument: an 11MB `--data-binary "$VAR"` blows past the OS's ARG_MAX ("Argument list too
+# long"), which curl reports as a generic exec failure with no HTTP status at all, not the 400 this
+# check exists to assert; `--data-binary @file` streams it instead.
+OVERSIZED_BODY_FILE="$WORK_DIR/oversized_body"
+head -c 11000000 /dev/zero | tr '\0' 'a' > "$OVERSIZED_BODY_FILE"
+next_timestamp
+raw_call POST "/api/sources" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SIGNED_TS" \
+    -H "X-Signature-256: sha256=0000000000000000000000000000000000000000000000000000000000000000" \
+    -H "Content-Type: application/json" --data-binary "@$OVERSIZED_BODY_FILE"
+check "400" "a body over MAX_BODY_SIZE_MIB (10 MiB default) is rejected cleanly (400) rather than a 500 or a hang"
+
 api_call PATCH "/api/keys/$MASTER_ID" "$MASTER_KEY" '{"name":"Renamed Master"}'
 check "403" "the Master key cannot be renamed through the API (RBAC §5)"
 

@@ -656,3 +656,181 @@ executed", never "the job succeeded".
   a global identifier.
 - `./scripts/verify_convergence.sh` still does not exist (see sessions 1–2's decision) and was not
   requested as a gate this session.
+
+## Session 6 (2026-08-17): cross-project test-pattern audit
+
+Requested as an audit, not a features session: read every peer project's test suite in `example/`
+(pulling each first, per `AGENT.MD`'s peer-sync rule), extract testing techniques not yet present
+here, and adapt the genuinely applicable ones. **Read-only against `example/`** — every peer repo
+was only `git pull --ff-only`d and read; all edits landed exclusively in `simply_ip_sync`'s own
+tree.
+
+**Projects audited** (all three under `example/`, each freshly pulled first):
+- `simply_hook_executor` (`ee9209a`, already up to date) — `tests/health_probes.rs`,
+  `referential_integrity.rs`, `rbac_model_compliance.rs`, `source_hygiene.rs`, `scripts/test_e2e.sh`.
+- `simply_ip_exporter` (`bd90b7c` → `f23e17c`, fresh pull today) — `tests/integration.rs`,
+  `source_hygiene.rs`, `scripts/test_e2e.sh`, and its new `src/extract.rs`/`error.rs` additions.
+- `simply_ip_vault` (`e8f9c14` → `ff18806`, fresh pull today) — `tests/security_tests.rs`,
+  `rbac_integration_tests.rs` (brand new — added the same day, alongside a real
+  `since`-filtering/tombstone-visibility bug fix in `src/api/records.rs`), `rbac_model_compliance.rs`.
+
+Audited via three parallel read-only research agents (one per peer), each briefed on this
+project's existing coverage so findings were filtered against what's already here rather than
+re-suggesting it. Every finding was then independently re-verified against `simply_ip_sync`'s
+actual code (grep the real handler, read the real guard, run the test before trusting it) before
+acting on it — two findings turned out to need correction after that step (see below).
+
+**Patterns adapted, by source:**
+
+- **`simply_hook_executor`**: a dedicated `tests/health_probes.rs` (new) proving liveness survives
+  a severed database (`state.db.close_by_ref()`, not a mock) and readiness independently depends on
+  *both* the database and the boot-time Master-pin invariant — including a startup-ordering test
+  (an unpinned `MasterPin::new()` swapped into `AppState` post-`common::setup()`) that a
+  steady-state-only suite structurally cannot produce, since every other test's harness has already
+  pinned the master by the time it runs. Also a dedicated `tests/referential_integrity.rs` (new):
+  cascade correctness proven *bidirectionally* (a doomed and a survivor source sharing one target
+  vault — deleting the doomed one must not touch the survivor's junction row, which a single-row
+  cascade test can't distinguish from "cascaded too broadly"), write-time FK rejection (not just
+  delete-time), and — the most interesting port — a test proving `owner_key_id` on
+  `external_sources`/`vault_endpoints`/`vault_sync_tasks` carries **no FK constraint at all**
+  (confirmed against the migration: no `ForeignKey::create()` targets it), which is deliberate: a
+  raw-SQL insert with a dangling `owner_key_id` succeeds where any other dangling FK in this schema
+  is rejected. That absence is exactly why `keys.rs::delete_api_key` enforces ownership cleanup at
+  the *application* layer (409 + resource inventory) instead — a property that turned out to have
+  **zero existing test coverage** before this session (`tests/rbac_tests.rs` gained
+  `deleting_a_key_that_still_owns_resources_is_blocked_with_inventory` and
+  `deleting_a_key_with_no_owned_resources_succeeds`).
+- **`simply_ip_exporter`**: `two_concurrent_identical_signed_requests_only_one_succeeds` → ported as
+  `security_tests.rs::two_concurrent_replays_of_the_same_signature_only_one_succeeds` (fires two
+  identically-signed requests through `tokio::join!` against the same shared-state `Router`,
+  proving `ReplayGuard::check_and_record`'s check-then-insert is atomic under *real* concurrency,
+  not just the sequential reuse the existing replay test already covered) — and the same technique
+  applied to a resource delete (`rbac_tests.rs::concurrent_deletes_of_the_same_resource_do_not_both_succeed`),
+  which **caught a genuine bug**: see "Production code changes" below. The exporter's
+  `an_oversized_body_is_413_not_400` and its malformed-JSON-envelope-shape test were also ported —
+  see the correction note below for why the first one's expected status changed on the way in.
+- **`simply_ip_vault`**: `attack_single_bit_signature_mutations_never_verify` → ported as two
+  `crypto.rs` unit tests, `every_single_bit_flip_of_a_valid_tag_fails_verification` (all 256 bit
+  positions of a valid HMAC-SHA256 tag, individually) and `every_wrong_tag_length_fails_verification`
+  (every length 0–63 except the correct 32) — strictly stronger than the existing single
+  fixed-tamper test, which only samples 4 of a nibble's 16 possible hex values and can't isolate a
+  short-circuit/word-boundary comparison bug. `s4_oracle_discipline_out_of_scope_is_indistinguishable_from_nonexistent`
+  → ported as `rbac_tests.rs::out_of_scope_and_nonexistent_vaults_are_indistinguishable` (also
+  present in `test_e2e.sh` §10a) — `simply_ip_sync` had per-owner visibility scoping on
+  `GET /api/vaults/{id}` (out-of-scope → `404`, same as nonexistent) but no test pinning that the
+  two cases are byte-identical, which is the actual enumeration-resistance property that matters.
+  The vault's fresh `rbac_integration_tests.rs::batch_enforces_address_validation_and_rejects_duplicates`
+  test (rejecting a whole batch containing `203.0.113.60` and `203.0.113.60/32` as the same address
+  in two notations) prompted `external_ingestion_tests.rs::mixed_notation_duplicate_addresses_canonicalize_and_dedupe_to_one_record`
+  — this one turned out to already be correctly handled here (see the correction note below), so the
+  new test is a regression guard proving that, not a bug fix.
+
+**Two findings that needed correction after verifying against real behavior, not just reading code:**
+
+1. **Oversized-body status code.** The exporter's peer test expects `413`. Tracing
+   `simply_ip_sync`'s actual request path (`middleware.rs::auth_middleware`) shows it reads the
+   *entire* body itself via `axum::body::to_bytes(body, max_body_bytes())` — needed regardless,
+   since `CANONICAL_V1` covers the body — and this happens *before* any handler or `StrictJson`
+   extractor ever runs, with an oversized read mapped to `AppError::InvalidInput` → **`400`**, not
+   `413`. `StrictJson`'s own `BodyRejected` → `413` path is consequently unreachable from any
+   `/api/*` route under the current wiring (every route sits behind `auth_middleware`, which always
+   consumes the body first). The ported test
+   (`api_validation_tests.rs::oversized_inbound_body_is_rejected_cleanly_before_signature_verification`,
+   plus `test_e2e.sh` §10a) asserts the real `400` and documents why, rather than asserting a status
+   this codebase's architecture doesn't produce. (Two smaller mistakes surfaced while getting this
+   test right and are worth naming so the next person doesn't repeat them: a `X-Timestamp` of
+   `"1700000000"` fails the 300-second skew check *before* the API key is ever looked up, producing
+   a misleading `401`; and passing an 11 MiB string as a `curl --data-binary` shell argument hits
+   the OS's `ARG_MAX` ("Argument list too long") in `test_e2e.sh`, fixed by writing the body to
+   `$WORK_DIR/oversized_body` and using `--data-binary @file` instead.)
+2. **Canonicalization dedup — already correct, not a gap.** The vault's duplicate-rejection bug
+   looked at first read like it might apply symmetrically to `simply_ip_sync`'s own outbound dedup
+   (`external_ingestion.rs`'s `seen.insert(r.clone())`, which operates on raw strings). It doesn't:
+   every `FeedParser` already runs each candidate through `parsers::normalize_ip_or_cidr` — which
+   canonicalizes via `IpAddr`/`IpNetwork`'s own `Display` impl, not string manipulation — *before*
+   the job layer ever sees it, so `/32`↔bare and unabbreviated↔abbreviated IPv6 spellings already
+   collapse to one string ahead of the dedup step. Confirmed by writing the test before assuming
+   either way; it passed on the first run.
+
+**Production code changes (both found by writing the ported tests, not planned in advance):**
+
+1. **Concurrent-delete race, fixed in four handlers.** The concurrent-delete test above initially
+   *failed* — `[204, 204]`, not `[204, 404]` — against `delete_external_source`. Its
+   find-then-delete sequence (`find_by_id` → `guard_resource_lifecycle` → `delete_by_id`) never
+   checked whether the `DELETE` actually removed a row; SQLite's single-connection pool
+   (`db::SQLITE_MAX_CONNECTIONS = 1`) serializes the four underlying queries from two concurrent
+   requests, but not at request granularity, so both requests' `find_by_id` calls could observe the
+   row before either's `delete_by_id` ran, and a `DELETE ... WHERE id = ?` matching zero rows is not
+   a SQL error — the handler returned `204` regardless. Fixed identically in all four handlers with
+   the same shape (`external_source`, `vault_endpoint`, `vault_sync_task`,
+   `api_key_sync_permission` revoke): check `DeleteResult.rows_affected == 0` and return
+   `AppError::NotFound` instead of an empty `204`. `delete_api_key` (subtree deletion via
+   `delete_many`) was deliberately left alone — no test exercises its concurrency, and it's a
+   different-shaped operation (bulk delete over a computed subtree, not a single lookup-then-delete)
+   not obviously fixable with the same one-line pattern.
+
+**A note on working conditions this session:** the repository's working tree was modified by
+something outside this session twice while this work was in progress — first a `git reset` back to
+`HEAD` (confirmed via `git reflog`: `HEAD@{0}: reset: moving to HEAD`, no stash created) that wiped
+every tracked-file change in flight, including a separate, apparently concurrent effort that had
+independently added a raw-SQL/unwrap-expect scanner to `tests/source_hygiene.rs` and several
+related `src/` hardening fixes; then, later, a `git clean`-shaped removal of this session's two new
+untracked files specifically. Neither event is this session's doing, and neither the other
+concurrent effort's changes nor its author are known — flagged here as a fact about how this
+session's numbers came together (redone twice from scratch) rather than a claim about what caused
+it. Nothing from that other effort survived to be included in this session's final diff or its test
+counts below.
+
+**New test files / major additions:**
+
+- `tests/health_probes.rs` (new, 6 tests): see "Patterns adapted" above.
+- `tests/referential_integrity.rs` (new, 3 tests): see "Patterns adapted" above.
+- `tests/rbac_tests.rs` (+6 tests): R1 non-amplification
+  (`cannot_grant_can_sync_without_holding_it_yourself_r1`), R6 revocation-without-the-verb
+  (`revocation_requires_only_manage_not_the_verb_itself_r6`), the two key-deletion-ownership tests,
+  the oracle-discipline test, and the concurrent-delete test that caught the bug above.
+- `tests/security_tests.rs` (+3 tests): `outbound_get_ips_delta_signs_correctly_with_since_and_include_deleted`
+  (pins the exact query parameters — `group_name`, `since`, `include_deleted=true`, `limit`,
+  `offset` — and that the signed target includes the query string, not just the path), the
+  mid-body tamper test, and the concurrent-replay test.
+- `src/crypto.rs` (+2 unit tests): the bit-flip and wrong-length sweeps.
+- `tests/api_validation_tests.rs` (+2 tests): the oversized-body and malformed-JSON-envelope tests.
+- `tests/external_ingestion_tests.rs` (+1 test): the canonicalization-dedup regression guard.
+- `scripts/test_e2e.sh`: new §10a ("RBAC delegation (R1/R6) & enumeration resistance") — the R1/R6
+  grant/revoke pair, the out-of-scope-vs-nonexistent oracle-discipline check (reusing the
+  already-registered `SCRATCH_VAULT_ID` and `DAUGHTER_KEY` rather than provisioning new fixtures),
+  and the oversized-body check (file-based `--data-binary @path`, not a shell argument).
+
+**Test metrics after this session:**
+- `cargo test` (default, offline): **159 tests**, 0 failed (up from 136: +6 `health_probes.rs`
+  (new file), +3 `referential_integrity.rs` (new file), +6 `rbac_tests.rs`, +3 `security_tests.rs`,
+  +2 `crypto.rs` unit tests, +2 `api_validation_tests.rs`, +1 `external_ingestion_tests.rs`).
+- `cargo test -- --ignored`: **5 tests**, 0 failed (unchanged).
+- `./scripts/test_e2e.sh`: **202 checks** (up from 192), 0 failed, 0 skipped, run **three times**
+  across this session (once mid-session after §10a landed, twice more after the concurrent-delete
+  fix) with an explicit post-run check for lingering `mock_vault.py`/`http.server` processes — clean
+  every time.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: both clean, zero
+  warnings.
+
+**Not done / flagged rather than assumed out of scope:**
+- `simply_ip_exporter`'s canary-decrypt-at-boot pattern (detecting a syntactically valid but
+  *wrong* `SYNC_ENCRYPTION_KEY` at startup by decrypting one known-sealed value as a canary, rather
+  than only discovering the mismatch on the first real request) is a genuinely applicable gap —
+  `simply_ip_sync` seals vault/key signing secrets under `SYNC_ENCRYPTION_KEY` the same way and has
+  no equivalent check — but it is a new production startup behavior, not a test, and this session's
+  scope was test-pattern audit and adaptation. Flagged for a future features session rather than
+  implemented here.
+- `delete_api_key`'s subtree-delete path was not given the same `rows_affected` check as the other
+  four handlers (see "Production code changes" above) — no test currently exercises its
+  concurrency, and its bulk-delete shape doesn't take the same one-line fix.
+- `simply_hook_executor`'s `rbac_model_compliance.rs`-style "hot-flip" test (drop the
+  `master_marker` unique index at runtime, insert a second `is_master=true` row via raw SQL, prove
+  every mutating handler still refuses both) was not ported: `master.rs::MasterPin::authenticate`
+  already demotes an impostor `is_master=true` row per-request regardless of the DB constraint
+  (documented in its own doc comment: "an attacker with database write access does not need two
+  Masters, only to demote the real one and promote itself"), and pinning that specific property
+  with its own adversarial test is reasonable follow-up work rather than something this session had
+  time to add on top of everything above.
+- `./scripts/verify_convergence.sh` still does not exist (see sessions 1–2's decision) and was not
+  requested as a gate this session.

@@ -472,7 +472,12 @@ pub async fn revoke_key_permission(
         super::support::find_permission(&state.db, caller.id, &permission.resource_type, permission.resource_id).await?;
     guard_revocation(&caller, caller_permission.as_ref())?;
 
-    api_key_sync_permission::Entity::delete_by_id(permission_id).exec(&state.db).await?;
+    // See `sources.rs::delete_external_source`'s identical comment: two concurrent revokes of the
+    // same permission id can both pass the lookup above before either `DELETE` runs.
+    let result = api_key_sync_permission::Entity::delete_by_id(permission_id).exec(&state.db).await?;
+    if result.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
     create_audit_log(&state.db, &caller, client_ip.0, "PERMISSION_REVOKE", Some(format!("permission {permission_id}")), None)
         .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)

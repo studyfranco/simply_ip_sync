@@ -235,3 +235,86 @@ async fn invalid_mode_on_source_update_is_rejected_without_mutating_existing_row
         .expect("row exists");
     assert_eq!(stored.mode, "upsert", "the original valid mode must be unchanged");
 }
+
+/// Prompted by a pattern audited in `example/simply_ip_exporter/tests/integration.rs`
+/// (`an_oversized_body_is_413_not_400`, 2026-08-17 cross-project test audit — see
+/// `AGENT_NOTES.MD`) — but `simply_ip_sync`'s actual wiring turned out to differ in a way worth
+/// pinning explicitly rather than assuming the peer's status code transfers unchanged:
+/// `auth_middleware` reads the whole body itself, with its own explicit `max_body_bytes()` cap
+/// (`axum::body::to_bytes(body, max_body_bytes())`, needed either way to compute the signature
+/// over it), and this happens *before* any handler or `StrictJson` extractor ever sees the
+/// request — so an oversized body here surfaces as `AppError::InvalidInput` (`400`), not
+/// `StrictJson`'s `BodyRejected` (`413`), which is only reachable for a body that grows too large
+/// during the *handler's own* re-extraction of an already-auth-buffered body — structurally
+/// unreachable on the current `/api/*` wiring, where every route sits behind `auth_middleware`.
+/// Requires a genuinely valid API key so the request reaches the size check at all (an invalid key
+/// is rejected first, before the body is ever read — see `middleware.rs::auth_middleware`).
+#[tokio::test]
+async fn oversized_inbound_body_is_rejected_cleanly_before_signature_verification() {
+    let (_conn, state, master) = common::setup().await;
+    let app = simply_ip_sync::create_app(state);
+
+    let oversized_body = vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_BODY_MIB * 1024 * 1024 + 1024];
+    // A *current* timestamp — `validate_timestamp`'s skew check runs even before the API key
+    // lookup, so a stale/fixed one (e.g. a hardcoded past Unix timestamp) would fail there first
+    // and mask the property this test actually wants to exercise.
+    let mut req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/sources")
+        .header("X-API-Key", master.plaintext_key.clone())
+        .header("X-Timestamp", chrono::Utc::now().timestamp().to_string())
+        .header("X-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(oversized_body))
+        .expect("build");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+
+    let resp = app.oneshot(req).await.expect("response");
+    // Not a 500, not a hang, not a bogus signature-mismatch 401 masking the real problem — the
+    // size check runs before the (deliberately garbage) signature is ever evaluated.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an oversized body must be rejected cleanly (400) before signature verification is even attempted");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json body");
+    assert!(
+        body["error"].as_str().is_some_and(|e| e.to_lowercase().contains("large") || e.to_lowercase().contains("unreadable")),
+        "the error message should explain the body was too large, got: {body}"
+    );
+}
+
+/// Adapted from the same audited pattern: a malformed-but-appropriately-sized JSON body, sent with
+/// a *valid* signature (so the request reaches JSON parsing, isolating this from the "auth runs
+/// first" case `scripts/test_e2e.sh` already checks at status-code granularity), must come back in
+/// this service's normal `{"error": "..."}` envelope — not axum's default `Json` rejection body
+/// shape, which a regression to a bare `Json<T>` extractor (bypassing `StrictJson`) would silently
+/// produce while keeping the same `400` status, an easy-to-miss regression if nothing ever looks at
+/// the body.
+#[tokio::test]
+async fn malformed_json_body_with_a_valid_signature_returns_the_standard_error_envelope() {
+    let (_conn, state, master) = common::setup().await;
+    let app = simply_ip_sync::create_app(state);
+
+    let malformed_body = br#"{"name": "x", invalid}"#;
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let signature =
+        simply_ip_sync::crypto::compute_signature(&master.signing_secret, "POST", "/api/sources", &timestamp, malformed_body)
+            .expect("sign");
+
+    let mut req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/sources")
+        .header("X-API-Key", master.plaintext_key.clone())
+        .header("X-Timestamp", timestamp)
+        .header("X-Signature-256", signature)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(malformed_body.to_vec()))
+        .expect("build");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be valid JSON, not axum's default plain-text rejection");
+    assert!(body.get("error").is_some_and(|e| e.is_string()), "the standard {{\"error\": ...}} envelope must be used, got: {body}");
+}
