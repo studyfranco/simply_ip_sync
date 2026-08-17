@@ -112,7 +112,12 @@ async fn execute(
             }
         }
     };
-    let body = match response.bytes().await {
+    // Streamed with a running byte-count cap, not `response.bytes()` — see
+    // `decompress::read_capped_body`'s doc comment for why a single-shot read would already have
+    // fully decompressed (and buffered) an arbitrarily large `Content-Encoding` payload by the
+    // time anything got a chance to check its length.
+    let max_decompressed_bytes = crate::config::max_decompressed_bytes();
+    let body = match super::decompress::read_capped_body(response, max_decompressed_bytes).await {
         Ok(b) => b,
         Err(e) => {
             return JobSummary {
@@ -126,8 +131,10 @@ async fn execute(
     };
 
     // Transparent to every parser type: a feed distributed as a `.zip` (e.g. StopForumSpam's
-    // downloads) is decompressed here, before any parser ever sees it.
-    let body = match super::decompress::decompress_if_zip(&body) {
+    // downloads) is decompressed here, before any parser ever sees it. Same byte ceiling applied
+    // again — independently — since a ZIP archive's internal members can expand far beyond the
+    // (already-capped) compressed archive bytes that got us here.
+    let body = match super::decompress::decompress_if_zip(&body, max_decompressed_bytes) {
         Ok(b) => b,
         Err(e) => {
             return JobSummary {

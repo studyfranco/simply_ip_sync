@@ -103,9 +103,17 @@ directory that contains a `.git` — see that script for the graceful offline-mo
 1. **`REGEX_LINE` (Text / Line-by-Line):**
    - Strips comments (lines starting with `#`, `;`, `//`).
    - Extracts valid IPv4/IPv6 addresses and CIDR subnets using strict IP regex patterns line by line.
+   - Decoded with `String::from_utf8_lossy`, not a hard UTF-8 validation: a body containing
+     ISO-8859-1/Windows-1252 bytes or transit corruption degrades those bytes to `U+FFFD`
+     (extracting nothing from that stretch) rather than failing the entire feed.
 2. **`JSON_PATH` (Structured JSON):**
    - Parses JSON payloads (e.g., AbuseIPDB API response, pfSense JSON exports).
    - Configured via `parser_config_json` containing the JSON path/pointer to the array of items and target key field (e.g., `{"array_path": "data", "ip_field": "ipAddress"}`).
+   - `jsonl` mode (newline-delimited JSON, one object per line) decodes each line with the same
+     lossy UTF-8 conversion as `REGEX_LINE`, so one non-UTF-8 line among well-formed ones only
+     fails that line (skipped, same as any other malformed JSONL line) rather than the whole feed.
+     The non-`jsonl` path needs no separate handling: `serde_json::from_slice` already validates
+     UTF-8 as ordinary JSON syntax and returns a clean `Err`, never a panic, on invalid bytes.
 3. **Extensible Trait (`FeedParser`):**
    - Modular architecture allowing simple addition of future parsers (e.g., CSV, XML, STIX/TAXII).
 
@@ -114,8 +122,8 @@ directory that contains a `.git` — see that script for the graceful offline-mo
 ### 3. Synchronization & Ingestion Pipeline
 
 #### A. External Ingestion Pipeline
-1. **Fetch:** HTTP GET to `external_sources.source_url` with optional custom headers/user-agent. Transient upstream failures (`429`/`502`/`503`/`504`) are retried with exponential backoff and jitter (`OUTBOUND_MAX_RETRIES`, `OUTBOUND_RETRY_BACKOFF_MS`) before the job is marked `FAILED`.
-2. **Parse:** Execute configured `FeedParser` to extract normalized IP/CIDR strings.
+1. **Fetch:** HTTP GET to `external_sources.source_url` with optional custom headers/user-agent. Transient upstream failures (`429`/`502`/`503`/`504`) are retried with exponential backoff and jitter (`OUTBOUND_MAX_RETRIES`, `OUTBOUND_RETRY_BACKOFF_MS`) before the job is marked `FAILED`. The response body is read via `jobs::decompress::read_capped_body` — a streaming read with a running byte count, not a single-shot `Response::bytes()` — so a `Content-Encoding` (gzip/deflate/brotli/zstd) decompression bomb aborts mid-stream with `FAILED` at `MAX_DECOMPRESSED_BYTES` (default 50 MiB) instead of buffering an arbitrarily large decompressed payload in memory first.
+2. **Parse:** Execute configured `FeedParser` to extract normalized IP/CIDR strings. A `.zip`-archived body (`jobs::decompress::decompress_if_zip`) is decompressed first, member by member, under the same `MAX_DECOMPRESSED_BYTES` ceiling applied independently to the combined member output — a small archive whose member(s) decompress far past that ceiling aborts the same way, never after fully decompressing the bomb.
 3. **Chunking & Batching:** Split extracted records into chunks of **5,000 items maximum** to comply with `ip_vault`'s `MAX_REQUEST_BODY_BYTES` (3 MiB limit).
 4. **Push:** Send each chunk via `POST /api/records/batch` to all associated target `vault_endpoints` (defined in `external_source_vault_targets`). `external_sources.mode` is `"upsert"` (default — never implicitly deletes) or `"full_replace"` (this run's fetched content becomes the group's full authoritative set). **`full_replace` semantics apply to chunk 0 of each target's own chunk sequence only** — every later chunk of the same run automatically downgrades to `"upsert"` (`jobs::mode_for_chunk_index`), since a second `full_replace` write would read as "delete everything not in this chunk" and erase the previous chunk's just-delivered records. A `413 Payload Too Large` response from a target additionally triggers adaptive splitting: the offending chunk is halved and each half resent (recursively, if still too large), with the same first-piece-only-keeps-the-original-mode rule applied to the halves.
 5. **Log:** Write detailed outcome to `sync_logs`.
@@ -169,11 +177,16 @@ Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync
   2. Outbound HMAC signature generation correctness against mock `ip_vault` endpoints.
   3. External feed parsing correctness (`REGEX_LINE` and `JSON_PATH`, including ZIP-archived and
      newline-delimited-JSON feed shapes via local fixtures — never against the live rate-limited
-     source).
+     source), including non-UTF-8/raw-binary bodies (lossy degradation, never a panic, valid IPs
+     extracted where possible) and decompression-bomb rejection (a small ZIP member or
+     `Content-Encoding`-compressed body that expands past `MAX_DECOMPRESSED_BYTES` must abort
+     `FAILED`, not OOM).
   4. Batch chunking (verifying payloads never exceed 5,000 records).
   5. Inter-vault delta replication and tombstone propagation, including multi-vault fan-out and
-     partial-failure resilience (one target failing must report `PARTIAL`/`FAILED` and must not
-     advance `last_sync_at`).
+     partial-failure resilience — including a failure partway through a single target's own
+     multi-chunk push sequence (a later chunk failing after an earlier one already succeeded), not
+     just a target that is down from the first request — must report `PARTIAL`/`FAILED`, must not
+     advance `last_sync_at`, and must never attempt the chunk(s) after the one that failed.
   6. Manual trigger permissions (`can_sync` vs unauthorized 403).
   7. Adversarial infrastructure tests (`ADVERSARIAL(§N)` for master uniqueness).
   8. Cron expression validation: `POST /api/sources` and `POST /api/sync-tasks` must reject a

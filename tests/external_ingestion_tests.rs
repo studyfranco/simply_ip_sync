@@ -185,6 +185,104 @@ async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_repl
     assert_eq!(modes[2], "upsert", "chunk 3 must also be upsert, not just chunk 2");
 }
 
+/// Task 2: the literal scenario this task describes — chunk 1 of a `full_replace` run (which
+/// already cleared-and-set the target's authoritative content) succeeds, chunk 2 then hits a fatal
+/// error. Chunk 3 must never be attempted against that target, and the overall job must report
+/// `PARTIAL` (a sibling target that completes all 3 chunks keeps this from being a hard `FAILED`).
+/// Unlike `vault_sync` (see `mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at`
+/// in `tests/vault_sync_tests.rs`), `external_ingestion` has no `last_sync_at`-style high-water
+/// mark to withhold: it re-fetches the feed's *entire* current content on every run regardless of
+/// the previous run's outcome, so "the next scheduled run performs a complete re-sync" — the
+/// safety property Task 2 asks for — already holds structurally here. `last_run_at` is still
+/// recorded unconditionally, since it only ever means "the job executed", not "the job succeeded".
+#[tokio::test]
+async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_partial() {
+    let (conn, state, _master) = common::setup().await;
+
+    const TOTAL_RECORDS: u32 = 12_000;
+    let feed_body: String = (0..TOTAL_RECORDS).map(synth_ip).collect::<Vec<_>>().join("\n");
+
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(feed_body))
+        .mount(&feed_mock)
+        .await;
+
+    let good_target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_response()))
+        .mount(&good_target_mock)
+        .await;
+
+    let bad_post_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = bad_post_count.clone();
+    let bad_target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // Chunk 1: succeeds, carrying full_replace — the target's authoritative content
+                // has now legitimately been cleared-and-set to chunk 1's records.
+                ResponseTemplate::new(200).set_body_json(batch_response())
+            } else {
+                // Chunk 2: a fatal server error. If chunk 3 were ever sent it would land here too
+                // — the request-count assertion below proves it was never attempted at all.
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&bad_target_mock)
+        .await;
+
+    let source_id = insert_source_with_mode(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group", "full_replace").await;
+    let good_vault_id = insert_vault(&conn, "good-target", &good_target_mock.uri()).await;
+    let bad_vault_id = insert_vault(&conn, "bad-target", &bad_target_mock.uri()).await;
+    insert_target(&conn, source_id, good_vault_id, None).await;
+    insert_target(&conn, source_id, bad_vault_id, None).await;
+
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+
+    assert_eq!(
+        summary.status, "PARTIAL",
+        "one target fully succeeding and the other partially failing must report PARTIAL, not SUCCESS or FAILED"
+    );
+    assert_eq!(
+        summary.chunks_sent, 4,
+        "good_target's 3 successful chunks + bad_target's 1 successful chunk (before failing on chunk 2) = 4"
+    );
+
+    let good_requests = good_target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(good_requests.len(), 3, "good_target must still receive its full 3-chunk sequence regardless of bad_target's failure");
+    let good_modes: Vec<String> = good_requests
+        .iter()
+        .map(|r| {
+            let body: serde_json::Value = serde_json::from_slice(&r.body).expect("json");
+            body["mode"].as_str().expect("mode field").to_owned()
+        })
+        .collect();
+    assert_eq!(good_modes, vec!["full_replace", "upsert", "upsert"], "good_target's own chunk sequence still follows the chunk-0-only rule");
+
+    let bad_requests = bad_target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(
+        bad_requests.len(), 2,
+        "bad_target must receive exactly chunk 1 (succeeded) + chunk 2 (failed) — chunk 3 must never be attempted once chunk 2 failed"
+    );
+    let bad_chunk1_body: serde_json::Value = serde_json::from_slice(&bad_requests[0].body).expect("json");
+    assert_eq!(
+        bad_chunk1_body["mode"], serde_json::json!("full_replace"),
+        "bad_target's own chunk 1 legitimately carried full_replace before the run failed on chunk 2"
+    );
+
+    let source = external_source::Entity::find_by_id(source_id).one(&conn).await.expect("query").expect("source exists");
+    assert!(
+        source.last_run_at.is_some(),
+        "last_run_at is unconditional by design — it means 'the job executed', not 'the job succeeded'; \
+         there is no incremental cursor here for a partial failure to corrupt"
+    );
+}
+
 /// Task 4: an HTTP `200 OK` carrying an HTML body (Cloudflare/WAF error page, captive portal,
 /// a 404 page some hosts serve with a 200 status) must not panic `REGEX_LINE`, must extract zero
 /// entries (HTML tags and prose are not IP-shaped), and must surface as `PARTIAL` in `sync_logs`
@@ -296,6 +394,148 @@ async fn gzip_compressed_feed_response_is_transparently_decompressed() {
 
     assert_eq!(summary.status, "SUCCESS");
     assert_eq!(summary.items_processed, 2, "both addresses must survive gzip decompression before parsing");
+}
+
+/// Task 1: a `Content-Encoding: gzip` response that decompresses to well over
+/// `DEFAULT_MAX_DECOMPRESSED_BYTES` (50 MiB) — a classic decompression bomb, since highly
+/// repetitive data compresses to almost nothing on the wire — must abort the job as `FAILED`
+/// rather than let `reqwest`'s transparent gzip decoder buffer the whole decompressed payload in
+/// memory first. The compressed body wiremock actually serves is tiny; only the *decompressed*
+/// size exceeds the limit, which is exactly the shape this defense exists for.
+#[tokio::test]
+async fn oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buffering_it_fully() {
+    let (conn, state, _master) = common::setup().await;
+
+    let oversized = vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES as usize + 1024];
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&oversized).expect("write to gzip encoder");
+    let compressed = encoder.finish().expect("finish gzip stream");
+    assert!(
+        compressed.len() < oversized.len() / 100,
+        "the compressed bomb should be far smaller than its decompressed size (got {} compressed vs {} decompressed)",
+        compressed.len(),
+        oversized.len()
+    );
+
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "gzip")
+                .set_body_bytes(compressed),
+        )
+        .mount(&feed_mock)
+        .await;
+
+    let source_id = insert_source(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group").await;
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs without panicking");
+
+    assert_eq!(summary.status, "FAILED", "an oversized decompressed body must fail the job, not succeed with truncated data");
+    assert_eq!(summary.items_processed, 0);
+    let message = summary.error_message.expect("must explain the failure");
+    assert!(
+        message.contains("MAX_DECOMPRESSED_BYTES") || message.contains("decompress"),
+        "error message should explain this is the decompression-bomb guard, got: {message}"
+    );
+
+    let logs = simply_ip_sync::entities::sync_log::Entity::find().all(&conn).await.expect("query logs");
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status, "FAILED");
+}
+
+/// The same defense, at the second (independent) expansion point: a `.zip` archive whose single
+/// member decompresses to well over the configured limit. The archive itself is tiny on the wire —
+/// `read_capped_body`'s outer cap never trips — so this specifically exercises
+/// `decompress_if_zip`'s own per-member streaming cap.
+#[tokio::test]
+async fn oversized_zip_member_is_rejected_as_a_decompression_bomb() {
+    let (conn, state, _master) = common::setup().await;
+
+    let oversized = vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES as usize + 1024];
+    let mut zip_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut zip_buf);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("bomb.txt", options).expect("start_file");
+        writer.write_all(&oversized).expect("write member contents");
+        writer.finish().expect("finish archive");
+    }
+    let zip_bytes = zip_buf.into_inner();
+    assert!(
+        zip_bytes.len() < oversized.len() / 100,
+        "the zip bomb should be far smaller than its decompressed size (got {} compressed vs {} decompressed)",
+        zip_bytes.len(),
+        oversized.len()
+    );
+
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+        .mount(&feed_mock)
+        .await;
+
+    let source_id = insert_source(&conn, &format!("{}/feed.zip", feed_mock.uri()), "group").await;
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs without panicking");
+
+    assert_eq!(summary.status, "FAILED", "a zip member that decompresses past the limit must fail the job");
+    assert_eq!(summary.items_processed, 0);
+    let message = summary.error_message.expect("must explain the failure");
+    assert!(
+        message.contains("MAX_DECOMPRESSED_BYTES") || message.contains("decompress"),
+        "error message should explain this is the decompression-bomb guard, got: {message}"
+    );
+}
+
+/// Task 3: a feed host serving Latin-1 (ISO-8859-1)/raw-binary bytes rather than UTF-8 must not
+/// crash the job — the full fetch→decompress→parse→push pipeline must complete, extracting
+/// whatever IP-shaped tokens survive lossy decoding (see `parsers::regex_line`'s doc comment) and
+/// pushing exactly those, rather than the whole run failing over one feed host's encoding choice.
+#[tokio::test]
+async fn non_utf8_feed_body_does_not_crash_the_job_and_extracts_the_valid_ips() {
+    let (conn, state, _master) = common::setup().await;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(b"# Liste \xE9 jour (Latin-1, pas UTF-8)\n"); // raw Latin-1 'é'
+    body.extend_from_slice(b"203.0.113.44\n");
+    body.extend_from_slice(b"; commentaire avec un caract\xE8re \xE9trange\n"); // raw Latin-1 'è'/'é'
+    body.extend_from_slice(b"2001:db8::44\n");
+
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&feed_mock)
+        .await;
+
+    let target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_response()))
+        .mount(&target_mock)
+        .await;
+
+    let source_id = insert_source(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group").await;
+    let vault_id = insert_vault(&conn, "target", &target_mock.uri()).await;
+    insert_target(&conn, source_id, vault_id, None).await;
+
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs without panicking");
+
+    assert_eq!(summary.status, "SUCCESS");
+    assert_eq!(summary.items_processed, 2, "both valid IPs must survive despite the Latin-1 bytes elsewhere in the body");
+
+    let received = target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(received.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    let addresses: Vec<String> = body["records"]
+        .as_array()
+        .expect("records array")
+        .iter()
+        .map(|r| r["target_address"].as_str().expect("target_address").to_owned())
+        .collect();
+    assert_eq!(addresses, vec!["203.0.113.44".to_owned(), "2001:db8::44".to_owned()]);
 }
 
 /// Task 3: a remote target that accepts the TCP connection but never responds (or responds far

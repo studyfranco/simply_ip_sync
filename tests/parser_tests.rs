@@ -73,7 +73,8 @@ fn stopforumspam_ipv6_zip_fixture_decompresses_and_parses_via_regex_line() {
     let fetched = std::fs::read(&fixture_path).expect("read zip fixture back");
     assert!(simply_ip_sync::jobs::decompress::is_zip(&fetched), "fixture must be recognised as a zip archive");
     let decompressed =
-        simply_ip_sync::jobs::decompress::decompress_if_zip(&fetched).expect("decompress zip fixture");
+        simply_ip_sync::jobs::decompress::decompress_if_zip(&fetched, simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("decompress zip fixture");
 
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
     let records = parser.parse(&decompressed, None).expect("parse decompressed body");
@@ -124,7 +125,8 @@ fn spamhaus_drop_v6_json_fixture_parses_via_jsonl_mode_and_skips_the_metadata_fo
 fn plain_text_body_is_not_mistaken_for_a_zip_archive() {
     let plain = b"2001:db8::1\n2001:db8::2\n";
     assert!(!simply_ip_sync::jobs::decompress::is_zip(plain));
-    let result = simply_ip_sync::jobs::decompress::decompress_if_zip(plain).expect("passthrough");
+    let result = simply_ip_sync::jobs::decompress::decompress_if_zip(plain, simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES)
+        .expect("passthrough");
     assert_eq!(result, plain);
 }
 
@@ -215,4 +217,65 @@ fn large_html_body_parses_quickly_with_zero_matches() {
 
     assert!(records.is_empty());
     assert!(elapsed < std::time::Duration::from_secs(5), "parsing ~{} bytes took {elapsed:?}, expected well under 5s", big_html.len());
+}
+
+/// Deterministic (not `rand`-dependent, so this test is reproducible byte-for-byte) pseudo-random
+/// byte buffer covering the full `u8` range, including many invalid-UTF-8-lead-byte and
+/// invalid-continuation-byte patterns — a stand-in for a corrupted-in-transit or genuinely raw
+/// binary feed response.
+fn pseudo_random_binary_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| ((i * 137 + 59) % 256) as u8).collect()
+}
+
+/// Task 3: a raw binary feed body (random bytes, no structure at all) must not panic either parser
+/// type. `REGEX_LINE` degrades to lossy UTF-8 and extracts whatever IP-shaped tokens happen to
+/// survive (realistically none, for pure random bytes); `JSON_PATH` fails cleanly since random
+/// bytes are essentially never valid JSON.
+#[test]
+fn raw_binary_buffer_does_not_panic_either_parser_type() {
+    let binary = pseudo_random_binary_bytes(10_000);
+
+    let regex_parser = parsers::for_type("REGEX_LINE").expect("known parser type");
+    let result = regex_parser.parse(&binary, None);
+    assert!(result.is_ok(), "REGEX_LINE must degrade gracefully on raw binary, not error");
+
+    let json_parser = parsers::for_type("JSON_PATH").expect("known parser type");
+    let config = r#"{"ip_field":"ip"}"#;
+    let result = json_parser.parse(&binary, Some(config));
+    assert!(result.is_err(), "raw binary is not valid JSON and JSON_PATH must reject it cleanly, not panic");
+}
+
+/// A feed encoded in Latin-1 (ISO-8859-1) rather than UTF-8 — plausible for an older or
+/// misconfigured feed host — mixing genuinely non-UTF-8 bytes (accented characters in a comment)
+/// with well-formed IP lines. Every valid IP must still be extracted; the encoding fault must stay
+/// local to the comment line it's actually on.
+#[test]
+fn latin1_encoded_feed_extracts_every_valid_ip_despite_the_encoding_mismatch() {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"# Liste des adresses \xE9 bloquer (Latin-1, pas UTF-8)\n"); // "é" as raw Latin-1 0xE9
+    body.extend_from_slice(b"198.51.100.5\n");
+    body.extend_from_slice(b"; Encore un commentaire avec un \xE9 accentu\xE9\n");
+    body.extend_from_slice(b"2001:db8::5\n");
+
+    let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
+    let records = parser.parse(&body, None).expect("must not error on Latin-1 bytes");
+    assert_eq!(records, vec!["198.51.100.5".to_owned(), "2001:db8::5".to_owned()]);
+}
+
+/// The `JSON_PATH` `jsonl` mode equivalent of the above: one line corrupted with raw non-UTF-8
+/// bytes among otherwise well-formed JSONL lines must not fail the whole feed — only that one line
+/// fails to parse (same as any other malformed JSONL line already does) and is skipped.
+#[test]
+fn jsonl_feed_with_one_non_utf8_line_still_extracts_the_well_formed_lines() {
+    let mut body = br#"{"cidr":"2001:678:254::/48"}"#.to_vec();
+    body.push(b'\n');
+    body.extend_from_slice(&[0xff, 0xfe, 0x80, 0x81]); // invalid UTF-8, not valid JSON either way
+    body.push(b'\n');
+    body.extend_from_slice(br#"{"cidr":"2001:678:6c0::/48"}"#);
+    body.push(b'\n');
+
+    let parser = parsers::for_type("JSON_PATH").expect("known parser type");
+    let config = r#"{"jsonl":true,"ip_field":"cidr"}"#;
+    let records = parser.parse(&body, Some(config)).expect("must not error on one bad line");
+    assert_eq!(records, vec!["2001:678:254::/48".to_owned(), "2001:678:6c0::/48".to_owned()]);
 }

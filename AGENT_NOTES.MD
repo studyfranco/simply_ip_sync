@@ -499,3 +499,160 @@ for the four requested features but was silently blocking all of them.
   exists to enforce.
 - `./scripts/verify_convergence.sh` still does not exist (see sessions 1–2's decision) and was not
   requested as a gate this session.
+
+## Session 5 (2026-08-17): decompression-bomb byte limits, partial multi-chunk failure verification, non-UTF-8 feed resilience
+
+Requested as three production-hardening edge cases plus tests: (1) a hard ceiling on decompressed
+feed body size, to stop a ZIP/gzip decompression bomb from exhausting memory; (2) verification that
+a fatal error partway through a multi-chunk push sequence — not just a target down from the first
+request — correctly reports `PARTIAL`/`FAILED` and withholds the incremental-sync cursor; (3) lossy
+UTF-8 decoding so a non-UTF-8/Latin-1/raw-binary feed body degrades gracefully instead of hard-
+failing or panicking. Landed one new config knob, two new streaming byte-cap functions, two lossy-
+decoding call-site changes, and a large new-tests-only surface (Task 2 turned out to already be
+correctly implemented — see below).
+
+**Production code changes:**
+
+1. **`config::max_decompressed_bytes`** (new, `MAX_DECOMPRESSED_BYTES`, default 50 MiB =
+   `52_428_800` bytes). `OnceLock`-cached like `max_body_bytes`/`outbound_http_timeout` (a stable
+   tuning knob, not something a test needs to override mid-run via env var the way the retry
+   backoff vars deliberately aren't cached) — `jobs::decompress`'s functions take the limit as an
+   explicit parameter instead of reading the config themselves, so every test that needs a specific
+   limit just passes one directly, with zero env-var-mutation/hermeticity concerns at all.
+2. **`jobs::decompress::read_capped_body`** (new): replaces `external_ingestion.rs`'s old
+   `response.bytes().await` single-shot read. This is the change that actually matters for the
+   `Content-Encoding` (gzip/deflate/brotli/zstd) case: `reqwest`'s decompression happens
+   transparently inside the response body stream (`tower_http::decompression::Decompression`
+   wrapping the underlying hyper service — confirmed by reading `reqwest` 0.13's source, since it
+   has no standalone `decoder.rs` the way older versions did), so by the time a single `bytes()`
+   call returns, an arbitrarily large decompressed payload would *already* be fully buffered in
+   memory — checking its length afterward is not a defense, it's a post-mortem. `read_capped_body`
+   instead polls `Response::chunk()` (available without the `stream` Cargo feature, unlike
+   `bytes_stream()` — no new dependency needed) in a loop, accumulating a running byte count and
+   erroring out the instant it crosses `max_bytes`, so the oversized remainder past that point is
+   never actually read off the stream, let alone buffered.
+3. **`jobs::decompress::decompress_if_zip`** (signature changed: now takes `max_decompressed_bytes:
+   u64`). Guards the *second*, independent expansion point: even a body that passed
+   `read_capped_body`'s wire-level cap (ZIP archives are rarely re-gzipped, so their compressed
+   size on the wire is usually already small) can still be a ZIP bomb internally. Each member is
+   read through `Read::take(remaining_budget + 1)` rather than the old unbounded `read_to_end` — the
+   budget is the *combined* ceiling minus what's already been decompressed from earlier members in
+   the same archive (not a fresh per-member allowance), since an archive with many small-looking
+   members could otherwise smuggle an arbitrarily large aggregate past a naive per-member check.
+   Reading `budget + 1` bytes rather than exactly `budget` is what lets a single `read_to_end` call
+   detect the overflow (`contents.len() > budget`) without a second read.
+4. **`parsers::regex_line::RegexLineParser::parse`** and **`parsers::json_path::parse_jsonl`**:
+   `std::str::from_utf8(raw).map_err(...)?` (hard failure on any invalid byte) replaced with
+   `String::from_utf8_lossy(raw)` (invalid sequences become `U+FFFD`, which can never form an
+   IP-shaped token, so the practical effect is "that stretch of text extracts nothing" rather than
+   "the whole feed fails"). **This is a deliberate behavior change, not a bug fix** — the prior
+   behavior was intentional and had its own test (`rejects_non_utf8_body`) asserting the `Err`; that
+   test is now `non_utf8_body_degrades_to_zero_entries_instead_of_erroring`, asserting the opposite,
+   per this session's explicit Task 3 requirement. `JSON_PATH`'s non-`jsonl` path
+   (`serde_json::from_slice`) needed no change: JSON syntax already requires valid UTF-8, so
+   `serde_json` itself returns a clean `Err` (never a panic) on invalid bytes — lossy pre-decoding
+   there would only risk corrupting a genuinely valid multi-byte UTF-8 string value at a chunk
+   boundary for no benefit, since there's no boundary here (the raw bytes are the *whole* fetched
+   body, never a partial read).
+5. **Unrelated fix along the way**: `zip::write::FileOptions` is `Copy`, and clippy's
+   `clone_on_copy` (part of `-D warnings`) caught a stray `.clone()` in one of this session's own
+   new test helpers (`decompress.rs`'s aggregate-cap test, looping `start_file` across 5 members) —
+   fixed immediately, not deferred; mentioned here only because it's the one clippy finding this
+   session's own new code produced.
+
+**Task 2 — verified, not implemented; no production code changed.** Read `vault_sync.rs`'s and
+`external_ingestion.rs`'s per-target chunk loops closely before writing any test: both already
+`break` out of a target's own chunk sequence on the first `client::post_batch` error (so a later
+chunk is never attempted once an earlier one in the same sequence fails), already track
+`target_ok`/`all_succeeded` correctly across that break, and `vault_sync::run` already only writes
+`last_sync_at` when `all_succeeded` is true. This already fully satisfies "a mid-run chunk failure
+must report `PARTIAL`/`FAILED` and withhold the sync cursor" — it just wasn't exercised by an
+existing test at *chunk* granularity specifically (existing tests covered "one whole target is down
+from its first request", not "chunk 1 of 3 succeeds, chunk 2 fails, chunk 3 must never even be
+sent"). Two new tests close that gap directly rather than assuming the property held:
+`mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at` (`vault_sync_tests.rs`,
+upsert mode — the only mode `vault_sync_tasks` ever uses) and
+`full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_partial`
+(`external_ingestion_tests.rs`, `full_replace` mode — the literal shape this session's task
+described, since `full_replace` was never extended to `vault_sync` in session 4 and that decision
+stands unchanged). **The task's premise ("Chunk #1 executes full_replace... clearing target
+entries... target Vault remains in a partially populated state") only applies to
+`external_ingestion`**, not `vault_sync` — `vault_sync_tasks.mode` is still strictly `upsert`
+(`SCHEMA.MD`, `AGENT.MD` §3.B), so its own version of this test uses `upsert`'s equivalent risk
+(chunk 1 landing, chunk 2 failing, and the next run needing to redo the whole delta rather than
+skip what chunk 1 already delivered) instead. Also worth being explicit about, since it's easy to
+mistake for a gap: `external_ingestion.rs` has **no `last_sync_at`-style cursor to withhold** at
+all — it re-fetches a feed's *entire* current content on every run regardless of the previous run's
+outcome, so "the next scheduled run performs a complete re-sync" (the safety property Task 2 asks
+for) already holds structurally there, with nothing to protect. `last_run_at` is still recorded
+unconditionally on every run, same as before this session — it has only ever meant "the job
+executed", never "the job succeeded".
+
+**New test files / major additions:**
+
+- `src/jobs/decompress.rs` (+6 unit tests): `single_member_exceeding_the_limit_is_rejected_without_fully_decompressing`
+  and `combined_output_across_multiple_members_is_capped_in_aggregate` (the latter proving the
+  ceiling is enforced on the *combined* total across members, not reset per member) for the ZIP
+  path; `read_capped_body_passes_through_a_body_under_the_limit` and
+  `read_capped_body_aborts_once_the_stream_exceeds_the_limit` against a real streamed
+  `wiremock`/`reqwest::Response` (available here since `wiremock` is already a dev-dependency
+  reachable from `src/`-level `#[cfg(test)]` modules, not just `tests/`); the three pre-existing
+  ZIP tests updated for the new `max_decompressed_bytes` parameter.
+- `src/parsers/regex_line.rs` (+2 tests, 1 renamed): `mixed_encoding_body_still_extracts_the_valid_utf8_portions`
+  and `latin1_byte_in_a_comment_does_not_prevent_extraction` — a single bad byte sequence must stay
+  local to the line/stretch it corrupted, not poison extraction from the rest of the body.
+- `src/parsers/json_path.rs` (+2 tests): `raw_binary_body_is_a_clean_parse_error_not_a_panic` (the
+  non-`jsonl` path) and `jsonl_mode_skips_a_non_utf8_line_without_failing_the_whole_body`.
+- `tests/parser_tests.rs` (+3 tests): the same three properties above, black-box through
+  `parsers::for_type`, plus a 10,000-byte deterministic (not `rand`-seeded, so reproducible)
+  pseudo-random binary buffer fed to both parser types to confirm neither panics.
+- `tests/external_ingestion_tests.rs` (+4 tests): `oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buffering_it_fully`
+  (a real gzip-encoded ~50MiB+1KiB-of-repeated-bytes body — compresses to ~51KB on the wire at
+  roughly 1000:1, *not* the "under 1KB" this session first assumed and had to correct after the
+  test's own sanity-check assertion failed against the real ratio DEFLATE achieves on run-length
+  data) through the full fetch pipeline; `oversized_zip_member_is_rejected_as_a_decompression_bomb`,
+  the same shape via a `.zip`; `full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_partial`
+  and `non_utf8_feed_body_does_not_crash_the_job_and_extracts_the_valid_ips` (Task 2/3 above).
+- `tests/vault_sync_tests.rs` (+1 test): `mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at`.
+- `scripts/test_e2e.sh`: `mock_vault.py` gained `failafter:<status>:<n>` (the mirror of the existing
+  `retry:<status>:<n>` — succeeds the first `<n>` POSTs while this mode string is active, fails
+  every one after that — for modeling a target that goes down mid-run rather than one recovering).
+  Three new subsections inserted before section 7h's existing cleanup (reusing `EXTRA_MOCK` and
+  `RESILIENCE_MOCK` from session 4 rather than spawning new processes): **7i** (a ~50MiB+1KiB ZIP
+  bomb, tiny on disk, rejected `FAILED` with an explanatory message, no crash); **7j** (a two-target
+  sync task where the "good" target completes all 4 push chunks of a 15,001-record delta and the
+  "bad" target — `failafter:500:1` — accepts chunk 1 then fails every chunk after, reporting
+  `PARTIAL` with the task's `last_sync_at` confirmed still `null` afterward, and the bad target's
+  request log confirming chunks 3–4 were never attempted); **7k** (a Latin-1/raw-binary feed body
+  extracting exactly its two valid IPs, `SUCCESS`, none of the encoding noise pushed).
+
+**Test metrics after this session:**
+- `cargo test` (default, offline): **136 tests**, 0 failed (up from 120: +8 lib unit tests
+  (`decompress.rs` +4, `regex_line.rs` +2, `json_path.rs` +2), +8 integration tests
+  (`vault_sync_tests.rs` +1, `external_ingestion_tests.rs` +4, `parser_tests.rs` +3)).
+- `cargo test -- --ignored`: **5 tests**, 0 failed (unchanged).
+- `./scripts/test_e2e.sh`: **192 checks** (up from 162), 0 failed, 0 skipped, run **twice
+  consecutively** with an explicit post-run check for lingering `mock_vault.py`/`http.server`
+  processes — clean both times, zero leaks.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: both clean, zero
+  warnings.
+
+**Not done / flagged rather than assumed out of scope:**
+- No `MAX_DECOMPRESSED_BYTES` protection was added for a *non-ZIP, non-`Content-Encoding`*
+  expansion point, because there isn't one in this pipeline — the only two places bytes can expand
+  are the two this session covers. If a future parser format introduces its own internal
+  decompression (e.g. a `.tar.gz` or nested-archive feed), that format's own implementation would
+  need to thread the same `max_decompressed_bytes` parameter through, following
+  `decompress_if_zip`'s pattern.
+- Task numbering note for future readers: doc comments in `tests/external_ingestion_tests.rs`
+  reference "Task 1"/"Task 2"/"Task 3" from *this* session's own task list, which reuses the same
+  numbers as pre-existing "Task 1"–"Task 4" comments left by earlier sessions' *different* task
+  lists in the same file (e.g. line 86's "Task 1" is session 3's target-group-name-override task;
+  line 399's "Task 1" is this session's decompression-bomb task). This ambiguity already existed
+  before this session (session 4 added "Task 4" comments that likewise collide with an
+  already-present "Task 4" from an earlier session) — flagged here rather than silently
+  perpetuated, but not retroactively fixed across the whole suite, since every "Task N" label is
+  already only ever meaningful relative to the task list active in its own originating session, not
+  a global identifier.
+- `./scripts/verify_convergence.sh` still does not exist (see sessions 1–2's decision) and was not
+  requested as a gate this session.

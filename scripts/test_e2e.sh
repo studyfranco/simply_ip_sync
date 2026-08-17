@@ -512,6 +512,12 @@ if [[ "$PYTHON3_AVAILABLE" -eq 1 ]]; then
 #   split413:<threshold>  - a POST is rejected with 413 iff its `records` array has more than
 #                           <threshold> entries; otherwise it succeeds. Models a target vault with a
 #                           real payload-size ceiling, for exercising client-side adaptive splitting.
+#   failafter:<status>:<n> - the mirror of retry: the first <n> POSTs while this exact mode string
+#                           is active succeed, every POST after that fails with <status>. Models a
+#                           target that accepts the first chunk or two of a multi-chunk run (e.g.
+#                           the full_replace chunk that just cleared-and-set its content) and then
+#                           goes down mid-stream — the same hit-counter-reset-on-mode-change rule
+#                           as retry: applies.
 import http.server
 import json
 import sys
@@ -604,6 +610,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 record_count = 0
             if record_count > threshold:
                 forced_status = 413
+        elif mode.startswith("failafter:"):
+            _, status_str, n_str = mode.split(":")
+            _mode_state["hits"] += 1
+            if _mode_state["hits"] > int(n_str):
+                forced_status = int(status_str)
 
         if forced_status is not None:
             self.send_response(forced_status)
@@ -989,10 +1000,137 @@ PYEOF
 
     api_call DELETE "/api/sources/$FULL_REPLACE_SOURCE_ID" "$MASTER_KEY"
     check "204" "clean up the full_replace source"
+
+    log_section "7i. Zip bomb / oversized decompressed archive rejection (Task 1)"
+
+    # A single ~50MiB+1KiB member of highly compressible repeated bytes — deflate shrinks it to a
+    # few tens of KB on disk, so this is fast to generate and fast to serve; MAX_DECOMPRESSED_BYTES
+    # (default 50MiB) is what must abort ingestion, not the wire size.
+    python3 - "$EXTRA_FEED" <<'PYEOF'
+import sys
+import zipfile
+
+out_path = sys.argv[1]
+oversized = b"a" * (50 * 1024 * 1024 + 1024)
+with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("bomb.txt", oversized)
+PYEOF
+    ZIP_BOMB_SIZE=$(stat -c%s "$EXTRA_FEED" 2>/dev/null || stat -f%z "$EXTRA_FEED" 2>/dev/null)
+    check_local "$([[ "$ZIP_BOMB_SIZE" -lt 1048576 ]] && echo yes || echo no)" "yes" \
+        "the zip bomb fixture is far smaller on disk (${ZIP_BOMB_SIZE} bytes) than the >50MiB it decompresses to"
+
+    echo "ok" > "$RESILIENCE_MODE"
+    api_call POST "/api/vaults" "$MASTER_KEY" \
+        "{\"name\":\"zipbomb-target-vault\",\"target_url\":\"http://127.0.0.1:$RESILIENCE_PORT\",\"api_key\":\"mock-key\",\"signing_secret\":\"mock-secret\"}"
+    check "200" "register a target vault for the zip-bomb source"
+    ZIPBOMB_TARGET_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/sources" "$MASTER_KEY" \
+        "{\"name\":\"zipbomb-e2e-source\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"zipbomb-dst\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$ZIPBOMB_TARGET_VAULT_ID\"}]}"
+    check "200" "register a source pointed at the oversized zip fixture"
+    ZIPBOMB_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/sources/$ZIPBOMB_SOURCE_ID/trigger" "$MASTER_KEY"
+    check "200" "triggering ingestion of the zip bomb does not crash the daemon (no 500)"
+    check_jq ".status" "FAILED" "a decompressed member exceeding MAX_DECOMPRESSED_BYTES must fail the job, not silently truncate or OOM"
+    check_jq ".items_processed" "0" "no records are processed once the decompression-bomb guard trips"
+    ERROR_MSG=$(echo "$RESP_BODY" | jq -r '.error_message')
+    check_local "$(echo "$ERROR_MSG" | grep -qi "decompress" && echo yes || echo no)" "yes" \
+        "the error message explains this is the decompression guard, not an opaque failure (got: $ERROR_MSG)"
+
+    api_call DELETE "/api/sources/$ZIPBOMB_SOURCE_ID" "$MASTER_KEY"
+    check "204" "clean up the zip-bomb source"
+    api_call DELETE "/api/vaults/$ZIPBOMB_TARGET_VAULT_ID" "$MASTER_KEY"
+    check "204" "clean up the zip-bomb target vault"
+
+    log_section "7j. Non-update of last_sync_at on a mid-run chunk failure (Task 2)"
+
+    # Reuses EXTRA_MOCK as a source vault again (EXTRA_DELTA still holds the 15,001-record
+    # pagination-group delta from 7e/7g — untouched by 7i/7h, which only ever rewrite EXTRA_FEED):
+    # push chunks land as 5000/5000/5000/1. bad_target accepts chunk 1 then fails every chunk after
+    # — chunks 2-4 must never reach it once chunk 2 fails partway through the run.
+    api_call POST "/api/vaults" "$MASTER_KEY" \
+        "{\"name\":\"midfail-source-vault\",\"target_url\":\"http://127.0.0.1:$EXTRA_PORT\",\"api_key\":\"mock-key\",\"signing_secret\":\"mock-secret\"}"
+    check "200" "register EXTRA_MOCK again as a source vault for the mid-run-failure check"
+    MIDFAIL_SOURCE_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    echo "failafter:500:1" > "$RESILIENCE_MODE"
+    api_call POST "/api/vaults" "$MASTER_KEY" \
+        "{\"name\":\"midfail-bad-target-vault\",\"target_url\":\"http://127.0.0.1:$RESILIENCE_PORT\",\"api_key\":\"mock-key\",\"signing_secret\":\"mock-secret\"}"
+    check "200" "register the bad (fails after chunk 1) target vault"
+    MIDFAIL_BAD_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/sync-tasks" "$MASTER_KEY" \
+        "{\"name\":\"midfail-e2e-task\",\"source_vault_id\":\"$MIDFAIL_SOURCE_VAULT_ID\",\"source_group_name\":\"pagination-group\",\"target_group_name\":\"midfail-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$TARGET1_VAULT_ID\"},{\"vault_endpoint_id\":\"$MIDFAIL_BAD_VAULT_ID\"}]}"
+    check "200" "create a sync task fanning out to a good target and a target that fails after chunk 1"
+    MIDFAIL_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    check_jq ".last_sync_at" "null" "a freshly created task has no last_sync_at yet"
+
+    RESILIENCE_HITS_BEFORE=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    api_call POST "/api/sync-tasks/$MIDFAIL_TASK_ID/trigger" "$MASTER_KEY"
+    check "200" "trigger the mid-run-failure sync task"
+    check_jq ".status" "PARTIAL" "one target fully succeeding and the other failing mid-run must report PARTIAL"
+
+    RESILIENCE_HITS_AFTER=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    check_local "$((RESILIENCE_HITS_AFTER - RESILIENCE_HITS_BEFORE))" "2" \
+        "the bad target must receive exactly chunk 1 (succeeded) + chunk 2 (failed) — chunks 3 and 4 must never be attempted"
+
+    api_call GET "/api/sync-tasks/$MIDFAIL_TASK_ID" "$MASTER_KEY"
+    check_jq ".last_sync_at" "null" \
+        "last_sync_at must remain withheld after a mid-run failure, so the next scheduled run re-syncs the entire delta"
+
+    echo "ok" > "$RESILIENCE_MODE"
+    api_call DELETE "/api/sync-tasks/$MIDFAIL_TASK_ID" "$MASTER_KEY"
+    check "204" "clean up the mid-run-failure sync task"
+    api_call DELETE "/api/vaults/$MIDFAIL_SOURCE_VAULT_ID" "$MASTER_KEY"
+    check "204" "clean up the mid-run-failure source vault"
+    api_call DELETE "/api/vaults/$MIDFAIL_BAD_VAULT_ID" "$MASTER_KEY"
+    check "204" "clean up the mid-run-failure bad target vault"
+
+    log_section "7k. Non-UTF-8 / raw binary feed body resilience (Task 3)"
+
+    python3 - "$EXTRA_FEED" <<'PYEOF'
+import sys
+
+out_path = sys.argv[1]
+with open(out_path, "wb") as f:
+    f.write(b"# Liste \xe9 jour (Latin-1, pas UTF-8)\n")
+    f.write(b"203.0.113.77\n")
+    f.write(b"; commentaire avec un caract\xe8re \xe9trange\n")
+    f.write(b"2001:db8::77\n")
+PYEOF
+    check_local "$([[ -s "$EXTRA_FEED" ]] && echo yes || echo no)" "yes" "generated a Latin-1/raw-binary feed fixture"
+
+    api_call POST "/api/vaults" "$MASTER_KEY" \
+        "{\"name\":\"nonutf8-target-vault\",\"target_url\":\"http://127.0.0.1:$RESILIENCE_PORT\",\"api_key\":\"mock-key\",\"signing_secret\":\"mock-secret\"}"
+    check "200" "register a target vault for the non-UTF-8 feed source"
+    NONUTF8_TARGET_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/sources" "$MASTER_KEY" \
+        "{\"name\":\"nonutf8-e2e-source\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"nonutf8-dst\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$NONUTF8_TARGET_VAULT_ID\"}]}"
+    check "200" "register a source pointed at the Latin-1/raw-binary feed fixture"
+    NONUTF8_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    RESILIENCE_HITS_BEFORE=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    api_call POST "/api/sources/$NONUTF8_SOURCE_ID/trigger" "$MASTER_KEY"
+    check "200" "triggering ingestion of the non-UTF-8 feed does not crash the daemon (no 500)"
+    check_jq ".status" "SUCCESS" "a feed with non-UTF-8 bytes elsewhere in the body must still succeed on the valid IPs it contains"
+    check_jq ".items_processed" "2" "both valid IPs must survive lossy decoding despite the Latin-1 bytes around them"
+
+    RESILIENCE_HITS_AFTER=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    check_local "$((RESILIENCE_HITS_AFTER - RESILIENCE_HITS_BEFORE))" "1" "exactly one batch was pushed"
+    PUSHED_ADDRESSES=$(tail -n 1 "$RESILIENCE_LOG" | jq -r '.body | fromjson | .records | map(.target_address) | join(",")')
+    check_local "$PUSHED_ADDRESSES" "203.0.113.77,2001:db8::77" "exactly the two valid IPs were extracted and pushed, none of the Latin-1 noise"
+
+    api_call DELETE "/api/sources/$NONUTF8_SOURCE_ID" "$MASTER_KEY"
+    check "204" "clean up the non-UTF-8 source"
+    api_call DELETE "/api/vaults/$NONUTF8_TARGET_VAULT_ID" "$MASTER_KEY"
+    check "204" "clean up the non-UTF-8 target vault"
+
     api_call DELETE "/api/vaults/$RESILIENCE_VAULT_ID" "$MASTER_KEY"
     check "204" "clean up the resilience target vault"
 else
-    skip "sections 6-7h (multi-vault sync, target overrides, credential rotation, concurrency, pagination, retry, 413 split, full_replace): mock vaults unavailable"
+    skip "sections 6-7k (multi-vault sync, target overrides, credential rotation, concurrency, pagination, retry, 413 split, full_replace, zip bomb, mid-run failure, non-utf8 feed): mock vaults unavailable"
 fi
 
 # ── 8. External feed ingestion — live feeds ─────────────────────────────────

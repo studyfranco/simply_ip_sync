@@ -7,6 +7,13 @@
 //! array) — this is Spamhaus DROP's actual wire format (`drop_v6.json` is **not** a JSON array;
 //! it is one object per line, plus a trailing `{"type":"metadata", ...}` footer line with no
 //! `ip_field`, which is silently skipped the same way any other item missing `ip_field` is).
+//!
+//! Non-`jsonl` bodies are handed to `serde_json::from_slice` directly, which already validates
+//! UTF-8 as an ordinary part of JSON syntax and returns a clean `Err` (never a panic) on invalid
+//! bytes — no separate lossy-decoding step is needed there. `jsonl` mode decodes each line with
+//! [`String::from_utf8_lossy`] instead (see `parse_jsonl`), since a single non-UTF-8 *line* among
+//! otherwise well-formed ones should only fail that line, the same way any other malformed line
+//! already does — not the whole feed.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -63,9 +70,13 @@ impl FeedParser for JsonPathParser {
 /// Parses newline-delimited JSON: one object per non-empty line. A line that fails to parse as
 /// JSON, or parses but lacks `ip_field`, is skipped rather than aborting the whole feed — this is
 /// what lets Spamhaus DROP's trailing `{"type":"metadata", ...}` footer line pass through
-/// harmlessly instead of failing the entire ingestion.
+/// harmlessly instead of failing the entire ingestion. Decoded with [`String::from_utf8_lossy`]
+/// for the same reason `regex_line.rs` is: a single non-UTF-8 line (see this module's doc comment)
+/// becomes `U+FFFD` replacement characters, which then simply fails that one line's JSON parse (or
+/// its `ip_field` lookup) and gets skipped exactly like any other malformed line already is —
+/// never a hard failure for the whole body over one bad line.
 fn parse_jsonl(raw: &[u8], ip_field: &str) -> Result<Vec<String>, ParseError> {
-    let text = std::str::from_utf8(raw).map_err(|e| ParseError::MalformedBody(e.to_string()))?;
+    let text = String::from_utf8_lossy(raw);
     let values = text
         .lines()
         .map(str::trim)
@@ -170,6 +181,33 @@ mod tests {
         let body = "{\"cidr\":\"2001:db8::/32\"}\nnot json at all\n{\"cidr\":\"2001:db9::/32\"}\n";
         let config = r#"{"jsonl":true,"ip_field":"cidr"}"#;
         let out = parser.parse(body.as_bytes(), Some(config)).expect("parse");
+        assert_eq!(out, vec!["2001:db8::/32".to_owned(), "2001:db9::/32".to_owned()]);
+    }
+
+    /// Task 3: a raw binary/non-UTF-8 body is not valid JSON either way, so `JSON_PATH`'s
+    /// non-`jsonl` path (`serde_json::from_slice`, which validates UTF-8 as part of JSON syntax)
+    /// must still surface this as a clean `Err`, never a panic.
+    #[test]
+    fn raw_binary_body_is_a_clean_parse_error_not_a_panic() {
+        let parser = JsonPathParser;
+        let config = r#"{"ip_field":"ip"}"#;
+        let body: &[u8] = &[0x00, 0xff, 0xfe, 0x80, 0x81, 0x00, 0x00, 0xc0, 0xc1];
+        let result = parser.parse(body, Some(config));
+        assert!(result.is_err(), "raw binary is not valid JSON and must be rejected cleanly, not panic");
+    }
+
+    /// Task 3, `jsonl` mode specifically: a non-UTF-8 line among otherwise well-formed JSONL lines
+    /// must not fail the whole body — lossy decoding turns the bad line into replacement
+    /// characters, which then simply fails *that* line's JSON parse and gets skipped, exactly like
+    /// `jsonl_mode_skips_unparseable_lines_without_failing`'s plain-garbage line does.
+    #[test]
+    fn jsonl_mode_skips_a_non_utf8_line_without_failing_the_whole_body() {
+        let parser = JsonPathParser;
+        let mut body = b"{\"cidr\":\"2001:db8::/32\"}\n".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0x00]); // invalid UTF-8, not valid JSON either way
+        body.extend_from_slice(b"\n{\"cidr\":\"2001:db9::/32\"}\n");
+        let config = r#"{"jsonl":true,"ip_field":"cidr"}"#;
+        let out = parser.parse(&body, Some(config)).expect("must not error on an invalid UTF-8 line");
         assert_eq!(out, vec!["2001:db8::/32".to_owned(), "2001:db9::/32".to_owned()]);
     }
 }

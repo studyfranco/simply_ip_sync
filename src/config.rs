@@ -266,6 +266,42 @@ pub fn outbound_retry_backoff() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// Default ceiling, in bytes, on a decompressed feed body before ingestion aborts, when
+/// `MAX_DECOMPRESSED_BYTES` is unset.
+pub const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 50 * 1024 * 1024;
+
+fn max_decompressed_bytes_cell() -> &'static OnceLock<u64> {
+    static CELL: OnceLock<u64> = OnceLock::new();
+    &CELL
+}
+
+/// Hard ceiling on decompressed feed body size — the defense against a decompression bomb (a
+/// small compressed payload, whether via an HTTP `Content-Encoding` reqwest decodes transparently
+/// or an internal ZIP member, that expands to gigabytes and exhausts memory before anything gets a
+/// chance to reject it). Read once from `MAX_DECOMPRESSED_BYTES` (default
+/// [`DEFAULT_MAX_DECOMPRESSED_BYTES`], clamped to at least 1 byte) — a tuning value, not a
+/// fail-hard security boundary, so a malformed setting fails soft to the default with a logged
+/// warning rather than refusing to boot. Enforced incrementally, never after the fact, by
+/// `jobs::decompress::read_capped_body` (streaming the HTTP response body) and
+/// `jobs::decompress::decompress_if_zip` (streaming each ZIP member) — both abort as soon as the
+/// running total crosses this ceiling, so the oversized remainder is never actually materialized.
+pub fn max_decompressed_bytes() -> u64 {
+    *max_decompressed_bytes_cell().get_or_init(|| {
+        std::env::var("MAX_DECOMPRESSED_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or_else(|| {
+                if std::env::var("MAX_DECOMPRESSED_BYTES").is_ok() {
+                    tracing::warn!(
+                        "MAX_DECOMPRESSED_BYTES is not a valid positive integer, using default of {DEFAULT_MAX_DECOMPRESSED_BYTES} bytes"
+                    );
+                }
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

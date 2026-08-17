@@ -552,3 +552,118 @@ async fn source_vault_delta_spanning_multiple_pages_is_fetched_completely() {
     let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
     assert!(updated_task.last_sync_at.is_some(), "a fully successful multi-page sync must still advance last_sync_at");
 }
+
+/// Task 2: a failure on chunk 2 of a target's own 3-chunk push sequence — *after* chunk 1 already
+/// landed — must stop that target's sequence immediately (chunk 3 is never attempted), the overall
+/// job must report `PARTIAL` (one target, `good_target`, fully succeeds; the other,
+/// `bad_target`, partially fails), and `last_sync_at` must remain withheld so the next scheduled
+/// run re-fetches and re-pushes the *entire* delta rather than skipping what `bad_target` already
+/// (partially) received. `vault_sync_tasks` only ever pushes in `upsert` mode (see
+/// `AGENT.MD` §3.B and `SCHEMA.MD`'s `vault_sync_tasks.mode` column) — a `full_replace` variant of
+/// this exact scenario lives in `tests/external_ingestion_tests.rs`, the pipeline that actually
+/// supports that mode.
+#[tokio::test]
+async fn mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at() {
+    let (conn, state, _master) = common::setup().await;
+
+    const TOTAL_RECORDS: u32 = 12_000;
+
+    let source_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .respond_with(move |req: &wiremock::Request| {
+            let offset: u32 = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "offset")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(0);
+            let limit: u32 = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "limit")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(5000);
+            let page_len = limit.min(TOTAL_RECORDS.saturating_sub(offset));
+            let page: Vec<serde_json::Value> = (0..page_len)
+                .map(|i| {
+                    let idx = offset + i;
+                    serde_json::json!({
+                        "id": uuid::Uuid::new_v4(),
+                        "target_address": synth_ip(idx),
+                        "group_name": "source-group",
+                        "is_deleted": false,
+                        "created_at": "2026-01-01T00:00:00",
+                        "updated_at": "2026-01-01T00:00:00",
+                        "last_seen_at": "2026-01-01T00:00:00"
+                    })
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(page)
+        })
+        .mount(&source_mock)
+        .await;
+
+    let good_target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1
+        })))
+        .mount(&good_target_mock)
+        .await;
+
+    let bad_post_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = bad_post_count.clone();
+    let bad_target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // Chunk 1: succeeds, same as every request to good_target_mock.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1
+                }))
+            } else {
+                // Chunk 2: a fatal server error. If chunk 3 were ever sent it would land here too
+                // (still failing) — the request-count assertion below is what actually proves
+                // chunk 3 was never attempted, not just that it would have failed if it had been.
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&bad_target_mock)
+        .await;
+
+    let source_id = insert_vault(&conn, "source", &source_mock.uri()).await;
+    let good_target_id = insert_vault(&conn, "good-target", &good_target_mock.uri()).await;
+    let bad_target_id = insert_vault(&conn, "bad-target", &bad_target_mock.uri()).await;
+    let task_id = insert_task_multi(&conn, source_id, &[good_target_id, bad_target_id]).await;
+
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+
+    assert_eq!(
+        summary.status, "PARTIAL",
+        "one target fully succeeding and the other partially failing must report PARTIAL, not SUCCESS or FAILED"
+    );
+    assert_eq!(
+        summary.chunks_sent, 4,
+        "good_target's 3 successful chunks + bad_target's 1 successful chunk (before it failed on chunk 2) = 4"
+    );
+
+    let good_requests = good_target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(good_requests.len(), 3, "good_target must still receive its full 3-chunk sequence regardless of bad_target's failure");
+
+    let bad_requests = bad_target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(
+        bad_requests.len(), 2,
+        "bad_target must receive exactly chunk 1 (succeeded) + chunk 2 (failed) — chunk 3 must never be attempted once chunk 2 failed"
+    );
+
+    let task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.expect("query").expect("task exists");
+    assert!(
+        task.last_sync_at.is_none(),
+        "last_sync_at must remain withheld after a mid-run failure, so the next scheduled run re-fetches and \
+         re-pushes the entire delta rather than skipping what bad_target only partially received"
+    );
+}
