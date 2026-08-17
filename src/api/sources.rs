@@ -44,7 +44,7 @@ pub struct ExternalSourceResponse {
     pub cron_schedule: String,
     /// Default target group name.
     pub target_group_name: String,
-    /// Ingestion mode. Always `"upsert"`.
+    /// Ingestion mode: `"upsert"` or `"full_replace"`. See [`CreateExternalSourcePayload::mode`].
     pub mode: String,
     /// Whether automatic scheduling is enabled.
     pub is_active: bool,
@@ -111,6 +111,13 @@ pub struct CreateExternalSourcePayload {
     pub cron_schedule: String,
     /// Default target group name.
     pub target_group_name: String,
+    /// Ingestion mode: `"upsert"` (default — never implicitly deletes) or `"full_replace"` (the
+    /// first chunk of each run's push to a given target clears anything not in this run's fetched
+    /// content; every subsequent chunk of the same run automatically downgrades to `upsert` — see
+    /// `jobs::mode_for_chunk_index` — so a multi-chunk feed can never have a later chunk erase an
+    /// earlier one's just-delivered records).
+    #[serde(default = "default_mode")]
+    pub mode: String,
     /// Whether automatic scheduling is enabled. Defaults to `true`.
     #[serde(default = "default_true")]
     pub is_active: bool,
@@ -121,6 +128,10 @@ pub struct CreateExternalSourcePayload {
 
 fn default_parser_type() -> String {
     "REGEX_LINE".to_owned()
+}
+
+fn default_mode() -> String {
+    "upsert".to_owned()
 }
 
 fn default_true() -> bool {
@@ -149,6 +160,9 @@ pub struct UpdateExternalSourcePayload {
     /// New default target group name.
     #[serde(default)]
     pub target_group_name: Option<String>,
+    /// New ingestion mode: `"upsert"` or `"full_replace"`.
+    #[serde(default)]
+    pub mode: Option<String>,
     /// New active flag.
     #[serde(default)]
     pub is_active: Option<bool>,
@@ -204,6 +218,9 @@ pub async fn create_external_source(
     if payload.parser_type != "REGEX_LINE" && payload.parser_type != "JSON_PATH" {
         return Err(AppError::InvalidInput("parser_type must be REGEX_LINE or JSON_PATH".to_owned()));
     }
+    if crate::client::BatchMode::parse(&payload.mode).is_none() {
+        return Err(AppError::InvalidInput("mode must be upsert or full_replace".to_owned()));
+    }
     crate::scheduler::validate_cron_expression(&payload.cron_schedule)
         .map_err(|e| AppError::InvalidInput(format!("invalid cron_schedule: {e}")))?;
 
@@ -219,7 +236,7 @@ pub async fn create_external_source(
         parser_config_json: Set(payload.parser_config_json),
         cron_schedule: Set(payload.cron_schedule),
         target_group_name: Set(payload.target_group_name),
-        mode: Set("upsert".to_owned()),
+        mode: Set(payload.mode),
         is_active: Set(payload.is_active),
         last_run_at: Set(None),
         owner_key_id: Set(Some(caller.id)),
@@ -274,6 +291,11 @@ pub async fn update_external_source(
         crate::scheduler::validate_cron_expression(cron)
             .map_err(|e| AppError::InvalidInput(format!("invalid cron_schedule: {e}")))?;
     }
+    if let Some(mode) = &payload.mode
+        && crate::client::BatchMode::parse(mode).is_none()
+    {
+        return Err(AppError::InvalidInput("mode must be upsert or full_replace".to_owned()));
+    }
 
     let txn = state.db.begin().await?;
     let mut active: external_source::ActiveModel = existing.into();
@@ -294,6 +316,9 @@ pub async fn update_external_source(
     }
     if let Some(group) = payload.target_group_name {
         active.target_group_name = Set(group);
+    }
+    if let Some(mode) = payload.mode {
+        active.mode = Set(mode);
     }
     if let Some(is_active) = payload.is_active {
         active.is_active = Set(is_active);

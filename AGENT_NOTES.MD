@@ -354,3 +354,148 @@ production-code changes (not just tests) plus new coverage across `tests/` and
   process-pause/resume in bash.
 - `./scripts/verify_convergence.sh` still does not exist (see sessions 1–2's decision) and was not
   requested as a gate this session.
+
+## Session 4 (2026-08-17): delta pagination, outbound retry/backoff, adaptive 413 splitting, safe multi-chunk `full_replace`
+
+Requested as four production features plus tests: (1) paginate `GET /api/ips` delta fetches
+instead of assuming one page is the whole result; (2) retry transient outbound failures
+(`429`/`502`/`503`/`504`) with exponential backoff+jitter; (3) adaptively split a batch in half on
+`413 Payload Too Large` and resend the halves; (4) make multi-chunk `full_replace` ingestion safe —
+only the first chunk of a run may carry `full_replace`, every later chunk must downgrade to
+`upsert` or it erases what the previous chunk just delivered.
+
+**Production code changes:**
+
+1. **`config::outbound_max_retries` / `config::outbound_retry_backoff`** (new, `OUTBOUND_MAX_RETRIES`
+   default `3`, `OUTBOUND_RETRY_BACKOFF_MS` default `500`). Unlike every other tunable in this
+   module (`outbound_http_timeout` included), these two are **deliberately not `OnceLock`-cached** —
+   they read `std::env::var` fresh on every call. A cached value set by one test would leak into
+   every other test sharing the binary (the exact hazard session 3 flagged for
+   `OUTBOUND_HTTP_TIMEOUT_SECS`, which is why timeout tests override `AppState.http` directly
+   instead). Retry tests can't use that workaround as cleanly — the retry loop lives inside
+   `client::post_batch`/`get_ips_delta`, not behind a swappable `Client` — so instead the config
+   reads live, and any test that needs a non-default value sets/removes the env var around just its
+   own call, under a shared `tokio::sync::Mutex` (`tests/client_resilience_tests.rs::env_lock`) so
+   two such tests never run concurrently and stomp each other's value mid-flight.
+2. **`retry` module** (new file, `src/retry.rs`): `is_transient_status(u16) -> bool` — exactly
+   `429 | 502 | 503 | 504`, deliberately excluding both `500` (a generic server error retrying won't
+   fix) and `413` (handled by splitting, not retrying — retrying an oversized payload unchanged
+   would just get `413` again). `backoff_with_jitter(attempt) -> Duration` — exponential off
+   `outbound_retry_backoff()`, capped at 30s, up to 50% jitter so a fleet of vaults hitting the same
+   flaky target don't all retry in lockstep.
+3. **`client.rs`**: `post_batch` and `get_ips_delta` each split into three layers — a single-attempt
+   fn (`post_batch_once` / `get_ips_page`), a retry wrapper around it
+   (`post_batch_with_retry` / `get_ips_page_with_retry`, looping on `is_transient_status` up to
+   `outbound_max_retries()`, always re-signing with a fresh timestamp since CANONICAL_V1 covers the
+   timestamp and a request signed before a multi-second backoff sleep could land outside the
+   receiving side's freshness window), and the public entry point. `post_batch`'s public layer adds
+   413-adaptive splitting on top: a `VecDeque<(Vec<BatchRecordInput>, BatchMode)>` work queue rather
+   than recursion (an async fn can't recurse without boxing the future) — on `413` with more than
+   one record, splits at the midpoint and pushes both halves back to the front, first-half-first,
+   aggregating successful responses via a new `BatchRecordsResponse::merge`. `get_ips_delta`'s
+   public layer adds the pagination loop (unchanged `DELTA_PAGE_SIZE = 5_000`, breaks on a
+   short/final page), now with each page independently retried — a `503` on page 3 of 4 no longer
+   requires re-fetching pages 1–2.
+4. **`BatchMode` gained `FullReplace`** plus `BatchMode::parse(&str) -> Option<Self>`
+   (`"upsert"`/`"full_replace"`, `None` for anything else — a typo must be caught at the API
+   boundary, not silently reinterpreted). The safety rule — only the *first* delivered piece of a
+   run may carry `full_replace`, everything after downgrades to `upsert` — is applied at **two
+   layers that must agree**: `jobs::mode_for_chunk_index(base_mode, chunk_index)` at the job-chunking
+   layer (`external_ingestion.rs`, chunk 0 keeps `base_mode`, every later chunk is `Upsert`), and
+   again *inside* `post_batch`'s own 413-split queue (the second half of any split is always forced
+   to `Upsert`, regardless of how many times a chunk has already been re-split) — because a chunk
+   that starts as chunk 0's `full_replace` and then gets 413-split into two wire requests must still
+   only have the *first* of those two carry `full_replace`, or the split itself would recreate the
+   exact bug the job-layer rule exists to prevent.
+5. **`jobs/vault_sync.rs` deliberately NOT modified.** `full_replace` was not extended to
+   `vault_sync_tasks`: a vault-sync delta batch (`since=`-filtered) is a small incremental slice, not
+   a group's full content, so `full_replace` there would read as "delete everything this run's tiny
+   delta didn't mention" — nearly the entire target group, on every single run. `vault_sync.rs`
+   still hardcodes `BatchMode::Upsert` for every chunk and inherited the pagination+retry behavior
+   automatically, with zero code changes of its own, purely from the `client.rs` rewrite underneath
+   it. Documented in `AGENT.MD` §3.B and `SCHEMA.MD`'s `vault_sync_tasks.mode` column description so
+   a future session doesn't "fix" this as a missing feature.
+6. **`api/sources.rs`**: `mode` accepted on create (defaults to `"upsert"`) and update, validated
+   with `BatchMode::parse` before the transaction — an invalid value is `400` and never persisted,
+   same pattern already established for `cron_schedule` validation.
+
+**Unrelated pre-existing build break, found and fixed (blocking, not part of the four features):**
+`Cargo.toml` already had `croner` bumped `"2"` → `"3"` and `tokio-cron-scheduler` `"0.13"` →
+`"0.15"` as an uncommitted change from before this session, but `scheduler.rs::validate_cron_expression`
+still called croner 2.x's removed builder API (`croner::Cron::new(&expr).with_seconds_required().with_dom_and_dow().parse()`).
+This isn't a lint — it's `E0599`, so it failed `cargo check`/`test`/`build` outright, not just
+`clippy`. Fixed by switching to croner 3's actual API: `croner::parser::CronParser::builder().seconds(Seconds::Required).dom_and_dow(true).build().parse(&normalized)`.
+Confirmed no other `croner::` call sites existed to update. This had to be fixed before any of this
+session's own validation gates could even compile — flagged here explicitly since it's out of scope
+for the four requested features but was silently blocking all of them.
+
+**New test files / major additions:**
+
+- `tests/client_resilience_tests.rs` (new file, 7 tests): retry recovery after two transient
+  failures then success on the third attempt (`post_batch` directly, asserting the aggregated
+  response and exactly 3 requests reaching the mock); retry exhaustion (`OUTBOUND_MAX_RETRIES=2` ⇒
+  3 total attempts, then a clean error, no infinite retry); a non-transient `400` is never retried
+  (exactly 1 request); adaptive 413 splitting completing delivery of 5,000 records (asserts the
+  *delivered* — i.e. `≤2000`-record — sub-batches sum to exactly 5,000, since `received_requests()`
+  also captures the oversized attempts that provoked each `413`); the same splitting preserving
+  `full_replace` on only the first of two delivered sub-chunks after one split; a `413` on a
+  single record failing outright rather than looping forever (nothing left to split); the same
+  per-page retry behavior for `get_ips_delta`. All env-var-mutating tests share
+  `env_lock()` (a `tokio::sync::Mutex`, not `std::sync::Mutex` — clippy's `await_holding_lock` lint
+  correctly flags a sync mutex guard held across an `.await`).
+- `tests/external_ingestion_tests.rs` (+1 test): 12,000 synthetic records through a `full_replace`
+  source (`MAX_BATCH_SIZE=5,000` ⇒ 3 chunks of 5000/5000/2000) — asserts all 12,000 land, exactly 3
+  POSTs are sent, and the wire-level `mode` field is `full_replace,upsert,upsert` in delivery order,
+  never more than the first.
+- `tests/vault_sync_tests.rs` (+1 test): 15,001 synthetic delta records across 4 pages
+  (`DELTA_PAGE_SIZE=5,000` ⇒ 5000/5000/5000/1) — a closure-based `wiremock` responder reads
+  `offset`/`limit` query params to serve the correct page; asserts exactly 4 GET requests, exactly 4
+  push chunks whose combined records sum to 15,001, and `last_sync_at` still advances.
+- `tests/api_validation_tests.rs` (+3 tests): an invalid `mode` on source creation is `400` and
+  nothing persists; both valid values are accepted and omitting `mode` defaults to `"upsert"`; an
+  invalid `mode` on update is `400` without mutating the existing row — mirrors the file's existing
+  `cron_schedule` validation tests exactly.
+- Lib unit tests (+6): `config.rs` (`outbound_max_retries`/`outbound_retry_backoff` default-when-unset,
+  ×2), `retry.rs` (`is_transient_status`'s exact set, backoff growth+cap, ×2), `jobs/mod.rs`
+  (`mode_for_chunk_index`: only chunk 0 keeps `full_replace`; `upsert` stays `upsert` for every
+  chunk, ×2).
+- `scripts/test_e2e.sh`: `mock_vault.py` extended in place — `GET /api/ips` now actually honors
+  `offset`/`limit` (previously always returned the whole delta file regardless of query params, a
+  gap this session's pagination scenario needed real support for, not just a mode string); a new
+  `GET /feed.txt` branch lets a mock vault instance double as an external-feed HTTP source; the POST
+  mode dispatch gained `retry:<status>:<n>` (fail with `<status>` for the first `<n>` POSTs *while
+  that exact mode string is active* — the hit counter resets whenever the mode file's content
+  changes, so re-arming the same mode string later in the same long-lived process counts from zero
+  again) and `split413:<threshold>` (413 iff the POSTed `records` array exceeds `<threshold>`,
+  otherwise success), alongside the existing `ok`/`fail500`/`fail413`. Two new long-lived mock
+  instances launched alongside the existing source/target1/target2 (`EXTRA_MOCK` — large delta +
+  feed-file serving; `RESILIENCE_MOCK` — the POST target whose mode file drives retry/413/full_replace
+  scenarios), both added to the process-cleanup trap. Four new subsections: **7e** (15,001-record
+  delta across 4 pages, checked end-to-end through a real sync-task trigger); **7f** (a target
+  failing twice with `503` before succeeding on the 3rd attempt, verified against the mock's own
+  request log, not just the job's reported status); **7g** (the same 15,001-record delta re-pushed
+  against a 2,000-record 413 ceiling — asserts the exact attempt/delivery cascade: 3 job-level
+  chunks of 5,000 each split into 4 delivered sub-batches apiece plus the trailing 1-record chunk
+  needing no split, 22 total wire attempts, 13 delivered, all summing back to 15,001); **7h**
+  (12,000-record `full_replace` feed via `EXTRA_MOCK`'s `/feed.txt`, asserting the wire-level `mode`
+  sequence `full_replace,upsert,upsert` exactly as the unit test does, but over a real socket against
+  the actual compiled binary).
+
+**Test metrics after this session:**
+- `cargo test` (default, offline): **120 tests**, 0 failed (up from 102: +6 lib unit tests, +1
+  `vault_sync_tests.rs`, +7 `client_resilience_tests.rs` (new file), +1 `external_ingestion_tests.rs`,
+  +3 `api_validation_tests.rs`).
+- `cargo test -- --ignored`: **5 tests**, 0 failed (unchanged — no new live-network tests this
+  session).
+- `./scripts/test_e2e.sh`: **162 checks** (up from 126), 0 failed, 0 skipped, run **twice
+  consecutively** with an explicit post-run check for lingering `mock_vault.py`/`http.server`
+  processes — clean both times, zero leaks.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: both clean, zero
+  warnings (after the croner fix above — before it, neither could even compile).
+
+**Not done / flagged rather than assumed out of scope:**
+- `full_replace` support was scoped to `external_sources` only, by design (see the vault_sync
+  decision above) — this is not a gap, it's the considered safety boundary this session's own Task 4
+  exists to enforce.
+- `./scripts/verify_convergence.sh` still does not exist (see sessions 1–2's decision) and was not
+  requested as a gate this session.

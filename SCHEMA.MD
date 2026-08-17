@@ -95,7 +95,7 @@ Defines external threat intelligence HTTP feeds (Spamhaus, FireHOL, AbuseIPDB, e
 | `parser_config_json`| `Text` | Nullable | JSON configuration for parser (e.g., JSONPath pointer, custom headers) |
 | `cron_schedule` | `String` | Not Null | Cron expression for periodic execution (e.g., `0 0 * * *`) |
 | `target_group_name` | `String` | Not Null | Default group name in target `ip_vault`s where IPs land |
-| `mode` | `String` | Not Null, Default: `'upsert'` | Ingestion mode: strictly `'upsert'` |
+| `mode` | `String` | Not Null, Default: `'upsert'` | Ingestion mode: `'upsert'` (never implicitly deletes) or `'full_replace'` (this run's fetched content becomes the target group's full authoritative set). Applies to chunk 0 of each target's chunk sequence only — every later chunk of the same run downgrades to `'upsert'` automatically, so a multi-chunk feed can never have a later chunk erase an earlier one's just-delivered records (see `AGENT.MD` §3.A) |
 | `is_active` | `Boolean` | Default: `true` | Enable/disable automatic scheduling |
 | `last_run_at` | `DateTimeUtc` | Nullable | Timestamp of last execution |
 | `owner_key_id` | `UUID` | Nullable, Indexed | Key holding lifecycle authority over this source |
@@ -130,7 +130,7 @@ Defines inter-vault delta replication tasks from a source Vault group to target 
 | `target_group_name` | `String` | Not Null | Default target group name on receiving Vaults |
 | `cron_schedule` | `String` | Not Null | Cron expression for periodic delta polling |
 | `last_sync_at` | `DateTimeUtc` | Nullable | High-water mark timestamp used for `since=` delta queries |
-| `mode` | `String` | Not Null, Default: `'upsert'` | Sync mode: strictly `'upsert'` |
+| `mode` | `String` | Not Null, Default: `'upsert'` | Sync mode: strictly `'upsert'`. Deliberately **not** extended to `'full_replace'` the way `external_sources.mode` was — a delta batch (`since=`-filtered) is an incremental slice of a group, not its full content, so `full_replace` here would read as "delete everything the current delta batch didn't happen to touch" on every run (see `AGENT.MD` §3.B) |
 | `is_active` | `Boolean` | Default: `true` | Enable/disable task execution |
 | `owner_key_id` | `UUID` | Nullable, Indexed | Key holding lifecycle authority over this task |
 | `created_at` | `DateTimeUtc` | Not Null | Creation timestamp |

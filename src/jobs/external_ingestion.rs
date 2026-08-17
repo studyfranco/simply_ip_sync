@@ -62,35 +62,56 @@ async fn execute(
     let start = std::time::Instant::now();
 
     let fetch_options = FetchOptions::from_config(source.parser_config_json.as_deref());
-    let mut request = state.http.get(&source.source_url);
-    if let Some(user_agent) = &fetch_options.user_agent {
-        request = request.header(reqwest::header::USER_AGENT, user_agent);
-    }
-    for (name, value) in &fetch_options.headers {
-        request = request.header(name, value);
-    }
+    let build_request = |http: &reqwest::Client| {
+        let mut request = http.get(&source.source_url);
+        if let Some(user_agent) = &fetch_options.user_agent {
+            request = request.header(reqwest::header::USER_AGENT, user_agent);
+        }
+        for (name, value) in &fetch_options.headers {
+            request = request.header(name, value);
+        }
+        request
+    };
 
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return JobSummary {
-                status: "FAILED",
-                items_processed: 0,
-                chunks_sent: 0,
-                duration_ms: start.elapsed().as_millis() as i32,
-                error_message: Some(format!("fetch failed: {e}")),
-            };
+    // Transient upstream errors (429/502/503/504) are retried with backoff — the same policy
+    // `client.rs` applies to vault calls, extended here since an external feed host is just as
+    // likely to be rate-limiting or briefly overloaded. A non-transient error status fails the job
+    // immediately, same as before.
+    let max_retries = crate::config::outbound_max_retries();
+    let mut attempt: u32 = 0;
+    let response = loop {
+        match build_request(&state.http).send().await {
+            Ok(r) if r.status().is_success() => break r,
+            Ok(r) if crate::retry::is_transient_status(r.status().as_u16()) && attempt < max_retries => {
+                attempt += 1;
+                let delay = crate::retry::backoff_with_jitter(attempt);
+                tracing::warn!(
+                    "fetching '{}' returned {}; retrying in {delay:?} (attempt {attempt}/{max_retries})",
+                    source.source_url,
+                    r.status()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Ok(r) => {
+                return JobSummary {
+                    status: "FAILED",
+                    items_processed: 0,
+                    chunks_sent: 0,
+                    duration_ms: start.elapsed().as_millis() as i32,
+                    error_message: Some(format!("fetch returned status {}", r.status())),
+                };
+            }
+            Err(e) => {
+                return JobSummary {
+                    status: "FAILED",
+                    items_processed: 0,
+                    chunks_sent: 0,
+                    duration_ms: start.elapsed().as_millis() as i32,
+                    error_message: Some(format!("fetch failed: {e}")),
+                };
+            }
         }
     };
-    if !response.status().is_success() {
-        return JobSummary {
-            status: "FAILED",
-            items_processed: 0,
-            chunks_sent: 0,
-            duration_ms: start.elapsed().as_millis() as i32,
-            error_message: Some(format!("fetch returned status {}", response.status())),
-        };
-    }
     let body = match response.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -155,6 +176,16 @@ async fn execute(
     let mut errors: Vec<String> = Vec::new();
     let mut any_success = targets.is_empty();
 
+    // `source.mode` is validated to be "upsert"/"full_replace" at the API boundary
+    // (api/sources.rs), so a value that fails to parse here can only mean the row predates that
+    // validation or was edited directly in the database — fail closed to the non-destructive
+    // choice rather than silently defaulting to full_replace's delete-anything-unmentioned
+    // behavior on a misread.
+    let base_mode = BatchMode::parse(&source.mode).unwrap_or_else(|| {
+        tracing::warn!("external_sources.mode '{}' is not a recognised value; treating as upsert", source.mode);
+        BatchMode::Upsert
+    });
+
     for (target, vault) in targets {
         let Some(vault) = vault else {
             errors.push(format!("target vault {} no longer exists", target.vault_endpoint_id));
@@ -166,7 +197,7 @@ async fn execute(
             .unwrap_or_else(|| source.target_group_name.clone());
 
         let mut target_ok = true;
-        for chunk in &chunks {
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
             let batch: Vec<BatchRecordInput> = chunk
                 .iter()
                 .map(|addr| BatchRecordInput {
@@ -179,8 +210,11 @@ async fn execute(
                     deleted_at: None,
                 })
                 .collect();
-            match client::post_batch(&state.http, &state.cipher, vault, &group_name, &batch, BatchMode::Upsert).await
-            {
+            // Only chunk 0 of *this target's* sequence may carry `full_replace` — see
+            // `jobs::mode_for_chunk_index`'s doc comment for why every later chunk must downgrade
+            // to `upsert` regardless of the source's configured mode.
+            let chunk_mode = super::mode_for_chunk_index(base_mode, chunk_index);
+            match client::post_batch(&state.http, &state.cipher, vault, &group_name, &batch, chunk_mode).await {
                 Ok(_) => chunks_sent += 1,
                 Err(e) => {
                     target_ok = false;

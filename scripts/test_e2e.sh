@@ -171,10 +171,12 @@ MOCK_SOURCE_PID=""
 MOCK_TARGET1_PID=""
 MOCK_TARGET2_PID=""
 FIXTURE_SERVER_PID=""
+EXTRA_MOCK_PID=""
+RESILIENCE_MOCK_PID=""
 
 cleanup() {
     local pid_var pid
-    for pid_var in SERVER_PID MOCK_SOURCE_PID MOCK_TARGET1_PID MOCK_TARGET2_PID FIXTURE_SERVER_PID; do
+    for pid_var in SERVER_PID MOCK_SOURCE_PID MOCK_TARGET1_PID MOCK_TARGET2_PID FIXTURE_SERVER_PID EXTRA_MOCK_PID RESILIENCE_MOCK_PID; do
         pid="${!pid_var}"
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             log "Stopping $pid_var (pid $pid)..."
@@ -491,18 +493,37 @@ log_section "5. Multi-vault sync — mock ip_vault servers"
 MULTI_VAULT_AVAILABLE=0
 if [[ "$PYTHON3_AVAILABLE" -eq 1 ]]; then
     cat > "$WORK_DIR/mock_vault.py" <<'PYEOF'
-# Minimal mock simply_ip_vault: serves a canned GET /api/ips delta and logs every
-# POST /api/records/batch (headers + body) as one JSON line per request. Failure mode for POST is
-# controlled by re-reading a small "mode" file on every request (ok | fail500 | fail413), so the
-# test script can flip a target's behavior without restarting the process or losing its port.
+# Minimal mock simply_ip_vault: serves a paginated GET /api/ips delta, an optional static
+# GET /feed.txt (for doubling as an external-feed HTTP source), and logs every
+# POST /api/records/batch (headers + body) as one JSON line per request. Behavior for POST and the
+# contents served by GET are controlled by re-reading small files on every request — mode_path,
+# delta_path, feed_path — so the test script can flip a target's behavior, swap its delta content,
+# or make a feed appear, all without restarting the process or losing its port.
+#
+# mode values:
+#   ok                    - normal success response.
+#   fail500               - every POST fails with 500.
+#   fail413               - every POST fails with 413 (payload can never be split small enough).
+#   retry:<status>:<n>    - the first <n> POSTs while this exact mode string is active fail with
+#                           <status> (429/502/503/504), every POST after that succeeds. The hit
+#                           counter resets whenever the mode file's content changes, so re-arming a
+#                           fresh "retry:503:2" later in the same process starts counting from zero
+#                           again.
+#   split413:<threshold>  - a POST is rejected with 413 iff its `records` array has more than
+#                           <threshold> entries; otherwise it succeeds. Models a target vault with a
+#                           real payload-size ceiling, for exercising client-side adaptive splitting.
 import http.server
 import json
 import sys
+import urllib.parse
 
 port = int(sys.argv[1])
 log_path = sys.argv[2]
 mode_path = sys.argv[3]
 delta_path = sys.argv[4]
+feed_path = sys.argv[5] if len(sys.argv) > 5 else None
+
+_mode_state = {"last": None, "hits": 0}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -513,12 +534,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except FileNotFoundError:
             return "ok"
 
+    def _write_json(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path.startswith("/api/ips"):
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
             with open(delta_path, "rb") as f:
-                body = f.read()
+                all_records = json.loads(f.read())
+            offset = int(qs.get("offset", ["0"])[0])
+            limit = int(qs.get("limit", [str(len(all_records))])[0])
+            self._write_json(200, all_records[offset:offset + limit])
+        elif feed_path and self.path.startswith("/feed.txt"):
+            try:
+                with open(feed_path, "rb") as f:
+                    body = f.read()
+            except FileNotFoundError:
+                self.send_response(404)
+                self.end_headers()
+                return
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -540,22 +582,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f.write(json.dumps(entry) + "\n")
 
         mode = self._mode()
+        if mode != _mode_state["last"]:
+            _mode_state["last"] = mode
+            _mode_state["hits"] = 0
+
+        forced_status = None
         if mode == "fail500":
-            self.send_response(500)
+            forced_status = 500
+        elif mode == "fail413":
+            forced_status = 413
+        elif mode.startswith("retry:"):
+            _, status_str, n_str = mode.split(":")
+            _mode_state["hits"] += 1
+            if _mode_state["hits"] <= int(n_str):
+                forced_status = int(status_str)
+        elif mode.startswith("split413:"):
+            threshold = int(mode.split(":")[1])
+            try:
+                record_count = len(json.loads(raw).get("records", []))
+            except (json.JSONDecodeError, AttributeError):
+                record_count = 0
+            if record_count > threshold:
+                forced_status = 413
+
+        if forced_status is not None:
+            self.send_response(forced_status)
             self.end_headers()
             return
-        if mode == "fail413":
-            self.send_response(413)
-            self.end_headers()
-            return
-        resp = json.dumps(
-            {"created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1}
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(resp)))
-        self.end_headers()
-        self.wfile.write(resp)
+
+        self._write_json(
+            200,
+            {"created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1},
+        )
 
     def log_message(self, format, *args):
         pass
@@ -583,17 +641,36 @@ PYEOF
 ]
 JSONEOF
 
+    # EXTRA_MOCK doubles as: (a) a large-delta source for the pagination test (its delta file is
+    # overwritten in place, per subsection, since the mock re-reads it fresh on every GET), and
+    # (b) a static /feed.txt server for the full_replace multi-chunk test (its feed file starts out
+    # absent — a 404 — until 7h writes it). RESILIENCE_MOCK is a POST target whose mode file drives
+    # the retry/413 scenarios; SOURCE_DELTA is passed as its (unused by those tests) delta arg.
+    EXTRA_PORT="$(pick_port 18761 18780 "extra mock vault (pagination/feed)")"
+    RESILIENCE_PORT="$(pick_port 18781 18800 "resilience mock vault (retry/413)")"
+    EXTRA_LOG="$WORK_DIR/extra_hits.log"; : > "$EXTRA_LOG"
+    RESILIENCE_LOG="$WORK_DIR/resilience_hits.log"; : > "$RESILIENCE_LOG"
+    EXTRA_DELTA="$WORK_DIR/extra_delta.json"; echo "[]" > "$EXTRA_DELTA"
+    EXTRA_FEED="$WORK_DIR/extra_feed.txt"  # deliberately not created yet — see 7h
+    RESILIENCE_MODE="$WORK_DIR/resilience_mode"; echo "ok" > "$RESILIENCE_MODE"
+
     python3 "$WORK_DIR/mock_vault.py" "$SOURCE_PORT" "$SOURCE_LOG" "$UNUSED_MODE" "$SOURCE_DELTA" &
     MOCK_SOURCE_PID=$!
     python3 "$WORK_DIR/mock_vault.py" "$TARGET1_PORT" "$TARGET1_LOG" "$TARGET1_MODE" "$SOURCE_DELTA" &
     MOCK_TARGET1_PID=$!
     python3 "$WORK_DIR/mock_vault.py" "$TARGET2_PORT" "$TARGET2_LOG" "$TARGET2_MODE" "$SOURCE_DELTA" &
     MOCK_TARGET2_PID=$!
+    python3 "$WORK_DIR/mock_vault.py" "$EXTRA_PORT" "$EXTRA_LOG" "$UNUSED_MODE" "$EXTRA_DELTA" "$EXTRA_FEED" &
+    EXTRA_MOCK_PID=$!
+    python3 "$WORK_DIR/mock_vault.py" "$RESILIENCE_PORT" "$RESILIENCE_LOG" "$RESILIENCE_MODE" "$SOURCE_DELTA" &
+    RESILIENCE_MOCK_PID=$!
     sleep 0.3
 
-    if kill -0 "$MOCK_SOURCE_PID" 2>/dev/null && kill -0 "$MOCK_TARGET1_PID" 2>/dev/null && kill -0 "$MOCK_TARGET2_PID" 2>/dev/null; then
+    if kill -0 "$MOCK_SOURCE_PID" 2>/dev/null && kill -0 "$MOCK_TARGET1_PID" 2>/dev/null \
+        && kill -0 "$MOCK_TARGET2_PID" 2>/dev/null && kill -0 "$EXTRA_MOCK_PID" 2>/dev/null \
+        && kill -0 "$RESILIENCE_MOCK_PID" 2>/dev/null; then
         MULTI_VAULT_AVAILABLE=1
-        log "Mock vaults up: source=:$SOURCE_PORT target1=:$TARGET1_PORT target2=:$TARGET2_PORT"
+        log "Mock vaults up: source=:$SOURCE_PORT target1=:$TARGET1_PORT target2=:$TARGET2_PORT extra=:$EXTRA_PORT resilience=:$RESILIENCE_PORT"
     else
         warn "One or more mock vault servers failed to start; skipping multi-vault sections."
     fi
@@ -762,8 +839,160 @@ if [[ "$MULTI_VAULT_AVAILABLE" -eq 1 ]]; then
 
     raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $TRUNC_TS" -H "X-Signature-256: "
     check "401" "an empty X-Signature-256 value is rejected cleanly"
+
+    log_section "7e. Delta pagination — large multi-page source fetch (Task 1)"
+
+    # client.rs::DELTA_PAGE_SIZE is 5,000, so 15,001 records forces exactly 4 GET /api/ips pages
+    # (5000/5000/5000/1) — and, independently, jobs::MAX_BATCH_SIZE is also 5,000, so the same
+    # number forces exactly 4 push chunks on delivery. Neither loop is allowed to drop or duplicate
+    # a record at the page/chunk boundary.
+    PAGINATION_TOTAL=15001
+    python3 - "$EXTRA_DELTA" "$PAGINATION_TOTAL" <<'PYEOF'
+import json
+import sys
+
+out_path = sys.argv[1]
+total = int(sys.argv[2])
+records = [
+    {
+        "id": f"{i:08x}-0000-0000-0000-000000000000",
+        "target_address": f"10.{(i // 65536) % 256}.{(i // 256) % 256}.{i % 256}",
+        "group_name": "pagination-group",
+        "is_deleted": False,
+        "created_at": "2026-01-01T00:00:00",
+        "updated_at": "2026-01-01T00:00:00",
+        "last_seen_at": "2026-01-01T00:00:00",
+    }
+    for i in range(total)
+]
+with open(out_path, "w") as f:
+    json.dump(records, f)
+PYEOF
+    check_local "$([[ -s "$EXTRA_DELTA" ]] && echo yes || echo no)" "yes" "generated a $PAGINATION_TOTAL-record synthetic delta fixture"
+
+    api_call POST "/api/vaults" "$MASTER_KEY" \
+        "{\"name\":\"pagination-source-vault\",\"target_url\":\"http://127.0.0.1:$EXTRA_PORT\",\"api_key\":\"mock-key\",\"signing_secret\":\"mock-secret\"}"
+    check "200" "register the large-delta source vault"
+    PAGINATION_SOURCE_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/vaults" "$MASTER_KEY" \
+        "{\"name\":\"resilience-target-vault\",\"target_url\":\"http://127.0.0.1:$RESILIENCE_PORT\",\"api_key\":\"mock-key\",\"signing_secret\":\"mock-secret\"}"
+    check "200" "register the resilience target vault (reused across 7e/7f/7g/7h)"
+    RESILIENCE_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/sync-tasks" "$MASTER_KEY" \
+        "{\"name\":\"pagination-e2e-task\",\"source_vault_id\":\"$PAGINATION_SOURCE_VAULT_ID\",\"source_group_name\":\"pagination-group\",\"target_group_name\":\"pagination-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
+    check "200" "create a sync task pulling the $PAGINATION_TOTAL-record delta"
+    PAGINATION_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    RESILIENCE_HITS_BEFORE=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    api_call POST "/api/sync-tasks/$PAGINATION_TASK_ID/trigger" "$MASTER_KEY"
+    check "200" "trigger the pagination sync task"
+    check_jq ".status" "SUCCESS" "the multi-page delta fetch completes successfully"
+    check_jq ".items_processed" "$PAGINATION_TOTAL" "all $PAGINATION_TOTAL records survived pagination across 4 GET pages, none dropped or duplicated"
+    check_jq ".chunks_sent" "4" "$PAGINATION_TOTAL records at MAX_BATCH_SIZE=5,000 push as 4 chunks (5000/5000/5000/1)"
+
+    RESILIENCE_HITS_AFTER=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    check_local "$((RESILIENCE_HITS_AFTER - RESILIENCE_HITS_BEFORE))" "4" "the target vault received exactly 4 POST /api/records/batch calls, one per push chunk"
+
+    DELIVERED_TOTAL=$(tail -n 4 "$RESILIENCE_LOG" | jq -s '[.[] | .body | fromjson | .records | length] | add')
+    check_local "$DELIVERED_TOTAL" "$PAGINATION_TOTAL" "the 4 delivered chunks together carry all $PAGINATION_TOTAL records"
+
+    log_section "7f. Outbound retry & exponential backoff (Task 2)"
+
+    api_call POST "/api/sync-tasks" "$MASTER_KEY" \
+        "{\"name\":\"retry-e2e-task\",\"source_vault_id\":\"$SOURCE_VAULT_ID\",\"source_group_name\":\"src-group\",\"target_group_name\":\"retry-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
+    check "200" "create a sync task targeting the resilience mock"
+    RETRY_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    echo "retry:503:2" > "$RESILIENCE_MODE"
+    RESILIENCE_HITS_BEFORE=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    api_call POST "/api/sync-tasks/$RETRY_TASK_ID/trigger" "$MASTER_KEY"
+    check "200" "trigger a task whose target fails twice with 503 before succeeding on the 3rd attempt"
+    check_jq ".status" "SUCCESS" "the job succeeds once the target recovers, transparently, within the default OUTBOUND_MAX_RETRIES=3 budget"
+    RESILIENCE_HITS_AFTER=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    check_local "$((RESILIENCE_HITS_AFTER - RESILIENCE_HITS_BEFORE))" "3" "exactly 2 failed attempts + 1 successful attempt reached the target"
+    echo "ok" > "$RESILIENCE_MODE"
+
+    api_call DELETE "/api/sync-tasks/$RETRY_TASK_ID" "$MASTER_KEY"
+    check "204" "clean up the retry-recovery sync task"
+
+    log_section "7g. Adaptive batch resizing on HTTP 413 (Task 3)"
+
+    # Reuses the pagination task from 7e: MAX_BATCH_SIZE=5,000 means each push chunk is well above
+    # the 2,000-record ceiling this subsection's mode enforces, so client::post_batch must
+    # adaptively split every chunk. Per chunk: a >2000 chunk halves until every sub-chunk is <=2000
+    # (5000 -> 2500+2500 -> 1250+1250+1250+1250: 3 rejected attempts + 4 delivered sub-batches per
+    # 5000-record chunk; the trailing 1-record chunk never exceeds the ceiling and needs no split).
+    # Three 5000-chunks + one 1-chunk => (3*(3+4)) + 1 = 22 total attempts, 13 delivered sub-batches.
+    echo "split413:2000" > "$RESILIENCE_MODE"
+    RESILIENCE_HITS_BEFORE=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    api_call POST "/api/sync-tasks/$PAGINATION_TASK_ID/trigger" "$MASTER_KEY"
+    check "200" "re-trigger the pagination task against a target enforcing a 2,000-record payload ceiling"
+    check_jq ".status" "SUCCESS" "adaptive splitting delivers the whole batch despite the ceiling"
+    check_jq ".items_processed" "$PAGINATION_TOTAL" "item count is unaffected by how many wire requests the delivery took"
+    check_jq ".chunks_sent" "4" "chunks_sent still counts job-level chunks (4), not the client's internal 413 sub-splits"
+
+    RESILIENCE_HITS_AFTER=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    NEW_HITS=$((RESILIENCE_HITS_AFTER - RESILIENCE_HITS_BEFORE))
+    check_local "$NEW_HITS" "22" "the 4 job-level chunks cascade through the 413 ceiling into 22 total POST attempts (3x7 + 1)"
+
+    DELIVERED_TOTAL=$(tail -n "$NEW_HITS" "$RESILIENCE_LOG" | jq -s '[.[] | .body | fromjson | .records | length] | map(select(. <= 2000)) | add')
+    check_local "$DELIVERED_TOTAL" "$PAGINATION_TOTAL" "the successfully delivered (<=2000-record) sub-batches together cover all $PAGINATION_TOTAL records"
+
+    DELIVERED_COUNT=$(tail -n "$NEW_HITS" "$RESILIENCE_LOG" | jq -s '[.[] | .body | fromjson | .records | length] | map(select(. <= 2000)) | length')
+    check_local "$DELIVERED_COUNT" "13" "exactly 13 sub-batches were small enough to be accepted (4+4+4+1, from the four job-level chunks)"
+
+    echo "ok" > "$RESILIENCE_MODE"
+    api_call DELETE "/api/sync-tasks/$PAGINATION_TASK_ID" "$MASTER_KEY"
+    check "204" "clean up the pagination/413-split sync task"
+    api_call DELETE "/api/vaults/$PAGINATION_SOURCE_VAULT_ID" "$MASTER_KEY"
+    check "204" "clean up the pagination source vault"
+
+    log_section "7h. Safe multi-chunk full_replace ingestion (Task 4)"
+
+    FULL_REPLACE_TOTAL=12000
+    python3 - "$EXTRA_FEED" "$FULL_REPLACE_TOTAL" <<'PYEOF'
+import sys
+
+out_path = sys.argv[1]
+total = int(sys.argv[2])
+with open(out_path, "w") as f:
+    for i in range(total):
+        f.write(f"10.{(i // 65536) % 256}.{(i // 256) % 256}.{i % 256}\n")
+PYEOF
+    check_local "$([[ -s "$EXTRA_FEED" ]] && echo yes || echo no)" "yes" "generated a $FULL_REPLACE_TOTAL-line synthetic feed fixture, now servable at EXTRA_MOCK's /feed.txt"
+
+    api_call POST "/api/sources" "$MASTER_KEY" \
+        "{\"name\":\"full-replace-e2e-source\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"full-replace-dst\",\"mode\":\"full_replace\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
+    check "200" "create a full_replace external source ($FULL_REPLACE_TOTAL records => 3 chunks of 5000/5000/2000)"
+    FULL_REPLACE_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    check_jq ".mode" "full_replace" "the created source reports mode=full_replace"
+
+    RESILIENCE_HITS_BEFORE=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    api_call POST "/api/sources/$FULL_REPLACE_SOURCE_ID/trigger" "$MASTER_KEY"
+    check "200" "trigger the full_replace ingestion"
+    check_jq ".status" "SUCCESS" "the full_replace multi-chunk ingestion succeeds"
+    check_jq ".items_processed" "$FULL_REPLACE_TOTAL" "all $FULL_REPLACE_TOTAL records were parsed and pushed"
+    check_jq ".chunks_sent" "3" "$FULL_REPLACE_TOTAL records at MAX_BATCH_SIZE=5,000 push as exactly 3 chunks"
+
+    RESILIENCE_HITS_AFTER=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
+    NEW_HITS=$((RESILIENCE_HITS_AFTER - RESILIENCE_HITS_BEFORE))
+    check_local "$NEW_HITS" "3" "the target received exactly 3 POST /api/records/batch calls, one per chunk"
+
+    CHUNK_MODES=$(tail -n 3 "$RESILIENCE_LOG" | jq -s -r '[.[] | .body | fromjson | .mode] | join(",")')
+    check_local "$CHUNK_MODES" "full_replace,upsert,upsert" \
+        "only the first of the 3 chunks carries full_replace on the wire; chunks 2 and 3 are downgraded to upsert so neither erases what the previous chunk just delivered"
+
+    CHUNK_TOTAL=$(tail -n 3 "$RESILIENCE_LOG" | jq -s '[.[] | .body | fromjson | .records | length] | add')
+    check_local "$CHUNK_TOTAL" "$FULL_REPLACE_TOTAL" "the 3 chunks together carry all $FULL_REPLACE_TOTAL records — none lost mid-stream"
+
+    api_call DELETE "/api/sources/$FULL_REPLACE_SOURCE_ID" "$MASTER_KEY"
+    check "204" "clean up the full_replace source"
+    api_call DELETE "/api/vaults/$RESILIENCE_VAULT_ID" "$MASTER_KEY"
+    check "204" "clean up the resilience target vault"
 else
-    skip "sections 6-7d (multi-vault sync, target overrides, credential rotation, concurrency): mock vaults unavailable"
+    skip "sections 6-7h (multi-vault sync, target overrides, credential rotation, concurrency, pagination, retry, 413 split, full_replace): mock vaults unavailable"
 fi
 
 # ── 8. External feed ingestion — live feeds ─────────────────────────────────

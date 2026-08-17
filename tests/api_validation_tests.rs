@@ -139,3 +139,99 @@ async fn invalid_cron_on_source_update_is_rejected_without_mutating_existing_row
         .expect("row exists");
     assert_eq!(stored.cron_schedule, "0 0 * * *", "the original valid cron_schedule must be unchanged");
 }
+
+/// `mode` must be one of the two values `client::BatchMode::parse` recognizes — a typo here would
+/// otherwise silently fall back to upsert deep inside the job (see `external_ingestion::run`'s
+/// `BatchMode::parse(...).unwrap_or_else(...)` warning path) instead of being caught at the door.
+#[tokio::test]
+async fn invalid_mode_on_source_creation_is_rejected_with_400_and_not_persisted() {
+    let (conn, state, master) = common::setup().await;
+    let app = simply_ip_sync::create_app(state);
+
+    for bad_mode in ["replace", "FULL_REPLACE", "upsert ", ""] {
+        let payload = json!({
+            "name": format!("source-{}", Uuid::new_v4()),
+            "source_url": "http://127.0.0.1:1/feed.txt",
+            "cron_schedule": "0 0 * * *",
+            "target_group_name": "group",
+            "mode": bad_mode,
+        });
+        let req = common::signed_request(&master, "POST", "/api/sources", Some(payload));
+        let resp = app.clone().oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "mode '{bad_mode}' must be rejected with 400");
+    }
+
+    let count = external_source::Entity::find().all(&conn).await.expect("query sources").len();
+    assert_eq!(count, 0, "no source may be persisted when mode validation rejects the request");
+}
+
+/// Both recognized `mode` values must be accepted, and a request that omits `mode` entirely must
+/// default to `"upsert"` rather than requiring every caller to specify it.
+#[tokio::test]
+async fn valid_mode_on_source_creation_is_accepted_and_omission_defaults_to_upsert() {
+    let (_conn, state, master) = common::setup().await;
+    let app = simply_ip_sync::create_app(state);
+
+    for good_mode in ["upsert", "full_replace"] {
+        let payload = json!({
+            "name": format!("source-{}", Uuid::new_v4()),
+            "source_url": "http://127.0.0.1:1/feed.txt",
+            "cron_schedule": "0 0 * * *",
+            "target_group_name": "group",
+            "mode": good_mode,
+        });
+        let req = common::signed_request(&master, "POST", "/api/sources", Some(payload));
+        let resp = app.clone().oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK, "mode '{good_mode}' should be accepted");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(created["mode"], json!(good_mode));
+    }
+
+    let payload = json!({
+        "name": format!("source-{}", Uuid::new_v4()),
+        "source_url": "http://127.0.0.1:1/feed.txt",
+        "cron_schedule": "0 0 * * *",
+        "target_group_name": "group",
+    });
+    let req = common::signed_request(&master, "POST", "/api/sources", Some(payload));
+    let resp = app.clone().oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let created: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(created["mode"], json!("upsert"), "omitting mode must default to upsert");
+}
+
+/// An update that tries to set an invalid `mode` must be rejected without mutating the existing
+/// row — mirrors `invalid_cron_on_source_update_is_rejected_without_mutating_existing_row` above.
+#[tokio::test]
+async fn invalid_mode_on_source_update_is_rejected_without_mutating_existing_row() {
+    let (conn, state, master) = common::setup().await;
+    let app = simply_ip_sync::create_app(state);
+
+    let create_payload = json!({
+        "name": "existing-source-mode",
+        "source_url": "http://127.0.0.1:1/feed.txt",
+        "cron_schedule": "0 0 * * *",
+        "target_group_name": "group",
+        "mode": "upsert",
+    });
+    let create_req = common::signed_request(&master, "POST", "/api/sources", Some(create_payload));
+    let create_resp = app.clone().oneshot(create_req).await.expect("response");
+    assert_eq!(create_resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(create_resp.into_body(), usize::MAX).await.expect("body");
+    let created: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let id = created["id"].as_str().expect("id field");
+
+    let update_payload = json!({ "mode": "not_a_real_mode" });
+    let update_req = common::signed_request(&master, "PATCH", &format!("/api/sources/{id}"), Some(update_payload));
+    let update_resp = app.oneshot(update_req).await.expect("response");
+    assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
+
+    let stored = external_source::Entity::find_by_id(Uuid::parse_str(id).unwrap())
+        .one(&conn)
+        .await
+        .expect("query")
+        .expect("row exists");
+    assert_eq!(stored.mode, "upsert", "the original valid mode must be unchanged");
+}

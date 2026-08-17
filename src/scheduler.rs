@@ -36,10 +36,11 @@ pub fn validate_cron_expression(expr: &str) -> Result<(), String> {
         return Err("cron_schedule must not be empty".to_owned());
     }
     let normalized = normalize_cron(expr);
-    croner::Cron::new(&normalized)
-        .with_seconds_required()
-        .with_dom_and_dow()
-        .parse()
+    croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Required)
+        .dom_and_dow(true)
+        .build()
+        .parse(&normalized)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

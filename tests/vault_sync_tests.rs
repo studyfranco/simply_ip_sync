@@ -458,3 +458,97 @@ async fn slow_target_vault_is_aborted_and_last_sync_at_is_withheld() {
     let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
     assert!(updated_task.last_sync_at.is_none(), "a timed-out delivery must not advance the high-water mark");
 }
+
+/// Synthesizes a deterministic, valid IPv4 address for delta-record index `i`, staying within
+/// `10.0.0.0/8` (comfortably covers the tens-of-thousands of addresses these pagination tests
+/// need without colliding).
+fn synth_ip(i: u32) -> String {
+    format!("10.0.{}.{}", (i / 256) % 256, i % 256)
+}
+
+/// Task 1: a source vault holding more delta records than a single page must be paged through
+/// completely (`limit`/`offset`) before delivery — not just the first page silently accepted as
+/// "the whole delta". 15,001 records spans exactly 4 pages at the client's 5,000-record page size
+/// (5000 + 5000 + 5000 + 1), chosen so the boundary itself (a final short page) is exercised, not
+/// just a round multiple.
+#[tokio::test]
+async fn source_vault_delta_spanning_multiple_pages_is_fetched_completely() {
+    let (conn, state, _master) = common::setup().await;
+
+    const TOTAL_RECORDS: u32 = 15_001;
+
+    let source_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .respond_with(move |req: &wiremock::Request| {
+            let offset: u32 = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "offset")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(0);
+            let limit: u32 = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "limit")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(5000);
+            let page_len = limit.min(TOTAL_RECORDS.saturating_sub(offset));
+            let page: Vec<serde_json::Value> = (0..page_len)
+                .map(|i| {
+                    let idx = offset + i;
+                    serde_json::json!({
+                        "id": uuid::Uuid::new_v4(),
+                        "target_address": synth_ip(idx),
+                        "group_name": "source-group",
+                        "is_deleted": false,
+                        "created_at": "2026-01-01T00:00:00",
+                        "updated_at": "2026-01-01T00:00:00",
+                        "last_seen_at": "2026-01-01T00:00:00"
+                    })
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(page)
+        })
+        .mount(&source_mock)
+        .await;
+
+    let target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1
+        })))
+        .mount(&target_mock)
+        .await;
+
+    let source_id = insert_vault(&conn, "paginated-source", &source_mock.uri()).await;
+    let target_id = insert_vault(&conn, "target", &target_mock.uri()).await;
+    let task_id = insert_task(&conn, source_id, target_id).await;
+
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+
+    assert_eq!(summary.status, "SUCCESS");
+    assert_eq!(
+        summary.items_processed, TOTAL_RECORDS as i32,
+        "every record across every page must be fetched, not just the first page"
+    );
+    assert_eq!(summary.chunks_sent, 4, "15,001 records at a 5,000-record push chunk size means 4 batch requests");
+
+    let source_requests = source_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(source_requests.len(), 4, "4 pages of 5000+5000+5000+1 means exactly 4 GET /api/ips calls");
+
+    let target_requests = target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(target_requests.len(), 4, "the fetched delta must be pushed in the same 4 chunks it was assembled from");
+    let total_pushed: usize = target_requests
+        .iter()
+        .map(|req| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+            body["records"].as_array().expect("records array").len()
+        })
+        .sum();
+    assert_eq!(total_pushed, TOTAL_RECORDS as usize, "the full paginated delta, not just one page, must reach the target");
+
+    let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
+    assert!(updated_task.last_sync_at.is_some(), "a fully successful multi-page sync must still advance last_sync_at");
+}

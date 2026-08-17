@@ -35,6 +35,15 @@ async fn insert_vault(conn: &sea_orm::DatabaseConnection, name: &str, target_url
 }
 
 async fn insert_source(conn: &sea_orm::DatabaseConnection, source_url: &str, default_group: &str) -> Uuid {
+    insert_source_with_mode(conn, source_url, default_group, "upsert").await
+}
+
+async fn insert_source_with_mode(
+    conn: &sea_orm::DatabaseConnection,
+    source_url: &str,
+    default_group: &str,
+    mode: &str,
+) -> Uuid {
     let id = Uuid::new_v4();
     let now = Utc::now();
     let model = external_source::ActiveModel {
@@ -45,7 +54,7 @@ async fn insert_source(conn: &sea_orm::DatabaseConnection, source_url: &str, def
         parser_config_json: Set(None),
         cron_schedule: Set("0 0 * * *".to_owned()),
         target_group_name: Set(default_group.to_owned()),
-        mode: Set("upsert".to_owned()),
+        mode: Set(mode.to_owned()),
         is_active: Set(true),
         last_run_at: Set(None),
         owner_key_id: Set(None),
@@ -119,6 +128,61 @@ async fn per_target_group_name_override_is_honored_independently_of_the_default(
         serde_json::json!("OVERRIDDEN_GROUP"),
         "an explicit per-target override must win over the source's default group"
     );
+}
+
+fn synth_ip(i: u32) -> String {
+    format!("10.{}.{}.{}", (i / 65536) % 256, (i / 256) % 256, i % 256)
+}
+
+/// Task 4: a `full_replace` source whose feed is large enough to need multiple chunks (12,000
+/// records / `MAX_BATCH_SIZE` 5,000 = 3 chunks of 5000/5000/2000) must only mark the *first* chunk
+/// as `full_replace` on the wire — chunks 2 and 3 of the same run must arrive as `upsert`, or
+/// chunk 2 would read on the receiving vault as "delete everything chunk 2 didn't mention",
+/// wiping out chunk 1's just-delivered records before chunk 3 even lands.
+#[tokio::test]
+async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_replace() {
+    let (conn, state, _master) = common::setup().await;
+
+    const TOTAL_RECORDS: u32 = 12_000;
+    let feed_body: String = (0..TOTAL_RECORDS).map(synth_ip).collect::<Vec<_>>().join("\n");
+
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(feed_body))
+        .mount(&feed_mock)
+        .await;
+
+    let target_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_response()))
+        .mount(&target_mock)
+        .await;
+
+    let source_id = insert_source_with_mode(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group", "full_replace").await;
+    let vault_id = insert_vault(&conn, "full-replace-target", &target_mock.uri()).await;
+    insert_target(&conn, source_id, vault_id, None).await;
+
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+    assert_eq!(summary.status, "SUCCESS");
+    assert_eq!(summary.items_processed, TOTAL_RECORDS as i32, "every record from the feed must be processed, none dropped mid-chunking");
+    assert_eq!(summary.chunks_sent, 3, "12,000 records at MAX_BATCH_SIZE=5,000 must split into exactly 3 chunks (5000/5000/2000)");
+
+    let received = target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(received.len(), 3);
+
+    let mut total_delivered = 0usize;
+    let mut modes = Vec::with_capacity(3);
+    for req in &received {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+        total_delivered += body["records"].as_array().expect("records array").len();
+        modes.push(body["mode"].as_str().expect("mode field").to_owned());
+    }
+    assert_eq!(total_delivered, TOTAL_RECORDS as usize, "all 12,000 records must land on the target, none lost across chunks");
+    assert_eq!(modes[0], "full_replace", "only the first chunk of the run may carry full_replace");
+    assert_eq!(modes[1], "upsert", "chunk 2 must already be downgraded to upsert");
+    assert_eq!(modes[2], "upsert", "chunk 3 must also be upsert, not just chunk 2");
 }
 
 /// Task 4: an HTTP `200 OK` carrying an HTML body (Cloudflare/WAF error page, captive portal,

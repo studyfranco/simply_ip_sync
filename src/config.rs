@@ -217,6 +217,55 @@ pub fn outbound_http_timeout() -> std::time::Duration {
     }))
 }
 
+/// Default maximum retry attempts for a transient (429/502/503/504) outbound failure, when
+/// `OUTBOUND_MAX_RETRIES` is unset.
+pub const DEFAULT_OUTBOUND_MAX_RETRIES: u32 = 3;
+
+/// Default base retry backoff, in milliseconds, when `OUTBOUND_RETRY_BACKOFF_MS` is unset.
+pub const DEFAULT_OUTBOUND_RETRY_BACKOFF_MS: u64 = 500;
+
+/// Maximum retry attempts for a transient outbound failure (`retry::is_transient_status`) before
+/// giving up. Read from `OUTBOUND_MAX_RETRIES` (default [`DEFAULT_OUTBOUND_MAX_RETRIES`]) **fresh
+/// on every call, deliberately not cached in a `OnceLock`** unlike this module's other tuning
+/// values: retries are the exceptional, rarely-taken path (most requests never hit them), so the
+/// extra `env::var` read is immaterial, and staying uncached is what lets a test set this value
+/// and see it take effect immediately rather than being stuck with whatever the first caller in
+/// the process happened to observe.
+pub fn outbound_max_retries() -> u32 {
+    std::env::var("OUTBOUND_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(|| {
+            if std::env::var("OUTBOUND_MAX_RETRIES").is_ok() {
+                tracing::warn!(
+                    "OUTBOUND_MAX_RETRIES is not a valid non-negative integer, using default of {DEFAULT_OUTBOUND_MAX_RETRIES}"
+                );
+            }
+            DEFAULT_OUTBOUND_MAX_RETRIES
+        })
+}
+
+/// Base delay before the first retry of a transient outbound failure; subsequent attempts back
+/// off exponentially from this (see `retry::backoff_with_jitter`). Read from
+/// `OUTBOUND_RETRY_BACKOFF_MS` (default [`DEFAULT_OUTBOUND_RETRY_BACKOFF_MS`], clamped to at
+/// least 1ms) fresh on every call — see `outbound_max_retries`'s doc comment for why this
+/// deliberately isn't `OnceLock`-cached.
+pub fn outbound_retry_backoff() -> std::time::Duration {
+    let ms = std::env::var("OUTBOUND_RETRY_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or_else(|| {
+            if std::env::var("OUTBOUND_RETRY_BACKOFF_MS").is_ok() {
+                tracing::warn!(
+                    "OUTBOUND_RETRY_BACKOFF_MS is not a valid positive integer, using default of {DEFAULT_OUTBOUND_RETRY_BACKOFF_MS}ms"
+                );
+            }
+            DEFAULT_OUTBOUND_RETRY_BACKOFF_MS
+        });
+    std::time::Duration::from_millis(ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +334,23 @@ mod tests {
     fn normalize_ip_unwraps_v4_mapped_v6() {
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
         assert_eq!(normalize_ip(mapped), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn outbound_max_retries_defaults_when_unset() {
+        // SAFETY: test-only env mutation; this key is not read anywhere else concurrently within
+        // this single-threaded assertion.
+        unsafe {
+            std::env::remove_var("OUTBOUND_MAX_RETRIES");
+        }
+        assert_eq!(outbound_max_retries(), DEFAULT_OUTBOUND_MAX_RETRIES);
+    }
+
+    #[test]
+    fn outbound_retry_backoff_defaults_when_unset() {
+        unsafe {
+            std::env::remove_var("OUTBOUND_RETRY_BACKOFF_MS");
+        }
+        assert_eq!(outbound_retry_backoff(), std::time::Duration::from_millis(DEFAULT_OUTBOUND_RETRY_BACKOFF_MS));
     }
 }

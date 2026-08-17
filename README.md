@@ -80,6 +80,8 @@ by hand** below).
 | `TRUSTED_PROXIES` | *(unset — nothing trusted)* | Comma-separated CIDR ranges/addresses whose `X-Forwarded-For`/`X-Real-IP` headers are honoured. Malformed entries are a fatal startup error. |
 | `MAX_BODY_SIZE_MIB` | `10` | Maximum accepted request body size. Shared by the router's body limit and the signed-body buffer in the auth middleware, so the two can never drift apart. |
 | `OUTBOUND_HTTP_TIMEOUT_SECS` | `60` | Per-request timeout for outbound calls to remote vault endpoints. A hung target is aborted on this schedule rather than stalling a scheduled job indefinitely. |
+| `OUTBOUND_MAX_RETRIES` | `3` | Maximum retry attempts for a transient (`429`/`502`/`503`/`504`) outbound failure, applied to vault calls and external feed fetches alike, before the job reports `FAILED`/`PARTIAL`. |
+| `OUTBOUND_RETRY_BACKOFF_MS` | `500` | Base delay before the first retry; later attempts back off exponentially from this (capped at 30s) with up to 50% jitter. |
 | `RUST_LOG` | *(unset)* | Standard `tracing-subscriber` env filter. |
 
 ## API endpoints

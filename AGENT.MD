@@ -6,22 +6,22 @@ Hello AI Agent! You are assisting with the development of `simply_ip_sync`. Read
 
 ## 📄 Document & Context Hierarchy
 
-1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, in-memory cache design, and testing directives.
-2. **`SCHEMA.MD`**: Official Database Schema (configuration only), SeaORM Entity relations, and Enum specifications.
+To keep this context clean and modular, responsibilities are split across three files:
+1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, documentation standards, and testing directives.
+2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
-4. **`example/`**: Reference implementations from linked projects (`simply_ip_vault`, `simply_hook_executor`, ...).
+4. **`example/`**: You can find the code of other similar/linked project inside. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
 
 ---
 
 ## 🔄 Peer Repository Synchronization
 
-`example/` holds live checkouts of the peer projects this service converges against
-(`simply_ip_vault`, `simply_hook_executor`, ...), each its own git repository with a configured
-`origin`. Their working trees can go stale between sessions — a peer's `AGENT.MD`, `RBAC_MODEL.md`,
-or source may have moved on since the last checkout in this tree was made.
+`example/` holds **live git clones** of the peer services, not flat snapshots.
+They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
 
-**Mandatory:** before reading any file under `example/<peer_repo>/` for the purpose of an audit,
-structural/security comparison, or convergence analysis, run:
+### Mandatory: pull before you analyse
+
+**Before reading any file under `example/`, and before generating a convergence, parity, or security report, you MUST run:**
 
 ```sh
 git -C example/<peer_repo> pull
@@ -35,6 +35,14 @@ producing a comparison/audit artifact) — use judgment, but default to pulling 
 
 `scripts/verify_convergence.sh` automates this at the start of every run for any `example/*`
 directory that contains a `.git` — see that script for the graceful offline-mode fallback.
+
+### Rules
+
+- **Pull first, read second.** Not "pull if it looks stale" — staleness is invisible from inside the tree.
+- **State the revision.** A report that does not name the peer commit it audited cannot be reproduced or re-checked. Both reports in this repository carry the peer's short SHA in their header.
+- **A failed pull is reportable, not ignorable.** If the remote is unreachable, say so in the report and name the local `HEAD` being analysed instead. Silent analysis of an unknown revision is the thing this section exists to prevent.
+- **Never commit the peer.** `example/` is `.gitignore`d. Reports about the peer belong in this repository; the peer's own code does not.
+- **Read-only.** Never modify, stage, or commit inside a peer checkout. `git pull --ff-only` is the only write this repository's tooling performs there.
 
 ---
 
@@ -106,16 +114,16 @@ directory that contains a `.git` — see that script for the graceful offline-mo
 ### 3. Synchronization & Ingestion Pipeline
 
 #### A. External Ingestion Pipeline
-1. **Fetch:** HTTP GET to `external_sources.source_url` with optional custom headers/user-agent.
+1. **Fetch:** HTTP GET to `external_sources.source_url` with optional custom headers/user-agent. Transient upstream failures (`429`/`502`/`503`/`504`) are retried with exponential backoff and jitter (`OUTBOUND_MAX_RETRIES`, `OUTBOUND_RETRY_BACKOFF_MS`) before the job is marked `FAILED`.
 2. **Parse:** Execute configured `FeedParser` to extract normalized IP/CIDR strings.
 3. **Chunking & Batching:** Split extracted records into chunks of **5,000 items maximum** to comply with `ip_vault`'s `MAX_REQUEST_BODY_BYTES` (3 MiB limit).
-4. **Push:** Send each chunk via `POST /api/records/batch` in mode `"upsert"` to all associated target `vault_endpoints` (defined in `external_source_vault_targets`). Mode is strictly `"upsert"` to preserve deleted entries in `ip_vault` for the full retention period (92 days).
+4. **Push:** Send each chunk via `POST /api/records/batch` to all associated target `vault_endpoints` (defined in `external_source_vault_targets`). `external_sources.mode` is `"upsert"` (default — never implicitly deletes) or `"full_replace"` (this run's fetched content becomes the group's full authoritative set). **`full_replace` semantics apply to chunk 0 of each target's own chunk sequence only** — every later chunk of the same run automatically downgrades to `"upsert"` (`jobs::mode_for_chunk_index`), since a second `full_replace` write would read as "delete everything not in this chunk" and erase the previous chunk's just-delivered records. A `413 Payload Too Large` response from a target additionally triggers adaptive splitting: the offending chunk is halved and each half resent (recursively, if still too large), with the same first-piece-only-keeps-the-original-mode rule applied to the halves.
 5. **Log:** Write detailed outcome to `sync_logs`.
 
 #### B. Inter-Vault Sync Pipeline (Vault-to-Vault Delta)
-1. **Fetch Delta:** Query source Vault via `GET /api/ips?group_name=X&since=<last_sync_at>&include_deleted=true`.
+1. **Fetch Delta:** Query source Vault via `GET /api/ips?group_name=X&since=<last_sync_at>&include_deleted=true`, transparently paginating (`limit`/`offset`) through the full delta result set and retrying transient per-page failures independently. `since` and `include_deleted=true` are what make this an *incremental* fetch — see point 3 below for why that rules out `full_replace` for this pipeline.
 2. **Chunking & Batching:** Group incoming delta records (including soft-deleted tombstones) into lots of 5,000 records.
-3. **Replicate:** Post chunked payload to `POST /api/records/batch` in mode `"upsert"` on all target Vaults (defined in `vault_sync_task_targets`).
+3. **Replicate:** Post chunked payload to `POST /api/records/batch` in mode `"upsert"` on all target Vaults (defined in `vault_sync_task_targets`). Unlike external ingestion, `vault_sync_tasks.mode` is **strictly `"upsert"`, deliberately not extended to `full_replace`**: a delta batch is a small incremental slice, not a group's full content, so a `full_replace` write here would read as "delete everything in the target group this run's delta didn't happen to touch" — which is nearly everything, on every run. The `413`-adaptive-splitting behavior still applies (it's a property of `client::post_batch`, independent of mode).
 4. **Timestamp Update:** On success across all targets, update `vault_sync_tasks.last_sync_at` to the job start timestamp.
 
 ---
