@@ -834,3 +834,120 @@ counts below.
   time to add on top of everything above.
 - `./scripts/verify_convergence.sh` still does not exist (see sessions 1–2's decision) and was not
   requested as a gate this session.
+
+## Session 7 (2026-08-17): closing the anomalies flagged in Session 6
+
+Requested as a direct follow-up to Session 6's own "Not done / flagged" list: fix the readiness
+probe's raw SQL, the delete-handler TOCTOU race, residual `unwrap`/`expect` in `main.rs`/`state.rs`,
+and the missing encryption-key startup canary; close the `Path`/`Query` JSON-error-envelope gap;
+add high-contention (`std::sync::Barrier`/many-way concurrent) tests reaching past the
+single-connection SQLite pool; harden the E2E harness (`check_not_contains` with an empty-needle
+guard); update `AGENT_NOTES.MD`/`FILE_MAP.MD`.
+
+**Starting state was not a blank slate.** By the time this session began investigating, most of the
+four anomalies were *already* fixed in the working tree — by a change this session did not make and
+whose origin this session cannot identify (the repository has, over several recent sessions, shown
+edits landing between turns that no session in this log claims; see Session 6's own note on the
+same phenomenon). Rather than assume that work was either trustworthy or complete, everything below
+was independently re-verified against the actual current source before being relied on, and new
+tests were added specifically where verification showed a real gap remained. What follows is
+organized by what was **verified as already correct**, and what this session **actually added**.
+
+**Verified already correct (not this session's authorship, confirmed by reading and testing):**
+- `api/health.rs::readiness_check` — already uses `ApiKey::find().count(&state.db)`, a typed SeaORM
+  query, not `Statement::from_string(..., "SELECT 1")`. No raw SQL remains on the one unauthenticated
+  route in the service.
+- `keys.rs::revoke_key_permission`, `sources.rs::delete_external_source`,
+  `vaults.rs::delete_vault_endpoint`, `sync_tasks.rs::delete_vault_sync_task` — all four already
+  check `DeleteResult.rows_affected == 0` and return `AppError::NotFound` instead of an unconditional
+  `204`, closing the concurrent-delete TOCTOU Session 6 found and fixed. Re-verified by re-running
+  `tests/rbac_tests.rs::concurrent_deletes_of_the_same_resource_do_not_both_succeed` (still passing)
+  and by writing a stronger 16-way version this session (see below).
+- `main.rs::verify_encryption_key` + `crypto::check_key_canary`/`KeyCanary` — the startup canary
+  Session 6 flagged as "not done" now exists: it opens one already-stored sealed secret with the
+  configured cipher right after Master bootstrap, and refuses to start (logging operator-facing
+  guidance) if it doesn't open. `NoSealedSecrets` handles the fresh-database case (nothing to check
+  against yet) without falsely failing. This closes Session 6's one production-behavior gap.
+- `main.rs::shutdown_signal` — no `.unwrap()`/`.expect()`; a signal handler that fails to install
+  degrades to `pending()` for that arm rather than panicking the shutdown future.
+- `extract.rs::StrictPath<T>`/`StrictQuery<T>` — both already exist alongside `StrictJson<T>`,
+  fully adopted across every handler in `src/api/` (confirmed via `grep` — no bare `Path<_>`/
+  `Query<_>` extractor remains anywhere in `src/api/*.rs`). `StrictPath`'s rejection is deliberately
+  `AppError::NotFound`, not `InvalidInput` — a malformed id must stay indistinguishable from a
+  well-formed id for a resource that doesn't exist (§4 oracle discipline), not merely get the same
+  *envelope shape* as a validation error.
+- `tests/concurrency_and_contracts.rs` (new file, already present) — a 16-OS-thread
+  `std::sync::Barrier` test proving `ReplayGuard::check_and_record`'s check-then-insert admits
+  exactly one winner under genuine contention (plus a companion test that distinct signatures never
+  block each other), and four tests pinning the `StrictPath`/`StrictQuery` JSON-envelope contract
+  (malformed path segment, malformed query string, the oracle-discipline pairing between a malformed
+  id and a nonexistent one, and the unauthenticated probes answering inside the envelope too).
+- `scripts/test_e2e.sh::pick_port` — already walks a range to avoid collisions (used for the main
+  server port and every mock vault port); starts at the service's actual default port (3003) rather
+  than an arbitrary 3000, which is more correct than the task's own illustrative example, not a gap.
+
+**What this session actually added:**
+
+1. **`crypto.rs` (+4 unit tests):** `check_key_canary` had zero direct test coverage despite being
+   new security-critical code. Added `canary_reports_no_sealed_secrets_on_an_empty_database`,
+   `canary_verifies_a_secret_sealed_under_the_same_key`,
+   `canary_fails_closed_when_the_configured_key_does_not_match_the_sealed_secret` (the property the
+   canary exists for), and `canary_passes_trivially_in_plaintext_mode` (no key configured means
+   nothing to mismatch, so the canary must not spuriously fail).
+2. **`tests/concurrency_and_contracts.rs` (+1 test):**
+   `sixteen_concurrent_deletes_of_the_same_resource_admit_exactly_one_success` — the existing
+   2-way `tokio::join!` concurrent-delete test (`rbac_tests.rs`, from Session 6) is what originally
+   caught the TOCTOU race, but it doesn't match the 16-way contention scale this session's own
+   replay-guard test uses. There is no in-process data structure to reach past with OS threads for
+   *deletion* the way there is for the replay guard — the atomicity guarantee is the database's own
+   per-statement atomicity plus checking `rows_affected`, not a hand-rolled lock — so `tokio::spawn`
+   (real concurrent tasks against the single-connection pool) is the correct tool here, not
+   `std::thread`. 16 concurrent deletes of one resource; exactly one `204`, the rest `404`. Stable
+   across 8 consecutive runs before being trusted.
+3. **`scripts/test_e2e.sh`:** added `check_not_contains` (ported verbatim in spirit from
+   `example/simply_hook_executor`/`example/simply_ip_exporter`'s identical helper — refuses an empty
+   needle rather than reporting a vacuous `PASS`, since `[[ "$x" == *""* ]]` is true for every
+   string). Used it immediately in a new credential-leak canary: create a vault endpoint with
+   distinctive, greppable `api_key`/`signing_secret` values, then assert neither ever appears in the
+   create response, `GET /api/vaults/{id}`, or `GET /api/vaults` (list) — the property
+   `FILE_MAP.MD` has claimed since it was written ("Credentials are never returned in any response")
+   but that had no E2E assertion pinning it against the real compiled binary until now.
+4. **`FILE_MAP.MD` refresh** — the file had drifted materially behind the actual `src/` tree:
+   `src/retry.rs` was entirely absent; `extract.rs`'s entry didn't mention `StrictPath`/`StrictQuery`;
+   `crypto.rs`'s entry didn't mention the canary; `config.rs`'s entry didn't mention
+   `max_decompressed_bytes` or the retry tunables; `health.rs`'s entry didn't note the raw-SQL-to-
+   typed-query change; `decompress.rs`'s entry didn't mention the byte-cap parameter; and the
+   `tests/` table was missing `health_probes.rs`, `referential_integrity.rs`,
+   `concurrency_and_contracts.rs`, and `client_resilience_tests.rs` outright. All fixed.
+
+**Deliberately not changed, with reasoning:**
+- `state.rs::AppState::for_tests` still uses `.expect("scheduler starts in tests")` and
+  `.expect("http client builds")`. This is not a production code path — it is only ever called from
+  `tests/common/mod.rs`; `main.rs::run()` calls `AppState::new()` (which is already `Result`-based)
+  instead. AGENT.MD's rule is "zero `.unwrap()`/`.expect()` in production **or HTTP handlers** —
+  `for_tests` is neither, and a test harness that panics loudly when its own setup is broken is the
+  correct behavior, not a gap. Converting it to return `Result` and pushing `.expect()` out to every
+  call site in `tests/common/mod.rs` would be pure churn for identical behavior.
+- `keys.rs::delete_api_key`'s subtree bulk-delete (`delete_many().filter(...).exec(...)`) was **not**
+  given the same `rows_affected` check as the other four handlers — flagged already in Session 6 and
+  still true: no test exercises its concurrency, and it's a different-shaped operation (a computed
+  subtree walk, not a single lookup-then-delete) that the one-line pattern doesn't transfer to
+  cleanly. Left as a known, explicitly-tracked gap rather than a rushed, untested fix.
+- `./scripts/verify_convergence.sh` still does not exist and was not run as a gate — `simply_ip_sync`
+  is deliberately outside the `simply_ip_vault`/`simply_hook_executor` pair's convergence-diffing
+  scope (see sessions 1–2, and `RBAC_MODEL.md`'s own status line). Building one was not one of this
+  session's five tasks; only running it as a gate was mentioned, and there is nothing to run.
+
+**Test metrics after this session:**
+- `cargo test` (default, offline): **170 tests**, 0 failed (up from 165 at the start of this
+  session's investigation, itself already up from Session 6's 159 via the unattributed prior work
+  described above: +6 lib unit tests overall this session's investigation window, +1
+  `concurrency_and_contracts.rs`; this session's own additions are +4 lib unit tests
+  (`crypto.rs`'s canary tests) and +1 integration test (the 16-way delete)).
+- `cargo test -- --ignored`: **5 tests**, 0 failed (unchanged).
+- `./scripts/test_e2e.sh`: **212 checks** (up from 202), 0 failed, 0 skipped, run twice consecutively
+  with an explicit post-run check for lingering `mock_vault.py`/`http.server` processes — clean both
+  times.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: both clean, zero
+  warnings.
+- `./scripts/verify_convergence.sh`: does not exist for this service; not run (see above).

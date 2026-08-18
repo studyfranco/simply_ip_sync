@@ -1,6 +1,8 @@
 //! `GET /api/sync-logs` — execution history for external ingestion and inter-vault sync jobs.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
+
+use crate::extract::StrictQuery;
 use axum::response::IntoResponse;
 use axum::Json;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -38,7 +40,7 @@ fn resource_type_for(job_type: &str) -> Option<&'static str> {
 pub async fn list_sync_logs(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
-    Query(query): Query<SyncLogQuery>,
+    StrictQuery(query): StrictQuery<SyncLogQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut find = sync_log::Entity::find();
     if let Some(job_type) = &query.job_type {

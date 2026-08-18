@@ -1,6 +1,8 @@
 //! `vault_sync_tasks` CRUD and manual trigger.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
+
+use crate::extract::StrictPath;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
@@ -159,7 +161,7 @@ pub async fn list_vault_sync_tasks(
 pub async fn get_vault_sync_task(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let task = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     if !visible_to(&state, &caller, &task).await? {
@@ -230,7 +232,7 @@ pub async fn update_vault_sync_task(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateVaultSyncTaskPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
@@ -294,7 +296,7 @@ pub async fn delete_vault_sync_task(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_resource_lifecycle(&caller, existing.owner_key_id)?;
@@ -316,7 +318,7 @@ pub async fn trigger_vault_sync_task(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     let permission = find_permission(&state.db, caller.id, RESOURCE_SYNC_TASK, id).await?;

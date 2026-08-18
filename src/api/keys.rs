@@ -2,7 +2,9 @@
 //! Deliberately not split further — R1–R7 are about how keys delegate to other keys, so subtree
 //! resolution, lifecycle, and permission grants are one subject.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
+
+use crate::extract::StrictPath;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
@@ -94,7 +96,7 @@ pub async fn list_api_keys(
 pub async fn get_api_key(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     if !(caller.is_master || target.id == caller.id || target.parent_key_id == Some(caller.id)) {
@@ -193,7 +195,7 @@ pub async fn update_api_key(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
@@ -279,7 +281,7 @@ pub async fn delete_api_key(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
     let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
@@ -303,7 +305,16 @@ pub async fn delete_api_key(
         });
     }
 
-    api_key::Entity::delete_many().filter(api_key::Column::Id.is_in(subtree_ids)).exec(&state.db).await?;
+    // Same TOCTOU shape as the single-row deletes, one level up: two concurrent deletes of the
+    // same key can both pass `find_by_id`, both compute the same subtree, and both reach here. A
+    // `delete_many` matching zero rows is not an error, so without this check the loser would also
+    // answer `204` and write a second KEY_DELETE audit entry for a deletion it did not perform.
+    // Whoever removes rows owns the outcome; everyone else gets `NotFound`.
+    let result =
+        api_key::Entity::delete_many().filter(api_key::Column::Id.is_in(subtree_ids)).exec(&state.db).await?;
+    if result.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
     create_audit_log(&state.db, &caller, client_ip.0, "KEY_DELETE", Some(name), None).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -314,7 +325,7 @@ pub async fn rotate_api_key(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
     let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
@@ -340,7 +351,7 @@ pub async fn rotate_signing_secret(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
     let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
@@ -383,7 +394,7 @@ pub struct GrantPermissionPayload {
 pub async fn list_key_permissions(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     if !(caller.is_master || target.id == caller.id || target.parent_key_id == Some(caller.id)) {
@@ -402,7 +413,7 @@ pub async fn grant_key_permission(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<GrantPermissionPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
@@ -458,7 +469,7 @@ pub async fn revoke_key_permission(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path((id, permission_id)): Path<(Uuid, Uuid)>,
+    StrictPath((id, permission_id)): StrictPath<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
     let permission = api_key_sync_permission::Entity::find_by_id(permission_id)

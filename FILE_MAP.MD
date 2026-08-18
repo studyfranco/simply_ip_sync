@@ -65,27 +65,61 @@ the anti-replay guard (only after verification succeeds) → checks `bound_ips` 
 fail-closed on an unrecognised prefix), `canonical_v1_payload`, `compute_signature`,
 `verify_signature` (constant-time via `Mac::verify_slice`, returns the raw digest for the replay
 guard), `generate_signing_secret`. `ENCRYPTION_KEY_ENV = "SYNC_ENCRYPTION_KEY"`.
+`check_key_canary`/`KeyCanary` (`NoSealedSecrets`/`Verified`): pure, DB-free boot canary — opens one
+already-stored sealed secret with the *configured* cipher to prove `SYNC_ENCRYPTION_KEY` is the key
+the data at rest was actually sealed under, called from `main.rs::verify_encryption_key` right
+after Master bootstrap and before the process binds a listener. Without this, a syntactically valid
+but *wrong* key boots cleanly, reports ready, and only fails later — inside outbound syncs, as an
+authentication error against the *vault* rather than a local misconfiguration.
 
 ### `src/config.rs` — environment parsing and client-address resolution
 
 `resolve_client_ip` (right-to-left `X-Forwarded-For` walk, trusted-peer gated), `normalize_ip`,
-`parse_trusted_proxies`, `resolve_bind_addr`, `validate_initial_master_key`, `max_body_bytes`.
-`TRUSTED_PROXIES` and `INITIAL_MASTER_KEY` are security boundaries and fail hard on a malformed
-value; tuning variables (`MAX_BODY_SIZE_MIB`) fail soft to a default with a logged warning.
+`parse_trusted_proxies`, `resolve_bind_addr`, `validate_initial_master_key`, `max_body_bytes`,
+`outbound_http_timeout`, `max_decompressed_bytes` (decompression-bomb ceiling, shared by
+`jobs::decompress`'s two independent expansion points). `TRUSTED_PROXIES` and `INITIAL_MASTER_KEY`
+are security boundaries and fail hard on a malformed value; tuning variables (`MAX_BODY_SIZE_MIB`,
+`MAX_DECOMPRESSED_BYTES`, `OUTBOUND_HTTP_TIMEOUT_SECS`) fail soft to a default with a logged
+warning. `outbound_max_retries`/`outbound_retry_backoff` (`retry.rs`'s two tunables) are
+deliberately **not** `OnceLock`-cached the way the others are — they read `env::var` fresh on every
+call, specifically so a test can set one and see it take effect immediately rather than being stuck
+with whatever the first caller in the process observed.
 
 ### `src/replay.rs` — anti-replay guard
 
 `ReplayGuard`: single-use signature cache keyed on `(key_id, raw digest bytes)`, monotonic
 `tokio::time::Instant` expiry (never wall-clock), amortized sweep plus a capacity-triggered sweep.
 Never flushed wholesale on saturation — that would let every currently valid signature replay at
-once.
+once. Backed by a plain `std::sync::Mutex<HashMap<...>>` — never held across an `.await` — whose
+check-then-insert happens under a single lock acquisition, which is exactly what makes it safe
+under real concurrent contention (see `tests/concurrency_and_contracts.rs`'s `Barrier`-based test).
+
+### `src/retry.rs` — transient-failure retry policy
+
+`is_transient_status` (`429`/`502`/`503`/`504`, deliberately excluding `500` and `413`) and
+`backoff_with_jitter` (exponential off `config::outbound_retry_backoff()`, capped at 30s, up to 50%
+jitter). Shared by `client.rs`'s outbound calls to remote vaults and
+`jobs::external_ingestion`'s feed fetches — one retry policy, not two independently-tuned ones.
 
 ### `src/extract.rs` — strict request extractors
 
-`StrictJson<T>`: `Json<T>` whose rejection renders as `AppError` (`400`/`413` as appropriate)
-rather than axum's default body. Combined with `#[serde(deny_unknown_fields)]` on payload types,
-this is how §5's "`is_master` must never be settable" rule is enforced at the type level rather
-than in a handler.
+Three extractor wrappers, one per axum extractor any handler uses — handlers use nothing else:
+- `StrictJson<T>`: `Json<T>` whose rejection renders as `AppError` (`400`/`413` as appropriate)
+  rather than axum's default plain-text body. Combined with `#[serde(deny_unknown_fields)]` on
+  payload types, this is how §5's "`is_master` must never be settable" rule is enforced at the type
+  level rather than in a handler.
+- `StrictPath<T>`: a malformed path segment (e.g. a non-UUID id) renders as `AppError::NotFound`,
+  not axum's plain-text `PathRejection` — deliberately `NotFound`, not `InvalidInput`, so a
+  syntactically invalid id stays indistinguishable from a well-formed id for a resource that
+  doesn't exist (RBAC §4 oracle discipline; see `tests/concurrency_and_contracts.rs`'s
+  `a_malformed_id_and_a_nonexistent_id_are_indistinguishable`).
+- `StrictQuery<T>`: an unparseable query string renders as `AppError::InvalidInput` rather than
+  axum's plain-text `QueryRejection`.
+
+All three exist for the same reason: axum's built-in `Path`/`Query`/`Json` rejections are plain
+text, and every other refusal this service emits is `{"error": "..."}` — a caller that parses the
+envelope to decide whether to retry would otherwise hit a parse failure instead of a status it can
+act on for exactly these three cases.
 
 ### `src/client.rs` — outbound signed HTTP client
 
@@ -135,7 +169,13 @@ scheduler's cron closures (a slow prior tick causes the next one to skip with a 
 `decompress.rs`: `decompress_if_zip`/`is_zip` — transparent ZIP-archive decompression inserted
 into `external_ingestion.rs` before any parser runs, so ZIP-distributed feeds (e.g. StopForumSpam)
 work with every parser type without the parser layer knowing archives exist; a pure passthrough
-for the (overwhelmingly common) non-ZIP case.
+for the (overwhelmingly common) non-ZIP case. Both `decompress_if_zip` and the sibling
+`read_capped_body` (which streams the HTTP response body itself, before decompression is even
+decided) take an explicit `max_decompressed_bytes` ceiling and abort mid-stream the instant the
+running total crosses it — the decompression-bomb defense for the two independent points a fetched
+body can expand: `Content-Encoding` (handled transparently by `reqwest`, so a naive `bytes()` read
+would already have fully buffered an oversized payload before anything could check its size) and a
+ZIP archive's own internal members.
 `external_ingestion.rs`: fetch → decompress-if-zip → parse → dedupe → chunk → push to every
 configured target vault, one `sync_logs` row per execution, `last_run_at` always updated (it means
 "last execution", not "last successful execution"). A fetch+parse that completes but yields
@@ -173,7 +213,10 @@ suites mint keys directly against the database.
   `guard_delegated_grant` (R1/R7), `guard_revocation` (R6), `guard_master_immutable`/
   `guard_rotation_allowed` (§5), `guard_manage_keys`.
 - **`health.rs`** — `health_check`/`readiness_check`. Mounted outside `/api` and outside
-  `auth_middleware` in `lib.rs`.
+  `auth_middleware` in `lib.rs`. `readiness_check` deliberately proves the database is live with an
+  ordinary typed query (`ApiKey::find().count()`), not a raw `SELECT 1` — this is the one
+  unauthenticated route in the service, so it is the one place a raw-SQL exemption would be least
+  defensible, and `tests/source_hygiene.rs`'s raw-SQL scanner would flag it if it ever regressed.
 - **`keys.rs`** — identity (`get_me`), key CRUD, rotation, cascade deletion with §6 pre-flight
   inventory, permission grant/revoke. The largest module, deliberately not split further — R1–R7
   are all about how keys delegate to other keys.
@@ -218,8 +261,12 @@ two or more Master rows.
 | `external_ingestion_tests.rs` | Per-target `target_group_name` override; HTML-masquerade-as-200 via both parser types; gzip-compressed response decompression; a slow/hung target aborted by the client's own timeout rather than hanging; the `try_start_job` concurrency guard exercised directly |
 | `vault_sync_tests.rs` | Tombstone propagation through a full fetch→push cycle; `last_sync_at` only advances on total success; multi-vault fan-out and partial-failure resilience; per-target `target_group_name` override; a slow/hung target vault aborted on the push path specifically |
 | `live_feed_ingestion_tests.rs` | `#[ignore]`d — real network calls to the four feeds named in `AGENT_NOTES.MD`, both via the parser directly and through the full `jobs::external_ingestion::run` pipeline. Run explicitly with `cargo test -- --ignored` |
-| `rbac_tests.rs` | `can_sync` manual-trigger allow/403, R4 scope elevation, §5 Master immutability/rotation refusal, §3 owner-only lifecycle |
+| `rbac_tests.rs` | `can_sync` manual-trigger allow/403, R1 non-amplification, R6 revocation-without-the-verb, §5 Master immutability/rotation refusal, §3 owner-only lifecycle and cascade-blocked-by-inventory, §4 oracle discipline (out-of-scope vs. nonexistent vault), a 2-way concurrent-delete regression test |
 | `schema_integrity_tests.rs` | Migrations apply cleanly; `ADVERSARIAL(§5)` — a raw-SQL insert with the marker column absent is rejected by the database itself; FK cascade on a junction table |
+| `referential_integrity.rs` | FK enforcement via `db::connect` (not `common::setup`'s bare `Database::connect`, which never enables `PRAGMA foreign_keys`): bidirectional cascade correctness (a doomed and a survivor source sharing one target vault), write-time rejection of a dangling FK, and a test proving `owner_key_id` deliberately carries **no** FK constraint at all |
+| `health_probes.rs` | `/health` never touches the database even when it's closed; `/ready` independently depends on both a live database and the boot-time Master pin (including a startup-ordering test — an unpinned `MasterPin` swapped into `AppState` post-setup — that a steady-state-only suite can't produce); the liveness body has exactly the two documented fields; neither probe leaks internal error text |
+| `concurrency_and_contracts.rs` | Real multi-task/thread contention the router's single-connection SQLite pool can't otherwise expose: 16 OS threads hammering `ReplayGuard::check_and_record` directly via a `Barrier` (exactly one admitted; distinct signatures never block each other), 16 concurrent `tokio::spawn`ed deletes of the same resource (exactly one `204`), and the `StrictPath`/`StrictQuery` JSON-envelope-totality contract (malformed path/query, and the oracle-discipline pairing between a malformed id and a nonexistent one) |
+| `client_resilience_tests.rs` | Outbound retry/backoff on transient vault failures, adaptive batch splitting on `413`, `full_replace`'s chunk-0-only rule surviving a `413` split, and per-page retry on the delta-fetch side |
 | `source_hygiene.rs` | `static/app.js` parses as valid ECMAScript (`oxc_parser`, self-tested against a known-broken fixture); every literal `document.getElementById()` reference resolves against `index.html` or an id `app.js` injects itself; the one dynamic id-construction pattern is verified against its actual invariant (every nav button's `data-tab` has a matching panel id) |
 
 `scripts/test_e2e.sh` (repository root, not under `tests/`) is the complementary black-box gate:

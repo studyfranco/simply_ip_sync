@@ -1,7 +1,9 @@
 //! `GET /api/audit-logs` — the security audit trail. Master-only: it is the one read surface
 //! spanning every domain, so scoping it per-caller would be arbitrary.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
+
+use crate::extract::StrictQuery;
 use axum::response::IntoResponse;
 use axum::Json;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -26,7 +28,7 @@ pub struct AuditLogQuery {
 pub async fn list_audit_logs(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
-    Query(query): Query<AuditLogQuery>,
+    StrictQuery(query): StrictQuery<AuditLogQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !caller.is_master {
         return Err(AppError::Forbidden("audit logs are visible to the Master key only".to_owned()));

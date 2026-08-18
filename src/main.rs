@@ -32,6 +32,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     simply_ip_sync::db::run_migrations(&db).await?;
 
     bootstrap_master_key(&db).await?;
+    verify_encryption_key(&db).await?;
 
     let state = simply_ip_sync::setup_state(db).await?;
     let pinned = state.master_pin.pin_at_boot(&state.db).await?;
@@ -49,6 +50,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+/// Boot canary for `SYNC_ENCRYPTION_KEY`: opens one stored signing secret to prove the configured
+/// key is the one the data at rest was sealed under, and refuses to start if it is not.
+///
+/// Runs after `bootstrap_master_key` so a fresh database has a secret to check against; on a
+/// genuinely empty database there is nothing sealed and the check passes vacuously. Without this,
+/// a wrong-but-well-formed key starts cleanly, reports ready, and fails only inside outbound
+/// syncs, where the error surfaces as an authentication failure against the *vault* rather than a
+/// local misconfiguration.
+async fn verify_encryption_key(db: &DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
+    let cipher = simply_ip_sync::crypto::SecretCipher::from_env()?;
+    let sample = ApiKey::find()
+        .filter(api_key::Column::SigningSecret.is_not_null())
+        .one(db)
+        .await?
+        .and_then(|key| key.signing_secret);
+
+    match simply_ip_sync::crypto::check_key_canary(&cipher, sample.as_deref()) {
+        Ok(simply_ip_sync::crypto::KeyCanary::Verified) => {
+            tracing::info!("Encryption key canary passed: secrets at rest open with the configured key.");
+            Ok(())
+        }
+        Ok(simply_ip_sync::crypto::KeyCanary::NoSealedSecrets) => {
+            tracing::info!("Encryption key canary skipped: no sealed secrets stored yet.");
+            Ok(())
+        }
+        Err(e) => {
+            // Logged before returning: `main` renders this error with `Debug`, which would drop
+            // the operator-facing guidance below.
+            tracing::error!(
+                "Encryption key canary FAILED ({e}): the stored secrets cannot be opened with the \
+                 current {} . Refusing to start rather than running with a key that does not match \
+                 the data at rest. Restore the previous key, or re-provision the secrets under the \
+                 new one.",
+                simply_ip_sync::crypto::ENCRYPTION_KEY_ENV
+            );
+            Err(Box::new(e))
+        }
+    }
 }
 
 /// Bootstraps the sole Master key on first boot. A no-op if a Master already exists. The only
@@ -118,16 +159,31 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
 }
 
 async fn shutdown_signal() {
+    // A signal handler that fails to install must not panic the shutdown future: that would abort
+    // the process mid-request instead of draining it, turning a degraded-but-serving container
+    // into a crash loop. Each arm degrades to `pending` so the *other* signal still works, and the
+    // server keeps serving if neither can be installed.
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!("failed to install Ctrl+C handler: {e}; ignoring SIGINT");
+                std::future::pending::<()>().await
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("failed to install SIGTERM handler: {e}; ignoring SIGTERM");
+                std::future::pending::<()>().await
+            }
+        }
     };
 
     #[cfg(not(unix))]

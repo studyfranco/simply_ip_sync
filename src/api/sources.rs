@@ -1,6 +1,8 @@
 //! `external_sources` CRUD and manual trigger.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
+
+use crate::extract::StrictPath;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
@@ -197,7 +199,7 @@ pub async fn list_external_sources(
 pub async fn get_external_source(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let source = external_source::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     if !visible_to(&state, &caller, &source).await? {
@@ -274,7 +276,7 @@ pub async fn update_external_source(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateExternalSourcePayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = external_source::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
@@ -355,7 +357,7 @@ pub async fn delete_external_source(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = external_source::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_resource_lifecycle(&caller, existing.owner_key_id)?;
@@ -378,7 +380,7 @@ pub async fn trigger_external_source(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = external_source::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     let permission = find_permission(&state.db, caller.id, RESOURCE_EXTERNAL_SOURCE, id).await?;

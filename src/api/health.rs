@@ -6,9 +6,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{EntityTrait, PaginatorTrait};
 use serde_json::json;
 
+use crate::entities::prelude::ApiKey;
 use crate::state::AppState;
 
 /// `GET /health`, `/healthz`. Liveness only: does not touch the database, so a database outage
@@ -20,12 +21,10 @@ pub async fn health_check() -> impl IntoResponse {
 /// `GET /ready`, `/readyz`. Readiness: proves the database answers and the Master identity is
 /// pinned. Returns `503` otherwise.
 pub async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
-    let backend = state.db.get_database_backend();
-    let db_ok = state
-        .db
-        .query_one_raw(Statement::from_string(backend, "SELECT 1".to_owned()))
-        .await
-        .is_ok();
+    // Deliberately a typed entity query rather than a raw `SELECT 1`: this is the one route
+    // reachable without a credential, so it holds no raw-SQL surface at all, and the count also
+    // proves the schema (not merely the socket) is live. The number is never disclosed.
+    let db_ok = ApiKey::find().count(&state.db).await.is_ok();
     let master_ready = state.master_pin.get().is_some();
 
     if db_ok && master_ready {

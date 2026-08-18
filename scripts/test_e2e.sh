@@ -376,6 +376,27 @@ skip() {
     echo -e "$(ts)   ${YELLOW}⊘ SKIP${RESET} $*" >&2
 }
 
+# Usage: check_not_contains "literal substring" "description" — asserts $RESP_BODY does NOT
+# contain `needle`. Refuses an empty needle rather than silently passing: `[[ "$x" == *""* ]]` is
+# true for every string, so an empty needle here would report PASS unconditionally regardless of
+# what leaked — exactly the false-positive shape this helper exists to prevent (adopted from
+# example/simply_hook_executor and example/simply_ip_exporter's identical helper).
+check_not_contains() {
+    local needle="$1" description="$2"
+    if [ -z "$needle" ]; then
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (empty needle — the assertion is vacuous)" >&2
+        return
+    fi
+    if [[ "$RESP_BODY" == *"$needle"* ]]; then
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (the body contains it)" >&2
+    else
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $description" >&2
+    fi
+}
+
 # ── 1. Public probes ─────────────────────────────────────────────────────────
 log_section "1. Public probes"
 
@@ -1371,6 +1392,31 @@ raw_call POST "/api/sources" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SIGNE
     -H "X-Signature-256: sha256=0000000000000000000000000000000000000000000000000000000000000000" \
     -H "Content-Type: application/json" --data-binary "@$OVERSIZED_BODY_FILE"
 check "400" "a body over MAX_BODY_SIZE_MIB (10 MiB default) is rejected cleanly (400) rather than a 500 or a hang"
+
+# Vault credentials must never round-trip in any response — creating and then reading back a vault
+# endpoint is the one place a naive `#[derive(Serialize)]` directly on the entity (rather than a
+# dedicated response struct omitting the two credential fields) would leak them.
+DISTINCTIVE_API_KEY="e2e-credential-leak-canary-api-key-$RANDOM"
+DISTINCTIVE_SIGNING_SECRET="e2e-credential-leak-canary-signing-secret-$RANDOM"
+api_call POST "/api/vaults" "$MASTER_KEY" \
+    "{\"name\":\"credential-leak-canary-vault\",\"target_url\":\"http://127.0.0.1:1\",\"api_key\":\"$DISTINCTIVE_API_KEY\",\"signing_secret\":\"$DISTINCTIVE_SIGNING_SECRET\"}"
+check "200" "create a vault endpoint carrying distinctive, greppable credential values"
+check_not_contains "$DISTINCTIVE_API_KEY" "the create response does not echo the plaintext api_key back"
+check_not_contains "$DISTINCTIVE_SIGNING_SECRET" "the create response does not echo the plaintext signing_secret back"
+CREDENTIAL_LEAK_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call GET "/api/vaults/$CREDENTIAL_LEAK_VAULT_ID" "$MASTER_KEY"
+check "200" "read the vault endpoint back"
+check_not_contains "$DISTINCTIVE_API_KEY" "GET /api/vaults/{id} never returns the plaintext api_key"
+check_not_contains "$DISTINCTIVE_SIGNING_SECRET" "GET /api/vaults/{id} never returns the plaintext signing_secret"
+
+api_call GET "/api/vaults" "$MASTER_KEY"
+check "200" "list vault endpoints"
+check_not_contains "$DISTINCTIVE_API_KEY" "GET /api/vaults (list) never returns the plaintext api_key"
+check_not_contains "$DISTINCTIVE_SIGNING_SECRET" "GET /api/vaults (list) never returns the plaintext signing_secret"
+
+api_call DELETE "/api/vaults/$CREDENTIAL_LEAK_VAULT_ID" "$MASTER_KEY"
+check "204" "clean up the credential-leak canary vault"
 
 api_call PATCH "/api/keys/$MASTER_ID" "$MASTER_KEY" '{"name":"Renamed Master"}'
 check "403" "the Master key cannot be renamed through the API (RBAC §5)"

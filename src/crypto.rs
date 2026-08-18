@@ -191,6 +191,35 @@ impl SecretCipher {
     }
 }
 
+/// Result of the boot-time encryption-key canary.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyCanary {
+    /// Nothing sealed exists yet (fresh database): there is nothing to check the key against.
+    NoSealedSecrets,
+    /// A stored secret was opened successfully; the configured key matches the data at rest.
+    Verified,
+}
+
+/// Boot-time canary: proves the configured `SYNC_ENCRYPTION_KEY` is the key the data at rest was
+/// actually sealed under, by opening one known-stored secret.
+///
+/// A syntactically valid but *wrong* key is otherwise indistinguishable from a correct one until
+/// the first request that needs a signing secret — by which time the service is live, is
+/// advertising readiness, and every outbound sync silently fails to authenticate. Failing at boot
+/// converts that into a refusal to start, which is the recoverable outcome: the operator still has
+/// the old key, and no partial writes have happened under the wrong one.
+///
+/// `sample` is any stored envelope (`api_key.signing_secret`); `None` means the database holds no
+/// sealed secrets yet. Pure and infallible-by-inspection so it can be unit-tested without a
+/// database.
+pub fn check_key_canary(cipher: &SecretCipher, sample: Option<&str>) -> Result<KeyCanary, CryptoError> {
+    let Some(stored) = sample else {
+        return Ok(KeyCanary::NoSealedSecrets);
+    };
+    cipher.open(stored)?;
+    Ok(KeyCanary::Verified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +358,45 @@ mod tests {
             let digest = verify_signature(secret, method, target, timestamp, body, &wrong_length_sig);
             assert!(digest.is_none(), "a {len}-byte tag must never verify (only 32 bytes is a valid HMAC-SHA256 length)");
         }
+    }
+
+    #[test]
+    fn canary_reports_no_sealed_secrets_on_an_empty_database() {
+        let cipher = SecretCipher::from_hex_key(&generate_signing_secret()).expect("valid key");
+        let result = check_key_canary(&cipher, None).expect("infallible on the empty-database branch");
+        assert!(matches!(result, KeyCanary::NoSealedSecrets));
+    }
+
+    #[test]
+    fn canary_verifies_a_secret_sealed_under_the_same_key() {
+        let key = generate_signing_secret();
+        let cipher = SecretCipher::from_hex_key(&key).expect("valid key");
+        let sealed = cipher.seal("vault-signing-secret").expect("seal");
+
+        let result = check_key_canary(&cipher, Some(&sealed)).expect("the same key must open its own ciphertext");
+        assert!(matches!(result, KeyCanary::Verified));
+    }
+
+    /// The property the canary exists for: a syntactically valid but *wrong* key must fail loudly
+    /// at this check, not open (or worse, silently corrupt) a secret sealed under a different key.
+    #[test]
+    fn canary_fails_closed_when_the_configured_key_does_not_match_the_sealed_secret() {
+        let original_cipher = SecretCipher::from_hex_key(&generate_signing_secret()).expect("valid key");
+        let sealed = original_cipher.seal("vault-signing-secret").expect("seal");
+
+        let wrong_cipher = SecretCipher::from_hex_key(&generate_signing_secret()).expect("valid key");
+        let result = check_key_canary(&wrong_cipher, Some(&sealed));
+        assert!(result.is_err(), "a wrong-but-well-formed key must fail the canary, not silently pass");
+    }
+
+    /// A plaintext-mode deployment (no `SYNC_ENCRYPTION_KEY` configured) has no key to be wrong
+    /// about — `Plaintext::open` never fails on a `v1.plain.`-prefixed value — so the canary must
+    /// still report success rather than a spurious failure with nothing actually misconfigured.
+    #[test]
+    fn canary_passes_trivially_in_plaintext_mode() {
+        let cipher = SecretCipher::Plaintext;
+        let sealed = cipher.seal("vault-signing-secret").expect("seal");
+        let result = check_key_canary(&cipher, Some(&sealed)).expect("plaintext mode has no key to mismatch");
+        assert!(matches!(result, KeyCanary::Verified));
     }
 }

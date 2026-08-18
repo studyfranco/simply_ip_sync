@@ -1,6 +1,8 @@
 //! `vault_endpoints` CRUD — configuration and credentials for remote `simply_ip_vault` instances.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
+
+use crate::extract::StrictPath;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
@@ -111,7 +113,7 @@ pub async fn list_vault_endpoints(
 pub async fn get_vault_endpoint(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let endpoint = vault_endpoint::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     let visible = caller.is_master
@@ -166,7 +168,7 @@ pub async fn update_vault_endpoint(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateVaultEndpointPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = vault_endpoint::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
@@ -201,7 +203,7 @@ pub async fn delete_vault_endpoint(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
     axum::Extension(client_ip): axum::Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = vault_endpoint::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_resource_lifecycle(&caller, existing.owner_key_id)?;
