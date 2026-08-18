@@ -35,7 +35,7 @@ tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 wiremock = "0.6"
-oxc_allocator = "0.144"
-oxc_parser = "0.144"
-oxc_span = "0.144"
+oxc_allocator = "0.145"
+oxc_parser = "0.145"
+oxc_span = "0.145"
 flate2 = "1"
