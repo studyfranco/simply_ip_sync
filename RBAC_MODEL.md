@@ -96,7 +96,7 @@ endpoint are separate powers.
 - Exactly one Master key exists, enforced by a database constraint: `api_keys.master_marker`,
   `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` under a plain unique index
   (`Postgres: STORED`, `SQLite/MySQL: VIRTUAL`) — see
-  `migration::m20260101_000002_derive_master_marker`.
+  `migration::m20260101_013241_derive_master_marker`.
 - The marker is never a field on the `api_key` entity `Model` (see `entities/api_key.rs`), so no
   query can ever write to it.
 - `is_master` is not present in any create/update payload type (`CreateApiKeyPayload`,

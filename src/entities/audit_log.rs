@@ -14,7 +14,7 @@ pub struct Model {
     pub api_key_id: Option<Uuid>,
     /// Denormalized actor name, so the trail survives key deletion. `NOT NULL`: every audited
     /// route runs behind `auth_middleware`, so `create_audit_log` always has a real key to
-    /// denormalize from — see `m20260818_000003_audit_attribution_not_null` for why this is
+    /// denormalize from — see `m20260818_010217_audit_attribution_not_null` for why this is
     /// enforced at the schema layer rather than left as an application convention.
     pub api_key_name: String,
     /// Denormalized actor key prefix. `NOT NULL`, same rationale as `api_key_name`.

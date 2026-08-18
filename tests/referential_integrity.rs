@@ -107,7 +107,7 @@ async fn junction_row_with_a_dangling_foreign_key_is_rejected_at_insert_time() {
 }
 
 /// `owner_key_id` on `external_sources`/`vault_endpoints`/`vault_sync_tasks` carries no FK
-/// constraint at all (confirmed against `src/migration/m20260101_000001_initial_schema.rs`: no
+/// constraint at all (confirmed against `src/migration/m20260101_013240_initial_schema.rs`: no
 /// `ForeignKey::create()` targets this column, unlike every other cross-table reference in the
 /// schema) — deliberately, not by oversight. `keys.rs::delete_api_key` enforces ownership
 /// transfer/cleanup at the *application* layer instead (see

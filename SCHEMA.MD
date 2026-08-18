@@ -196,9 +196,9 @@ Security audit trail tracking mutating operations across `simply_ip_sync`.
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique audit log entry ID |
 | `api_key_id` | `UUID` | Nullable, FK -> `api_keys.id` (SET NULL) | Performing API key ID |
-| `api_key_name` | `String` | **Not Null** (since `m20260818_000003`) | Denormalized actor name — a point-in-time snapshot that survives the key's own deletion; `api_key_id` is nullable specifically so `api_key_name`/`api_key_prefix` remain the durable record |
-| `api_key_prefix` | `String` | **Not Null** (since `m20260818_000003`) | Denormalized actor key prefix |
-| `client_ip` | `String` | **Not Null** (since `m20260818_000003`) | Resolved client IP |
+| `api_key_name` | `String` | **Not Null** (since `m20260818_010217`) | Denormalized actor name — a point-in-time snapshot that survives the key's own deletion; `api_key_id` is nullable specifically so `api_key_name`/`api_key_prefix` remain the durable record |
+| `api_key_prefix` | `String` | **Not Null** (since `m20260818_010217`) | Denormalized actor key prefix |
+| `client_ip` | `String` | **Not Null** (since `m20260818_010217`) | Resolved client IP |
 | `action` | `String` | Not Null, Indexed | Action name (e.g. `SOURCE_CREATE`, `SOURCE_TRIGGER`, `TASK_UPDATE`, `KEY_ROTATE`) |
 | `target_resource`| `String` | Nullable | Human-readable target name |
 | `details` | `Text` | Nullable | Additional payload context |

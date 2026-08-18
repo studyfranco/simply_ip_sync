@@ -263,11 +263,11 @@ number (disambiguates same-day migrations; not a literal time-of-day), and a sho
 `src/migration/mod.rs`'s registration order must match filename order — see `AGENT.MD`'s "SeaORM
 Migration Standards" section for the full rule and the audit-attribution-`NOT NULL` pattern below.
 
-`m20260101_000001_initial_schema` — all 9 `SCHEMA.MD` tables, including the `target_group_name`
+`m20260101_013240_initial_schema` — all 9 `SCHEMA.MD` tables, including the `target_group_name`
 override columns on both junction tables, FKs with the specified `CASCADE`/`SET NULL` behavior,
-and the six mandatory indexes. `m20260101_000002_derive_master_marker` — adds the generated
+and the six mandatory indexes. `m20260101_013241_derive_master_marker` — adds the generated
 `master_marker` column and its unique index; aborts before any DDL if the database already holds
-two or more Master rows. `m20260818_000003_audit_attribution_not_null` — tightens
+two or more Master rows. `m20260818_010217_audit_attribution_not_null` — tightens
 `audit_logs.api_key_name`/`.api_key_prefix`/`.client_ip` to `NOT NULL` (every `create_audit_log`
 call site already supplies all three; the columns were nullable only because the initial schema
 declared them so). Backfills any pre-existing `NULL` to the unmistakable sentinel `"(unknown)"`

@@ -1,7 +1,7 @@
 //! The Master identity pin.
 //!
 //! This file answers exactly one question — "is this key the Master this process pinned?" — and
-//! nothing else. `migration::m20260101_000002_derive_master_marker`'s unique index guarantees *at
+//! nothing else. `migration::m20260101_013241_derive_master_marker`'s unique index guarantees *at
 //! most one* Master row exists (it defends cardinality); this module defends *identity*: an
 //! attacker with database write access does not need two Masters, only to demote the real one and
 //! promote itself, which keeps the count at exactly one and satisfies the index. Neither control

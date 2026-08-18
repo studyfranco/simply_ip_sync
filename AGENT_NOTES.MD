@@ -1247,3 +1247,56 @@ note is the living record that the finding they both describe is now closed as o
 are staged together under the addendum's own message,
 `fix(sync): enforce NOT NULL on audit attribution columns and return 413 for oversized bodies` —
 no push instruction was given, so the commit was made locally only.
+
+## Session 11 (2026-08-19): migrations renamed to literal `mYYYYMMDD_HHMMSS_*` timestamps
+
+Session 10's own addendum had explicitly declined to rename `m20260101_000001_initial_schema.rs`/
+`m20260101_000002_derive_master_marker.rs`, reasoning that the `NNNNNN` segment was already a valid
+zero-padded sequence number matching the convention documented in `AGENT.MD`, and that renaming an
+already-applied migration is a breaking change against any database with real history (the
+filename is the identifier `seaql_migrations` tracks). The user overrode that caution directly this
+session: confirmed the project has no production deployment yet, and asked for the literal
+`HHMMSS` (not sequence-number) format explicitly. With that confirmation, renaming stopped being
+unsafe and became just a normal edit.
+
+**What changed.** All three migrations renamed via `git mv` (preserves history) to a literal
+authored-time format, using each file's real first-commit timestamp as the `HHMMSS` (git blame,
+not invented): `m20260101_000001_initial_schema.rs` → `m20260101_013240_initial_schema.rs` and
+`m20260101_000002_derive_master_marker.rs` → `m20260101_013241_derive_master_marker.rs` (both
+authored in the same commit, `f891b44`, at `01:32:40+02:00`; the second bumped by one second since
+two files cannot share an identical timestamp under this convention and still express which came
+first). `m20260818_000003_audit_attribution_not_null.rs` → `m20260818_010217_audit_attribution_not_null.rs`
+(real commit time `01:02:17+02:00`, on the `a48e919` commit from Session 10's addendum; the
+`20260818` date segment was kept as originally chosen — the session's own "today" — even though the
+literal commit timestamp technically landed just past midnight into the 19th).
+
+**Everything downstream of the file names updated in the same pass:** `src/migration/mod.rs`'s
+`mod` declarations and `Box::new(...)` registrations (module names are derived from file names, so
+these are not optional); cross-reference doc comments in `src/master.rs`, `src/entities/api_key.rs`,
+`src/entities/audit_log.rs`, `src/migration/m20260101_013240_initial_schema.rs` (referenced its
+sibling by old name); `RBAC_MODEL.md` §5's citation; `scripts/verify_convergence.sh`'s two
+`assert_present` file-path arguments; `FILE_MAP.MD`'s migration-section prose; `SCHEMA.MD`'s
+`audit_logs` table's three `NOT NULL` footnotes; `AGENT.MD`'s "SeaORM Migration Standards" section
+itself — rewrote rule 1 to describe the naming segment as a literal time-of-day rather than a
+sequence counter (the rule text and the files it describes must agree, or the section becomes
+exactly the kind of stale documentation this project's own audits keep flagging in `AGENT.MD`), and
+added an explicit note that renaming an *already-applied* migration is unsafe against a database
+with real history and was only done here because the project confirmed it has none yet.
+`tests/referential_integrity.rs`'s one comment citing the initial-schema file by name. Left
+`AGENT_NOTES.MD`'s own historical Sessions 8-10 entries untouched — they are a dated log of what was
+decided and why at the time (including the earlier, now-superseded decision not to rename), not a
+living reference; correcting them in place would erase the record of that reasoning rather than
+supersede it, which is what this entry does instead.
+
+**Verification.** `cargo check --all-targets`/`cargo clippy --all-targets -- -D warnings` clean.
+`cargo test`: unchanged at 183 passed / 0 failed / 5 ignored — renaming a migration file changes
+nothing SeaORM's `Migrator` sees at the *value* level (the migration name it records comes from the
+module, which was renamed consistently), so no test assertions needed to change, only the
+`mod.rs`/cross-reference wiring. `./scripts/test_e2e.sh`: 213/213, unchanged.
+`./scripts/verify_convergence.sh`: still PASSED, 52 matching / 2 documented / 0 unexplained — its
+two `assert_present` checks against the master-marker migration's file path were updated to the new
+name and still find what they're looking for.
+
+**Not done:** did not touch `example/` in any way (read-only per standing policy, and irrelevant to
+a purely local file-naming decision). Did not add a fourth migration or otherwise touch schema
+content — this was a rename-and-propagate-references pass only.

@@ -1,6 +1,6 @@
 //! Initial schema: all 9 `SCHEMA.MD` tables, their foreign keys, and the mandatory indexes.
 //! `api_keys.master_marker` is added separately by
-//! `m20260101_000002_derive_master_marker`, since a generated column cannot be expressed through
+//! `m20260101_013241_derive_master_marker`, since a generated column cannot be expressed through
 //! `ColumnDef` and must be raw DDL.
 
 use sea_orm_migration::prelude::*;

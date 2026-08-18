@@ -191,7 +191,7 @@ Implements `RBAC_MODEL.md` (Master / Parent / Daughter):
 
 ### 6. Audit Trail
 
-Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync Task CRUD, Permission updates) writes an entry to `audit_logs` storing denormalized actor details (`api_key_id`, `api_key_name`, `api_key_prefix`, `client_ip`), `action`, `target_resource`, and timestamp. `api_key_name`, `api_key_prefix`, and `client_ip` are **`NOT NULL`** (since `m20260818_000003_audit_attribution_not_null`): `api_key_id` is nullable and `ON DELETE SET NULL` specifically so deleting a key cannot erase the record of what it did, which means the denormalized snapshot columns are the *only* attribution that survives the key — an audit row with no name/prefix/IP recorded would be an action with no representable actor at all. See the migration's own module doc for the full rationale and the pre-`NOT NULL` backfill it performs.
+Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync Task CRUD, Permission updates) writes an entry to `audit_logs` storing denormalized actor details (`api_key_id`, `api_key_name`, `api_key_prefix`, `client_ip`), `action`, `target_resource`, and timestamp. `api_key_name`, `api_key_prefix`, and `client_ip` are **`NOT NULL`** (since `m20260818_010217_audit_attribution_not_null`): `api_key_id` is nullable and `ON DELETE SET NULL` specifically so deleting a key cannot erase the record of what it did, which means the denormalized snapshot columns are the *only* attribution that survives the key — an audit row with no name/prefix/IP recorded would be an action with no representable actor at all. See the migration's own module doc for the full rationale and the pre-`NOT NULL` backfill it performs.
 
 ---
 
@@ -200,15 +200,21 @@ Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync
 Every migration in `src/migration/` follows two mandatory rules, checked as part of every schema
 change and audited whenever a new migration is added:
 
-1. **Naming convention.** Every migration file is named `m<YYYYMMDD>_<NNNNNN>_<migration_name>.rs`
-   — an 8-digit date the migration was authored, an underscore, a 6-digit zero-padded sequence
-   number (not a literal time-of-day; it exists to make ordering unambiguous when two migrations
-   share a date), an underscore, and a short `snake_case` description. `SeaORM`'s `Migrator` applies
-   migrations in the order they are listed in `src/migration/mod.rs`, and that list's order **must**
-   match the filename order — the filename is not decorative, it is the mechanism a human (or an
-   agent) uses to verify the applied order matches the intended one at a glance. Current migrations:
-   `m20260101_000001_initial_schema.rs`, `m20260101_000002_derive_master_marker.rs`,
-   `m20260818_000003_audit_attribution_not_null.rs`.
+1. **Naming convention.** Every migration file is named `m<YYYYMMDD>_<HHMMSS>_<migration_name>.rs`
+   — an 8-digit authoring date, an underscore, the literal 6-digit time of authoring (24-hour,
+   zero-padded — not a sequence counter; two migrations authored on the same date are disambiguated
+   by their actual times, and if two are genuinely simultaneous, the second is bumped by one second
+   so the pair stays strictly ordered), an underscore, and a short `snake_case` description.
+   `SeaORM`'s `Migrator` applies migrations in the order they are listed in `src/migration/mod.rs`,
+   and that list's order **must** match filename order — the filename is not decorative, it is the
+   mechanism a human (or an agent) uses to verify the applied order matches the intended one at a
+   glance. Current migrations: `m20260101_013240_initial_schema.rs`,
+   `m20260101_013241_derive_master_marker.rs`, `m20260818_010217_audit_attribution_not_null.rs`.
+   **Renaming an already-applied migration is a breaking change against any deployed database**
+   (its filename is the identifier recorded in `seaql_migrations`) and must not be done against a
+   database with real history; the three current files were renamed to this literal-time format on
+   2026-08-19 specifically because the project confirmed there is no production deployment yet — see
+   `AGENT_NOTES.MD`'s corresponding session entry.
 2. **Audit attribution integrity.** Any column that denormalizes actor/attribution data for the
    audit trail (see §6) must be `NOT NULL` once every write path that populates it is verified to
    always supply a value — nullability on such a column is either a temporary state during a
@@ -232,7 +238,7 @@ change and audited whenever a new migration is added:
      corrupts data on a future column reorder), drop the original, rename the replacement into
      place, and recreate every index the original table had. PostgreSQL and MySQL take
      `ALTER COLUMN … SET NOT NULL`/`MODIFY` directly; branch on `manager.get_database_backend()`.
-   - See `m20260818_000003_audit_attribution_not_null.rs` for the reference implementation of all
+   - See `m20260818_010217_audit_attribution_not_null.rs` for the reference implementation of all
      of the above, including its own `#[cfg(test)]` assertions that the strict/loose table
      definitions differ in exactly the intended columns and that the backfill sentinel cannot be
      mistaken for real data.
