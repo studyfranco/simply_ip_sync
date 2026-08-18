@@ -951,3 +951,73 @@ organized by what was **verified as already correct**, and what this session **a
 - `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: both clean, zero
   warnings.
 - `./scripts/verify_convergence.sh`: does not exist for this service; not run (see above).
+
+## Session 8 (2026-08-18): independent security and structural convergence reports (4-way)
+
+Requested as a read-only, zero-knowledge/clean-room comparative audit against every peer in
+`example/`, not a single named one — the task text gave two disjoint example peers
+(`simply_hook_executor` or `simply_ip_vault`), but `example/` actually holds three
+(`simply_hook_executor`, `simply_ip_exporter`, `simply_ip_vault`); asked the user which to use,
+and the answer was explicit: compare against **all** of them. Both target reports
+(`SECURITY_COMPARISON_REPORT.md`, `STRUCTURAL_CONVERGENCE_REPORT.md`) did not previously exist in
+this repository and were created fresh, not overwritten.
+
+**Task 0 — peer sync.** Ran `git pull` in each of the three peer checkouts under `example/`
+(read-only elsewhere in those trees, per standing policy — see Session 2's clarification):
+- `simply_hook_executor`: fast-forwarded to `15b8af6` (2026-08-18) — that project's own version of
+  this exact task, "docs: finalize independent security and structural convergence reports",
+  comparing itself against `simply_ip_vault`.
+- `simply_ip_exporter`: fast-forwarded to `80a3b31` (2026-08-18) — same commit message, first time
+  that project created its own two convergence-report files.
+- `simply_ip_vault`: already up to date at `14c8fa3` (2026-08-17); no new commits.
+
+**Methodology — zero-knowledge audit.** By the same logic that this session must not read its own
+prior `SECURITY_COMPARISON_REPORT.md`/`STRUCTURAL_CONVERGENCE_REPORT.md` (neither existed yet, so
+this was moot for `simply_ip_sync` itself), each peer's *own* two report files were explicitly
+excluded from every research pass, since all three had just written or already had their own
+self-comparison conclusions and reading them first would bias a fresh read of the actual code.
+Facts for each peer were gathered by an independent `Explore`-type research pass per project (three
+in total, run in parallel), each instructed to report only structured facts — file:line references,
+exact names, exact status codes — not conclusions, and each explicitly told to skip that project's
+own comparison-report files while reading everything else (`RBAC_MODEL.md`/`AGENT.MD`/`SCHEMA.MD`/
+`FILE_MAP.MD`/`AGENT_NOTES.MD`/`src/**/*.rs`/`tests/**/*.rs`). Every fact used in the two final
+reports was then re-derived against this project's own current source directly (not taken from
+agent claims alone) before being included — e.g. the `deny_unknown_fields` 9/9 coverage count, the
+`rows_affected` TOCTOU-check call sites, the `AppError` variant table, and the `guards.rs` function
+list were all re-grepped/re-read fresh in this session rather than carried over from memory of
+earlier sessions.
+
+**Key findings surfaced by the comparison (full detail in the two report files):**
+- `simply_ip_sync` has 100% `deny_unknown_fields` coverage (9/9 payload structs) — the only one of
+  the four projects with universal coverage; `simply_ip_exporter` has zero occurrences anywhere
+  (a gap that project's own notes already document), and the other two apply it only to key-admin
+  payloads.
+- A peer's own audit notes (`simply_ip_exporter`'s `AGENT_NOTES.MD`, dated 2026-08-17) recorded the
+  concurrent-delete TOCTOU race as **present and unfixed** in `simply_ip_sync` across four delete
+  handlers, at the commit it inspected. That finding is now stale — Session 7's work (`024ffc5`)
+  closed all four of those plus a fifth (`revoke_key_permission`), independently of that peer's
+  observation. Documented as a stale-finding correction in `SECURITY_COMPARISON_REPORT.md` §1.2
+  rather than silently dropped.
+- The oversized-body status code (400 in this project vs. 413 in all three peers) is confirmed,
+  again, as a genuine architectural divergence rather than a bug — `simply_ip_exporter` proves the
+  413 outcome is reachable even from a body-buffering middleware like this project's own, via one
+  additional explicit `Content-Length` pre-check step this project does not have. Left as a
+  precisely-described, not-yet-acted-on finding; fixing it was not in scope for this read-only task.
+- Structural naming convergence is high across all four projects on no shared code path:
+  `auth_middleware`, `MasterPin`, `ReplayGuard`, `SecretCipher`, `ClientIp` are named identically in
+  all four; `simply_ip_sync` and `simply_ip_vault` have byte-identical `AppError` variant sets.
+- `AGENT.MD`'s own text (line ~82) still says API keys are matched via "Argon2/SHA-256" when
+  `support::hash_key` uses plain SHA-256 only — a stale-documentation observation, not a
+  vulnerability (SHA-256 is the correct choice for a high-entropy random token). Noted in the
+  security report; `AGENT.MD` itself was not edited (not the explicitly protected document for this
+  task — that's `RBAC_MODEL.md`, read-only and untouched throughout — but also not asked to be
+  corrected here).
+
+**Explicitly not done:** no application code in `src/`/`tests/` was read for the purpose of
+changing it, and none was changed, in either this repository or any peer under `example/` — this
+was a strictly read-only pass except for the two new report files and this note.
+
+**Final action:** `git add .`, commit
+`docs: finalize independent security and structural convergence reports`, then `git push` — this is
+the one task in this session's history that explicitly authorizes and requires pushing to the
+remote.
