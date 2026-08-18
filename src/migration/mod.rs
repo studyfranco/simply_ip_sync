@@ -7,6 +7,7 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20260101_000001_initial_schema;
 mod m20260101_000002_derive_master_marker;
+mod m20260818_000003_audit_attribution_not_null;
 
 /// The ordered set of migrations applied at startup.
 pub struct Migrator;
@@ -17,6 +18,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20260101_000001_initial_schema::Migration),
             Box::new(m20260101_000002_derive_master_marker::Migration),
+            Box::new(m20260818_000003_audit_attribution_not_null::Migration),
         ]
     }
 }

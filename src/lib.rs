@@ -21,6 +21,7 @@ pub mod middleware;
 pub mod migration;
 pub mod parsers;
 pub mod replay;
+pub mod retention;
 pub mod retry;
 pub mod scheduler;
 pub mod state;

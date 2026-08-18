@@ -238,15 +238,16 @@ async fn invalid_mode_on_source_update_is_rejected_without_mutating_existing_row
 
 /// Prompted by a pattern audited in `example/simply_ip_exporter/tests/integration.rs`
 /// (`an_oversized_body_is_413_not_400`, 2026-08-17 cross-project test audit — see
-/// `AGENT_NOTES.MD`) — but `simply_ip_sync`'s actual wiring turned out to differ in a way worth
-/// pinning explicitly rather than assuming the peer's status code transfers unchanged:
-/// `auth_middleware` reads the whole body itself, with its own explicit `max_body_bytes()` cap
-/// (`axum::body::to_bytes(body, max_body_bytes())`, needed either way to compute the signature
-/// over it), and this happens *before* any handler or `StrictJson` extractor ever sees the
-/// request — so an oversized body here surfaces as `AppError::InvalidInput` (`400`), not
-/// `StrictJson`'s `BodyRejected` (`413`), which is only reachable for a body that grows too large
-/// during the *handler's own* re-extraction of an already-auth-buffered body — structurally
-/// unreachable on the current `/api/*` wiring, where every route sits behind `auth_middleware`.
+/// `AGENT_NOTES.MD`). This project's `auth_middleware` reads the whole body itself, with its own
+/// explicit `max_body_bytes()` cap (`axum::body::to_bytes`, needed either way to compute the
+/// signature over it), and this happens *before* any handler or `StrictJson` extractor ever sees
+/// the request. That used to mean an oversized body here surfaced as `AppError::InvalidInput`
+/// (`400`) — a real, once-deliberate divergence from the rest of the ecosystem (`simply_ip_vault`/
+/// `simply_hook_executor`/`simply_ip_exporter` all answer `413`), documented and then closed:
+/// `auth_middleware` now does an explicit `Content-Length` pre-check (rejecting before a byte is
+/// read, when the client honestly declares an oversized body) and remaps the `to_bytes` overflow
+/// fallback to `AppError::BodyRejected(StatusCode::PAYLOAD_TOO_LARGE, ..)` too, matching how
+/// `simply_ip_exporter` achieves `413` from the same body-buffering-in-middleware architecture.
 /// Requires a genuinely valid API key so the request reaches the size check at all (an invalid key
 /// is rejected first, before the body is ever read — see `middleware.rs::auth_middleware`).
 #[tokio::test]
@@ -273,13 +274,43 @@ async fn oversized_inbound_body_is_rejected_cleanly_before_signature_verificatio
     let resp = app.oneshot(req).await.expect("response");
     // Not a 500, not a hang, not a bogus signature-mismatch 401 masking the real problem — the
     // size check runs before the (deliberately garbage) signature is ever evaluated.
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an oversized body must be rejected cleanly (400) before signature verification is even attempted");
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "an oversized body must be rejected cleanly (413) before signature verification is even attempted");
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json body");
     assert!(
-        body["error"].as_str().is_some_and(|e| e.to_lowercase().contains("large") || e.to_lowercase().contains("unreadable")),
+        body["error"].as_str().is_some_and(|e| e.to_lowercase().contains("exceeds") || e.to_lowercase().contains("large")),
         "the error message should explain the body was too large, got: {body}"
     );
+}
+
+/// The `Content-Length` fast path specifically: a client that honestly declares an oversized body
+/// must be refused before any of it is read, not merely once `to_bytes` has streamed the whole
+/// thing in and discovered the same fact the header already said. Distinguished from the test
+/// above (which sends the oversized bytes and lets the `to_bytes` cap catch it) by declaring a
+/// `Content-Length` far beyond the limit while sending only a small, cheap body — if the
+/// pre-check were missing or broken, this request would hang waiting for bytes that never arrive
+/// rather than failing fast.
+#[tokio::test]
+async fn a_declared_content_length_over_the_limit_is_rejected_without_reading_the_body() {
+    let (_conn, state, master) = common::setup().await;
+    let app = simply_ip_sync::create_app(state);
+
+    let declared_len = simply_ip_sync::config::DEFAULT_MAX_BODY_MIB * 1024 * 1024 + 1024;
+    let mut req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/sources")
+        .header("X-API-Key", master.plaintext_key.clone())
+        .header("X-Timestamp", chrono::Utc::now().timestamp().to_string())
+        .header("X-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
+        .header("Content-Type", "application/json")
+        .header("Content-Length", declared_len.to_string())
+        .body(axum::body::Body::from("tiny"))
+        .expect("build");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "a declared Content-Length over the limit must be refused before the body is read");
 }
 
 /// Adapted from the same audited pattern: a malformed-but-appropriately-sized JSON body, sent with

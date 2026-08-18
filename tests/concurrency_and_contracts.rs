@@ -203,7 +203,7 @@ fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestam
     req
 }
 
-/// A higher-multiplicity version of `rbac_tests.rs`'s two-way concurrent-delete test, at the same
+/// A higher-multiplicity version of `rbac_model_compliance.rs`'s two-way concurrent-delete test, at the same
 /// scale (16) the replay-guard test above uses: 16 requests racing to delete the *same* resource
 /// through the full router. Unlike the replay guard, there is no in-process data structure to
 /// reach past with OS threads here — the atomicity guarantee for deletion is the database's own

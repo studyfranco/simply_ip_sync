@@ -40,6 +40,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     state.scheduler.boot(&state).await?;
 
+    // Detached, not drained on shutdown: a retention sweep is a bounded, idempotent DELETE, unlike
+    // the in-flight HTTP requests graceful shutdown below actually needs to wait for. See
+    // `retention::run_retention_worker`'s doc comment.
+    tokio::spawn(simply_ip_sync::retention::run_retention_worker(state.db.clone()));
+
     let app = simply_ip_sync::create_app(state);
     let addr = simply_ip_sync::config::resolve_bind_addr();
     tracing::info!("simply_ip_sync listening on {addr}");

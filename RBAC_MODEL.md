@@ -138,5 +138,5 @@ endpoint are separate powers.
   `ALTER TABLE … ADD CONSTRAINT`, and a self-referential FK on the same table SeaORM's migration
   builder is creating is awkward across all three supported backends); the application-level
   equivalent (cascade-safe deletion via subtree walking) is covered by
-  `tests/rbac_tests.rs::resource_lifecycle_delete_requires_owner_or_master` and the key CRUD
+  `tests/rbac_model_compliance.rs::s3_resource_lifecycle_delete_requires_owner_or_master` and the key CRUD
   handlers themselves.

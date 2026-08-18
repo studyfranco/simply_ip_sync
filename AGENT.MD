@@ -191,7 +191,51 @@ Implements `RBAC_MODEL.md` (Master / Parent / Daughter):
 
 ### 6. Audit Trail
 
-Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync Task CRUD, Permission updates) writes an entry to `audit_logs` storing denormalized actor details (`api_key_id`, `api_key_name`, `api_key_prefix`, `client_ip`), `action`, `target_resource`, and timestamp.
+Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync Task CRUD, Permission updates) writes an entry to `audit_logs` storing denormalized actor details (`api_key_id`, `api_key_name`, `api_key_prefix`, `client_ip`), `action`, `target_resource`, and timestamp. `api_key_name`, `api_key_prefix`, and `client_ip` are **`NOT NULL`** (since `m20260818_000003_audit_attribution_not_null`): `api_key_id` is nullable and `ON DELETE SET NULL` specifically so deleting a key cannot erase the record of what it did, which means the denormalized snapshot columns are the *only* attribution that survives the key — an audit row with no name/prefix/IP recorded would be an action with no representable actor at all. See the migration's own module doc for the full rationale and the pre-`NOT NULL` backfill it performs.
+
+---
+
+### 7. SeaORM Migration Standards
+
+Every migration in `src/migration/` follows two mandatory rules, checked as part of every schema
+change and audited whenever a new migration is added:
+
+1. **Naming convention.** Every migration file is named `m<YYYYMMDD>_<NNNNNN>_<migration_name>.rs`
+   — an 8-digit date the migration was authored, an underscore, a 6-digit zero-padded sequence
+   number (not a literal time-of-day; it exists to make ordering unambiguous when two migrations
+   share a date), an underscore, and a short `snake_case` description. `SeaORM`'s `Migrator` applies
+   migrations in the order they are listed in `src/migration/mod.rs`, and that list's order **must**
+   match the filename order — the filename is not decorative, it is the mechanism a human (or an
+   agent) uses to verify the applied order matches the intended one at a glance. Current migrations:
+   `m20260101_000001_initial_schema.rs`, `m20260101_000002_derive_master_marker.rs`,
+   `m20260818_000003_audit_attribution_not_null.rs`.
+2. **Audit attribution integrity.** Any column that denormalizes actor/attribution data for the
+   audit trail (see §6) must be `NOT NULL` once every write path that populates it is verified to
+   always supply a value — nullability on such a column is either a temporary state during a
+   backfill migration, or a bug. A migration that tightens such a column to `NOT NULL` must:
+   - **Backfill first, constrain second.** Pre-existing rows may legitimately hold `NULL` (they
+     predate the column's existence, or predate the migration itself); update them to an
+     unambiguous, unmistakable-for-real-data sentinel (e.g. `"(unknown)"`, never a plausible-looking
+     value like `"system"` or `"127.0.0.1"`) before applying the constraint, or the migration fails
+     against any database with existing history.
+   - **Never let this conflict with `ON DELETE SET NULL` on the owning FK.** A denormalized
+     attribution column existing specifically *because* the FK it accompanies is nullable
+     (`api_key_id: ON DELETE SET NULL`, so a key's own deletion doesn't erase its audit trail) must
+     itself become `NOT NULL` once every write path is verified never to omit it — the FK's
+     nullability and the denormalized column's non-nullability are not in tension; they are the
+     same design decision seen from two different columns.
+   - **SQLite needs a table rebuild, not `ALTER COLUMN`.** SQLite has no
+     `ALTER TABLE … ALTER COLUMN`; tightening nullability there means: create a replacement table
+     with the tightened definition (built via SeaORM's schema builder, not hand-written DDL, so
+     column types match the original byte-for-byte), copy every row across with an explicit column
+     list on both sides of `INSERT … SELECT` (never `SELECT *` — positional copying silently
+     corrupts data on a future column reorder), drop the original, rename the replacement into
+     place, and recreate every index the original table had. PostgreSQL and MySQL take
+     `ALTER COLUMN … SET NOT NULL`/`MODIFY` directly; branch on `manager.get_database_backend()`.
+   - See `m20260818_000003_audit_attribution_not_null.rs` for the reference implementation of all
+     of the above, including its own `#[cfg(test)]` assertions that the strict/loose table
+     definitions differ in exactly the intended columns and that the backfill sentinel cannot be
+     mistaken for real data.
 
 ---
 

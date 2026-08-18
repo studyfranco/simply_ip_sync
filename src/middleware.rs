@@ -111,9 +111,32 @@ pub async fn auth_middleware(
     let method = req.method().as_str().to_owned();
     let (parts, body) = req.into_parts();
     let target = signed_target(&parts);
-    let body_bytes = axum::body::to_bytes(body, crate::config::max_body_bytes())
-        .await
-        .map_err(|_| AppError::InvalidInput("Request body unreadable or too large to sign".to_owned()))?;
+
+    // A declared `Content-Length` over the limit is rejected before a single byte of the body is
+    // read — cheaper than buffering megabytes just to discover they were never going to fit, and
+    // it's what lets an oversized-but-honestly-labeled request answer `413` immediately rather
+    // than only after `to_bytes` below has streamed the whole thing in. A body that lies about its
+    // length (or omits `Content-Length` and streams via chunked transfer-encoding) still hits the
+    // `to_bytes` cap right after.
+    let max_bytes = crate::config::max_body_bytes();
+    let declared_len = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    if declared_len.is_some_and(|declared| declared > max_bytes) {
+        return Err(AppError::BodyRejected(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body exceeds the maximum allowed size".to_owned(),
+        ));
+    }
+
+    let body_bytes = axum::body::to_bytes(body, max_bytes).await.map_err(|_| {
+        AppError::BodyRejected(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body exceeds the maximum allowed size".to_owned(),
+        )
+    })?;
 
     let Some(digest) = crypto::verify_signature(
         &signing_secret,

@@ -90,9 +90,9 @@ pub async fn create_audit_log<C: ConnectionTrait>(
     let log = audit_log::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(Some(key.id)),
-        api_key_name: Set(Some(key.name.clone())),
-        api_key_prefix: Set(Some(key.prefix.clone())),
-        client_ip: Set(Some(client_ip.to_string())),
+        api_key_name: Set(key.name.clone()),
+        api_key_prefix: Set(key.prefix.clone()),
+        client_ip: Set(client_ip.to_string()),
         action: Set(action.to_owned()),
         target_resource: Set(target_resource),
         details: Set(details),

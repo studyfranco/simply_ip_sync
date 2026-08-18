@@ -2,7 +2,7 @@
 //! `master_marker` column enforces single-master uniqueness at the engine level, and foreign key
 //! cascades behave as `SCHEMA.MD` specifies.
 
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbErr, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use simply_ip_sync::db;
 
 /// File-backed (not `sqlite::memory:`) because `PRAGMA foreign_keys` behavior is per-connection,
@@ -38,27 +38,10 @@ async fn master_marker_index_exists_after_migration() {
     assert!(present, "master_marker unique index must exist after migration");
 }
 
-#[tokio::test]
-async fn adversarial_second_master_rejected_by_generated_column() {
-    let db = in_memory_db().await;
-    let insert_master = |id: &str| {
-        format!(
-            "INSERT INTO api_keys (id, name, key_hash, prefix, is_master, can_manage_keys, can_manage_sources, can_manage_vaults, created_at, updated_at) \
-             VALUES ('{id}', 'm', '{id}-hash', '{id}pfx', 1, 0, 0, 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
-        )
-    };
-    db.execute_unprepared(&insert_master("11111111-1111-1111-1111-111111111111"))
-        .await
-        .expect("first master insert succeeds");
-
-    // ADVERSARIAL(§5): a direct raw-SQL insert setting is_master=1 with the generated marker
-    // column absent from the insert list — proving the constraint holds against a hostile writer,
-    // not merely a cooperative one that would have supplied a marker itself.
-    let second: Result<_, DbErr> = db
-        .execute_unprepared(&insert_master("22222222-2222-2222-2222-222222222222"))
-        .await;
-    assert!(second.is_err(), "a second is_master=true row must be rejected by the DB itself");
-}
+// The adversarial raw-SQL proof that a second `is_master=true` row is rejected by the generated
+// `master_marker` column lives in `tests/rbac_model_compliance.rs::s5_adversarial_second_master_rejected_by_generated_column`
+// — RBAC §5's guarantees, adversarial or not, are indexed there so a missing one shows up as a
+// missing rule prefix rather than being scattered across files by convention alone.
 
 #[tokio::test]
 async fn foreign_keys_are_enforced_on_a_fresh_connection() {

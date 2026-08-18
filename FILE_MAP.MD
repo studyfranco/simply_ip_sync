@@ -54,9 +54,12 @@ Neither substitutes for the other — see the module doc comment.
 ### `src/middleware.rs` — inbound authentication
 
 `auth_middleware`: resolves client IP → validates `X-Timestamp` (no DB round-trip) → looks up the
-key by `SHA-256(X-API-Key)` → buffers the body and verifies the `CANONICAL_V1` signature → checks
-the anti-replay guard (only after verification succeeds) → checks `bound_ips` (last, so a
-401-vs-403 pair can't be used as a key-existence oracle) → calls `MasterPin::authenticate`. Also
+key by `SHA-256(X-API-Key)` → checks a declared `Content-Length` against `max_body_bytes()` and
+rejects with `413` before reading a byte if it's over → buffers the body (remapping `to_bytes`'s
+own overflow fallback to `413` too, for a body without a declared length) and verifies the
+`CANONICAL_V1` signature → checks the anti-replay guard (only after verification succeeds) →
+checks `bound_ips` (last, so a 401-vs-403 pair can't be used as a key-existence oracle) → calls
+`MasterPin::authenticate`. Also
 `ClientIp`. No per-resource authorization — that is `api/guards.rs`.
 
 ### `src/crypto.rs` — at-rest encryption and request signing
@@ -93,6 +96,18 @@ Never flushed wholesale on saturation — that would let every currently valid s
 once. Backed by a plain `std::sync::Mutex<HashMap<...>>` — never held across an `.await` — whose
 check-then-insert happens under a single lock acquisition, which is exactly what makes it safe
 under real concurrent contention (see `tests/concurrency_and_contracts.rs`'s `Barrier`-based test).
+
+### `src/retention.rs` — historic-log purge worker
+
+`run_retention_worker` (spawned detached from `main.rs`, not drained on shutdown — a purge sweep is
+a bounded, idempotent `DELETE ... WHERE timestamp < threshold`, unlike the in-flight HTTP requests
+graceful shutdown actually needs to wait for): purges `sync_logs` and `audit_logs` rows older than
+independently-configured retention windows (`SYNC_LOG_RETENTION_DAYS_ENV` default 92,
+`AUDIT_LOG_RETENTION_DAYS_ENV` default 365 — a security/compliance trail reasonably wants a longer
+horizon than operational job-run noise). `0` disables purging for that table. This project has no
+soft-deleted *resource* rows to purge the way `simply_ip_vault`'s equivalent module does — RBAC
+§6 uses hard-delete-with-cascade-inventory instead — so retention here is scoped to the two
+unbounded history tables rather than a resource's own lifecycle.
 
 ### `src/retry.rs` — transient-failure retry policy
 
@@ -243,11 +258,22 @@ from the entity, so leaving the field out of the struct is what guarantees no qu
 
 ## `src/migration/` — schema migrations
 
+Named `m<YYYYMMDD>_<NNNNNN>_<name>.rs` — an 8-digit authoring date, a 6-digit zero-padded sequence
+number (disambiguates same-day migrations; not a literal time-of-day), and a short description.
+`src/migration/mod.rs`'s registration order must match filename order — see `AGENT.MD`'s "SeaORM
+Migration Standards" section for the full rule and the audit-attribution-`NOT NULL` pattern below.
+
 `m20260101_000001_initial_schema` — all 9 `SCHEMA.MD` tables, including the `target_group_name`
 override columns on both junction tables, FKs with the specified `CASCADE`/`SET NULL` behavior,
 and the six mandatory indexes. `m20260101_000002_derive_master_marker` — adds the generated
 `master_marker` column and its unique index; aborts before any DDL if the database already holds
-two or more Master rows.
+two or more Master rows. `m20260818_000003_audit_attribution_not_null` — tightens
+`audit_logs.api_key_name`/`.api_key_prefix`/`.client_ip` to `NOT NULL` (every `create_audit_log`
+call site already supplies all three; the columns were nullable only because the initial schema
+declared them so). Backfills any pre-existing `NULL` to the unmistakable sentinel `"(unknown)"`
+before constraining, and rebuilds the table on SQLite (no `ALTER COLUMN` there) via a single
+`table_definition(attribution_not_null: bool)` shared by both the rebuild and `down`, so the two
+paths cannot describe different tables.
 
 ## `tests/` — what each suite owns
 
@@ -261,7 +287,7 @@ two or more Master rows.
 | `external_ingestion_tests.rs` | Per-target `target_group_name` override; HTML-masquerade-as-200 via both parser types; gzip-compressed response decompression; a slow/hung target aborted by the client's own timeout rather than hanging; the `try_start_job` concurrency guard exercised directly |
 | `vault_sync_tests.rs` | Tombstone propagation through a full fetch→push cycle; `last_sync_at` only advances on total success; multi-vault fan-out and partial-failure resilience; per-target `target_group_name` override; a slow/hung target vault aborted on the push path specifically |
 | `live_feed_ingestion_tests.rs` | `#[ignore]`d — real network calls to the four feeds named in `AGENT_NOTES.MD`, both via the parser directly and through the full `jobs::external_ingestion::run` pipeline. Run explicitly with `cargo test -- --ignored` |
-| `rbac_tests.rs` | `can_sync` manual-trigger allow/403, R1 non-amplification, R6 revocation-without-the-verb, §5 Master immutability/rotation refusal, §3 owner-only lifecycle and cascade-blocked-by-inventory, §4 oracle discipline (out-of-scope vs. nonexistent vault), a 2-way concurrent-delete regression test |
+| `rbac_model_compliance.rs` | One test per `RBAC_MODEL.md` rule/section, named `r1_`…`r7_`/`s3_`…`s7_` so `scripts/verify_convergence.sh` can mechanically confirm every rule has coverage; `s5_`/`s7_` additionally carry an `ADVERSARIAL(§N)` raw-SQL test proving the guarantee holds against a writer that bypasses the application, not only a cooperative one. Plus `can_sync` manual-trigger allow/403, a 2-way concurrent-delete regression test, and the unauthenticated-request-never-reaches-a-handler check |
 | `schema_integrity_tests.rs` | Migrations apply cleanly; `ADVERSARIAL(§5)` — a raw-SQL insert with the marker column absent is rejected by the database itself; FK cascade on a junction table |
 | `referential_integrity.rs` | FK enforcement via `db::connect` (not `common::setup`'s bare `Database::connect`, which never enables `PRAGMA foreign_keys`): bidirectional cascade correctness (a doomed and a survivor source sharing one target vault), write-time rejection of a dangling FK, and a test proving `owner_key_id` deliberately carries **no** FK constraint at all |
 | `health_probes.rs` | `/health` never touches the database even when it's closed; `/ready` independently depends on both a live database and the boot-time Master pin (including a startup-ordering test — an unpinned `MasterPin` swapped into `AppState` post-setup — that a steady-state-only suite can't produce); the liveness body has exactly the two documented fields; neither probe leaks internal error text |
@@ -272,3 +298,14 @@ two or more Master rows.
 `scripts/test_e2e.sh` (repository root, not under `tests/`) is the complementary black-box gate:
 it boots the real compiled binary and drives it with `curl` over a real socket, which none of the
 above can do. See its own header comment and `AGENT_NOTES.MD` session 2 for what it covers.
+
+`scripts/verify_convergence.sh` (repository root) is a fourth kind of gate: mechanical drift
+detection between this project and `example/simply_ip_vault`, not a test of this project's own
+behavior in isolation. It pulls the peer, diffs security-critical functions after normalizing away
+expected vocabulary differences (crate names, env var names), asserts structural invariants
+(ordering, index presence, absence of raw SQL/wall-clock replay expiry/bare-hex signature
+fallbacks), and cross-checks `tests/rbac_model_compliance.rs` for full rule and adversarial
+coverage. Unlike `simply_ip_vault`/`simply_hook_executor`'s own copy of this script, this one does
+not diff `RBAC_MODEL.md` for byte-identity — this project's copy is a deliberate restatement, not a
+shared file — so Pillar 0 instead checks structural section coverage plus rule-test coverage. See
+the script's own header comment for the full rationale and its `--verbose` flag.

@@ -111,7 +111,7 @@ async fn junction_row_with_a_dangling_foreign_key_is_rejected_at_insert_time() {
 /// `ForeignKey::create()` targets this column, unlike every other cross-table reference in the
 /// schema) — deliberately, not by oversight. `keys.rs::delete_api_key` enforces ownership
 /// transfer/cleanup at the *application* layer instead (see
-/// `tests/rbac_tests.rs::deleting_a_key_that_still_owns_resources_is_blocked_with_inventory`),
+/// `tests/rbac_model_compliance.rs::s6_deleting_a_key_that_still_owns_resources_is_blocked_with_inventory`),
 /// because a DB-level `CASCADE` here would silently delete every resource a Parent key ever
 /// created the moment that key is deleted, and a DB-level `RESTRICT`/`SET NULL` would either block
 /// key deletion outright or erase ownership with no record of what happened — neither gives an

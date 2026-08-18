@@ -1379,19 +1379,23 @@ api_call GET "/api/vaults/$NONEXISTENT_UUID" "$DAUGHTER_KEY"
 check "404" "a vault id that doesn't exist at all is also 404"
 check_local "$OUT_OF_SCOPE_BODY" "$RESP_BODY" "an out-of-scope vault and a nonexistent one return byte-identical response bodies"
 
-# An oversized inbound body must be rejected cleanly (400), not a 500 or a hang — regardless of
+# An oversized inbound body must be rejected cleanly (413), not a 500 or a hang — regardless of
 # whether the (deliberately garbage) signature would have verified, since the body-size check in
 # auth_middleware runs before signature verification. Written to a file rather than passed as a
 # shell argument: an 11MB `--data-binary "$VAR"` blows past the OS's ARG_MAX ("Argument list too
-# long"), which curl reports as a generic exec failure with no HTTP status at all, not the 400 this
-# check exists to assert; `--data-binary @file` streams it instead.
+# long"), which curl reports as a generic exec failure with no HTTP status at all, not the 413 this
+# check exists to assert; `--data-binary @file` streams it instead. curl sets Content-Length from
+# the file size automatically, so this exercises auth_middleware's Content-Length pre-check path
+# (reject before reading), matching the ecosystem-standard status code every peer service answers
+# with (`simply_ip_vault`/`simply_hook_executor`/`simply_ip_exporter` all return 413 here too).
 OVERSIZED_BODY_FILE="$WORK_DIR/oversized_body"
 head -c 11000000 /dev/zero | tr '\0' 'a' > "$OVERSIZED_BODY_FILE"
 next_timestamp
 raw_call POST "/api/sources" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SIGNED_TS" \
     -H "X-Signature-256: sha256=0000000000000000000000000000000000000000000000000000000000000000" \
     -H "Content-Type: application/json" --data-binary "@$OVERSIZED_BODY_FILE"
-check "400" "a body over MAX_BODY_SIZE_MIB (10 MiB default) is rejected cleanly (400) rather than a 500 or a hang"
+check "413" "a body over MAX_BODY_SIZE_MIB (10 MiB default) is rejected cleanly (413) rather than a 500 or a hang"
+check_jq ".error" "Request body exceeds the maximum allowed size" "the 413 still carries the standard {\"error\": ...} JSON envelope"
 
 # Vault credentials must never round-trip in any response — creating and then reading back a vault
 # endpoint is the one place a naive `#[derive(Serialize)]` directly on the entity (rather than a

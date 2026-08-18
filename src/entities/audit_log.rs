@@ -12,12 +12,15 @@ pub struct Model {
     pub id: Uuid,
     /// Performing API key id. `NULL` once the key is deleted (`ON DELETE SET NULL`).
     pub api_key_id: Option<Uuid>,
-    /// Denormalized actor name, so the trail survives key deletion.
-    pub api_key_name: Option<String>,
-    /// Denormalized actor key prefix.
-    pub api_key_prefix: Option<String>,
-    /// Resolved client IP.
-    pub client_ip: Option<String>,
+    /// Denormalized actor name, so the trail survives key deletion. `NOT NULL`: every audited
+    /// route runs behind `auth_middleware`, so `create_audit_log` always has a real key to
+    /// denormalize from — see `m20260818_000003_audit_attribution_not_null` for why this is
+    /// enforced at the schema layer rather than left as an application convention.
+    pub api_key_name: String,
+    /// Denormalized actor key prefix. `NOT NULL`, same rationale as `api_key_name`.
+    pub api_key_prefix: String,
+    /// Resolved client IP. `NOT NULL`, same rationale as `api_key_name`.
+    pub client_ip: String,
     /// Action name (e.g. `SOURCE_CREATE`, `SOURCE_TRIGGER`, `TASK_UPDATE`, `KEY_ROTATE`).
     pub action: String,
     /// Human-readable target name.
