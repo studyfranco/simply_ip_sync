@@ -19,6 +19,39 @@ To keep this context clean and modular, responsibilities are split across three 
 `example/` holds **live git clones** of the peer services, not flat snapshots.
 They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
 
+### Why `example/` Exists
+
+This ecosystem's security and architectural convergence did not start with `simply_ip_sync`. It
+originated with two foundational sibling projects — **`simply_ip_vault`** and
+**`simply_hook_executor`** — which independently arrived at, and then deliberately converged on, the
+same RBAC tier model, the same CANONICAL_V1 HMAC signing scheme, the same XChaCha20-Poly1305
+secrets-at-rest envelope, and the same DB-generated Master-uniqueness pattern. Their shared
+`RBAC_MODEL.md` (byte-identical across both repositories, diffed by their own
+`scripts/verify_convergence.sh`) is the tightest point of alignment in the ecosystem and the closest
+thing it has to a gold standard.
+
+The ecosystem is designed to **scale beyond that original pair**. `simply_ip_exporter` joined as a
+third peer with its own, deliberately simpler two-tier RBAC model (no Parent tier — a documented,
+intentional divergence, not a gap), and `simply_ip_sync` (this project) joined as a fourth,
+positioned as the active ingestion/replication orchestrator that talks to `simply_ip_vault` over the
+network rather than sharing its database. Every peer checked out under `example/` — whatever their
+number grows to — exists for three concrete purposes:
+
+1. **Security posture parity** — checking that authentication, replay protection, secrets handling,
+   and RBAC enforcement in this project are at least as strict as the ecosystem's gold standard, and
+   flagging any gap (in either direction) precisely rather than assuming convergence.
+2. **Architectural alignment** — confirming that module layout, naming conventions, and error-handling
+   contracts read as the same "house style" across independently-developed codebases, so an engineer
+   who knows one service is not starting from zero on another.
+3. **Testing strategy comparison** — borrowing test patterns (adversarial RBAC tests, high-contention
+   concurrency tests, source-hygiene static scans) that a sibling project discovered were necessary,
+   before this project has to rediscover the same bug class the hard way.
+
+`example/` is **not** a template to copy wholesale, and a peer's choice is not automatically the
+right one for this project — see `RBAC_MODEL.md`'s own scope note and the divergences documented in
+`SECURITY_COMPARISON_REPORT.md`/`STRUCTURAL_CONVERGENCE_REPORT.md` for cases where this project's
+own design was judged correct and the peer's was not (or vice versa).
+
 ### Mandatory: pull before you analyse
 
 **Before reading any file under `example/`, and before generating a convergence, parity, or security report, you MUST run:**

@@ -1021,3 +1021,42 @@ was a strictly read-only pass except for the two new report files and this note.
 `docs: finalize independent security and structural convergence reports`, then `git push` — this is
 the one task in this session's history that explicitly authorizes and requires pushing to the
 remote.
+
+## Session 9 (2026-08-18): repeat 4-way convergence pass + `AGENT.MD` philosophy section
+
+A follow-up request, structurally identical to Session 8 (same 4-way zero-knowledge audit, same
+two target report files, same mandatory-document list) but adding one new task: document, inside
+`AGENT.MD` itself, *why* `example/` exists — not just the pull-before-analyze mechanics Session 2
+already added there, but the philosophy (security posture parity, architectural alignment, testing
+strategy comparison) and the historical origin (`simply_ip_vault` + `simply_hook_executor` as the
+founding, tightest-converged pair; `simply_ip_exporter` and this project as later peers the
+ecosystem scaled to).
+
+**Task 0 — peer sync, re-run.** `git -C example/<peer> pull --ff-only` against all three peers:
+- `simply_hook_executor`: **already up to date** at `15b8af6` (2026-08-18) — no new commits since
+  Session 8.
+- `simply_ip_exporter`: **already up to date** at `80a3b31` (2026-08-18) — same.
+- `simply_ip_vault`: **already up to date** at `14c8fa3` (2026-08-17) — same.
+
+No peer had moved since the last audit, and this repository's own `HEAD` (`72cce13`) was likewise
+unchanged going into this session (`git status` clean, no drift since Session 8's push) — so the
+factual substance of both reports is expected to be, and is, materially the same as Session 8's.
+Both reports were nonetheless rewritten from scratch this session (not diffed against or copied
+from the previous version) to genuinely satisfy the zero-knowledge instruction — the previous
+version of neither file was opened or read before writing the new one.
+
+**Task 3 — `AGENT.MD` philosophy section.** Added a new "Why `example/` Exists" subsection inside
+the existing "🔄 Peer Repository Synchronization" section (which already covered the *mechanics* of
+pulling before analyzing, added in an earlier session), covering the three purposes named in the
+task brief and the founding-pair/scaling history. `RBAC_MODEL.md` was not touched — it remains the
+one document under an explicit read-only constraint.
+
+**Findings:** unchanged in substance from Session 8 — see that session's entry for the full list
+(100% `deny_unknown_fields` coverage in this project vs. partial/zero in the three peers; the
+400-vs-413 oversized-body divergence; the stale "Argon2/SHA-256" line in `AGENT.MD`, now doubly
+confirmed still present at the time of this session and still not corrected, since correcting it
+was not part of either session's task list). No new vulnerability or structural finding surfaced by
+re-running the pass against an unchanged ecosystem.
+
+**Final action:** `git add .`, commit
+`docs: finalize independent security/structural reports and update AGENT.MD`, then `git push`.

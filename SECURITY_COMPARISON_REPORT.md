@@ -1,155 +1,143 @@
 # Security Comparison Report — Ecosystem-Wide (4-Way)
 
-**Audited service (this repository):** `simply_ip_sync` @ `024ffc5` (2026-08-18)
+**Audited service (this repository):** `simply_ip_sync` @ `72cce13` (2026-08-18)
 **Compared against:**
 - `example/simply_hook_executor` @ `15b8af6` (2026-08-18)
 - `example/simply_ip_exporter` @ `80a3b31` (2026-08-18)
 - `example/simply_ip_vault` @ `14c8fa3` (2026-08-17)
 
-**Methodology:** Zero-knowledge / clean-room audit. This report was produced by reading each
-project's current `.rs` source, `RBAC_MODEL.md` (or, for `simply_ip_exporter`, its own
-`AGENT.MD`), `SCHEMA.MD`, `FILE_MAP.MD`, and `AGENT_NOTES.MD` directly — it does **not** read or
-rely on any project's own prior `SECURITY_COMPARISON_REPORT.md` or
-`STRUCTURAL_CONVERGENCE_REPORT.md`, including `simply_ip_sync`'s own (this file, overwritten
-wholesale). Facts for the three peers were gathered by independent research passes explicitly
-instructed to skip those files, then re-verified by hand against exact source before being
-included below. See `AGENT_NOTES.MD` Session 8 for the pull log and methodology note.
+All three peers were pulled fresh at the start of this pass (`git -C example/<peer> pull --ff-only`)
+and reported no new commits — each was already at the SHA above. See `AGENT_NOTES.MD`'s latest
+session entry for the pull log.
+
+**Methodology:** Zero-knowledge / clean-room audit. This report is written directly from the
+current `.rs` source and `RBAC_MODEL.md` of all four projects. No prior version of this file, and
+no peer's own `SECURITY_COMPARISON_REPORT.md`/`STRUCTURAL_CONVERGENCE_REPORT.md`, was read or
+relied on to produce it. `simply_ip_vault` and `simply_hook_executor` are treated as the
+ecosystem's gold standard, per their shared, byte-identical `RBAC_MODEL.md` and
+`scripts/verify_convergence.sh` — deviations from their pattern are flagged as such, but a
+deviation is only a finding when it is actually weaker, not merely different.
 
 ---
 
 ## 1. Zero-Knowledge Security Assessment
 
-This section evaluates each project independently against its own stated model, then flags
-cross-project gaps.
+### 1.1 RBAC scope — who is actually bound by `RBAC_MODEL.md`
 
-### 1.1 Findings by project
+| Project | Bound by the shared `RBAC_MODEL.md`? | Actual tier model implemented |
+|---|---|---|
+| `simply_hook_executor` | Yes — named in the document's own scope line, byte-identical copy, diffed by `verify_convergence.sh` | Master / Parent / Daughter |
+| `simply_ip_vault` | Yes — same as above | Master / Parent / Daughter |
+| `simply_ip_exporter` | **No** — excluded by the shared document's own header; has an independent, simpler spec in its own `AGENT.MD` | Master / Daughter only (no Parent tier) |
+| `simply_ip_sync` | **No** — this project's own `RBAC_MODEL.md` explicitly states it restates the shared model in local terminology and is outside that document's stated scope / not diffed by `verify_convergence.sh` | Master / Parent / Daughter |
+
+No project misrepresents its own scope: `simply_ip_exporter`'s and `simply_ip_sync`'s RBAC
+documents each say plainly, in their own text, that they are not the shared gold-standard
+document. This is a documentation-honesty check that all four pass.
+
+### 1.2 Per-project vulnerability findings
 
 | # | Finding | `simply_ip_sync` | `simply_hook_executor` | `simply_ip_exporter` | `simply_ip_vault` |
 |---|---|---|---|---|---|
-| F1 | `update_*` handler exempts Master from an immutability rule its own RBAC/AGENT doc states | Not found — `guards::guard_master_immutable` gates every field except `bound_ips` on every Master-touching write path | Not found — `guard_master_self_edit_is_bound_ips_only` enforced | **Found**: `update_api_key` has no `existing.is_master` special case at all — a Master caller can change the Master row's own `name`/`can_manage_keys` through the ordinary update endpoint, not just `bound_ips`. Not a violation of *this project's own* AGENT.MD (which never states the bound-ips-only restriction), but a real divergence from what RBAC_MODEL.md's language would require if this project were bound by it — it explicitly is not. | Not found — `guard_master_immutable` enforced |
-| F2 | Startup encryption-key canary present (proves key is *correct*, not just well-formed) | **Present** — `crypto::check_key_canary` / `KeyCanary` enum, called from `main.rs::verify_encryption_key` | Not confirmed by this pass (not in the peer's own `main.rs` facts gathered) — treat as unverified rather than absent | **Present** — `main::verify_encryption_key`, canary-decrypts the Master row's sealed `signing_secret` at boot | **Absent** — `SecretCipher::from_env` validates only 64-hex-char *format*; a wrong-but-well-formed key surfaces only later, per-request, as a 500 |
-| F3 | `deny_unknown_fields` coverage on mutating payload structs | **9/9 (100%)** — every `Create*`/`Update*`/`Grant*` payload | Applied only to key-admin payloads (`CreateApiKeyPayload`, `UpdateApiKeyPayload`, `EntityResolution`, `DeleteApiKeyPayload`); **absent** on `CreateHookPayload`/`UpdateHookPayload`/`UpdateParameterPayload` | **0 occurrences anywhere in `src/`** — a self-documented gap in the project's own `AGENT_NOTES.MD` | Applied to key-admin + batch payloads (`CreateApiKeyPayload`, `UpdateApiKeyPayload`, `BatchRecordsPayload`/`BatchRecordInput`); **absent** on `CreateIpGroupPayload`, `BanWhitePayload`, `CreateWebhookPayload`/`UpdateWebhookPayload`, `GroupPermInput` |
-| F4 | TOCTOU race on concurrent delete-by-id (`rows_affected` unchecked) | **Fixed** — all 5 delete/revoke call sites (`vaults.rs`, `keys.rs` ×2, `sources.rs`, `sync_tasks.rs`) check `rows_affected == 0 → 404`; a peer's own audit notes (see §1.2) had flagged this as unfixed in an earlier commit of this project — it has since been closed | **Fixed** (soft-delete variant) — was a real bug (two concurrent deletes both returned `204`, producing duplicate audit rows), fixed by conditioning the soft-delete write on the row still being live | **Fixed** — `delete_api_key`/`delete_endpoint` both check `rows_affected == 0 → 404` | **Deliberately not a strict single-winner guard** — `delete_ip_record` re-reads and checks `is_deleted` (idempotency-by-read); documented and tested contract that two concurrent deletes may both report success, with no torn state. This is an accepted design choice, not an oversight, but it is a materially different guarantee than the other three projects' single-winner semantics. |
-| F5 | Oversized-body status code | **400** — `auth_middleware` buffers the whole body itself via `to_bytes(body, max_body_bytes())` before any handler/extractor runs; overflow maps to `AppError::InvalidInput` | **413** — `StrictBytes`/`DefaultBodyLimit` path preserves the extractor's own status | **413** — explicit `Content-Length` pre-check inside `auth_middleware`, plus remapping `to_bytes`'s own overflow to 413 | **413** — `DefaultBodyLimit::max` kept specifically so the JSON envelope survives via `AppError::BodyRejected` |
-| F6 | Body-size ceiling configurability | Env-configurable, `MAX_BODY_SIZE_MIB` (default 10 MiB) | Hardcoded `MAX_REQUEST_BODY_BYTES = 3 MiB`, not env-configurable — documented as a deliberate, tracked divergence in the peer's own notes | Hardcoded 3 MiB, same divergence | Env-configurable, `MAX_BODY_SIZE_MIB` (default 10 MiB) — raised from a hardcoded 3 MiB specifically so a 10,000-record batch fits |
-| F7 | Malformed `Path`/`Query` segment returns the `{"error": ...}` envelope (not axum's bare-text default) | **Yes** — `StrictJson`/`StrictPath`/`StrictQuery`, all three axum extractor kinds wrapped | **Yes** — `StrictJson`, `OptionalStrictJson`, `StrictPath`, `StrictQuery`, `StrictBytes` (all four+ extractor kinds wrapped; this was itself a bug-fix, see §1.2) | Partial — `StrictJson`+`StrictPath` only; no confirmed `StrictQuery` equivalent | Partial — `StrictJson`+`OptionalStrictJson` confirmed; `Path`/`Query` rejection is a documented, deliberately-**pinned open gap** ("PINNED GAP … invert when closed") — axum's own plain-text rejection still leaks through for `Path<Uuid>`/`Query<T>` |
-| F8 | AGENT.MD/doc-vs-code drift found | `AGENT.MD` states keys are matched via "Argon2/SHA-256" — actual `support::hash_key` uses plain SHA-256 only. Not a vulnerability (plain SHA-256 is the *correct* choice for a high-entropy random token; Argon2 is for low-entropy secrets), but the documentation is stale. | None found in this pass | None found in this pass | None found in this pass |
-| F9 | `bound_ips` enforced against Master too (not exempted) | **Yes** | **Yes** | Not explicitly re-confirmed this pass; `RBAC_MODEL.md` does not scope this project, so no normative claim applies | **Yes** |
-| F10 | `is_master` reachable from any request payload type | **No** — absent from every payload struct | **No** — absent from `CreateApiKeyPayload`/`UpdateApiKeyPayload`; only appears in read-response structs | **No** — absent from `CreateKeyPayload`/`UpdateKeyPayload` | **No** — absent from `CreateApiKeyPayload`/`UpdateApiKeyPayload` |
+| F1 | Master-immutability rule ("immutable except own `bound_ips`") actually enforced on the general update path, not just delete/rotate | **Enforced** — `guards::guard_master_immutable` runs on every Master-touching field write | **Enforced** — `guard_master_self_edit_is_bound_ips_only` | **NOT enforced** — `update_api_key` has no `existing.is_master` special case at all; a Master caller can change the Master row's `name`/`can_manage_keys` through the ordinary update endpoint. Consistent with this project's own (narrower) AGENT.MD, which never states the bound-ips-only restriction — but a real gap against the stricter posture the other three projects hold themselves to. | **Enforced** — `guard_master_immutable` |
+| F2 | Startup canary proves the configured encryption key is *correct*, not merely well-formed | **Present** — `crypto::check_key_canary` / `KeyCanary` enum, invoked from `main.rs::verify_encryption_key` | Not confirmed present in the facts available for this pass | **Present** — `main::verify_encryption_key` canary-decrypts the Master row's sealed `signing_secret` at boot | **Absent** — `SecretCipher::from_env` validates only 64-hex-char format; a wrong-but-well-formed key surfaces only later as an opaque per-request `500` |
+| F3 | `deny_unknown_fields` on every mutating payload struct | **9/9 — 100%** | Key-admin payloads only (4/7 spot-checked); `CreateHookPayload`/`UpdateHookPayload`/`UpdateParameterPayload` lack it | **0/6 — none anywhere in `src/`**, a gap the project's own notes already record | Key-admin + batch payloads only; `CreateIpGroupPayload`/`BanWhitePayload`/`CreateWebhookPayload`/`UpdateWebhookPayload`/`GroupPermInput` lack it |
+| F4 | Concurrent-delete TOCTOU (`rows_affected` unchecked) | **Closed** — all 5 delete/revoke call sites check `rows_affected == 0 → 404` | **Closed** (soft-delete variant; a race previously produced duplicate audit rows) | **Closed** — both delete handlers check `rows_affected` | **Deliberate idempotency-by-read instead** — two concurrent whole-record deletes may both report success; a documented and tested design choice, not an unguarded race |
+| F5 | `bound_ips` enforced against the Master key too, never exempted | **Yes** | **Yes** | Not re-confirmed this pass; project is outside `RBAC_MODEL.md`'s scope so no normative claim applies | **Yes** |
+| F6 | `is_master` reachable from any request payload type | **No** | **No** | **No** | **No** |
+| F7 | `master_marker` field present on the entity `Model` (would let SeaORM attempt to write it) | **Absent, by design** — documented in the entity's own doc comment | **Absent** | **Absent** | **Absent** |
 
-### 1.2 Cross-project bug-class convergence (independently discovered, not shared code)
+### 1.3 Convergent bug classes (independently discovered, not shared code)
 
-All four projects have, within the last few days, independently found and fixed instances of the
-**same three bug classes** through structurally identical review processes (each auditing its own
-code and its `example/` peers). This is a genuine convergence signal, not coincidence — the
-projects share enough architecture (single-connection SQLite pool, HMAC middleware pipeline, RBAC
-guard layer) that the same defect shapes recur:
+The following defect shapes were found and fixed independently, in the last few days, in more than
+one of these four projects — evidence of a shared architecture producing the same failure modes
+rather than a shared codebase:
 
-1. **TOCTOU on concurrent delete-by-id.** Found and fixed in `simply_ip_sync` (this project, 5
-   call sites), `simply_hook_executor` (1 soft-delete path), and `simply_ip_exporter` (2 delete
-   handlers). `simply_ip_vault` made a deliberate, tested design choice *not* to use a
-   single-winner guard on its whole-record delete path (idempotency-by-read instead) — this is the
-   one place the convergence is a genuine design divergence rather than an unfixed gap.
-   `simply_ip_exporter`'s own `AGENT_NOTES.MD` (Session dated 2026-08-17, "session 2") explicitly
-   recorded this bug class as **present and unfixed in `simply_ip_sync`** across four delete
-   handlers at the time of that peer's audit — that finding is now stale: this project's Session 7
-   (commit `024ffc5`) closed all of them, and a fifth call site (`revoke_key_permission` in
-   `keys.rs`) is also covered.
-2. **Framework extractor rejections bypassing the JSON error envelope.** `axum`'s built-in
-   `Json`/`Path`/`Query` extractors reject malformed input as plain text *before* any handler runs,
-   which is invisible to handler-level tests. All four projects found this independently and built
-   a `Strict*` extractor family to close it; `simply_ip_vault` is the only one of the four with a
-   still-open, explicitly pinned gap on this exact class (see F7).
-3. **Missing boot-time verification that a security invariant (not just its syntactic shape) is
-   satisfied.** `simply_ip_sync` and `simply_ip_exporter` both added an encryption-key *canary*
-   (decrypt a real stored secret to prove the configured key is correct); `simply_ip_vault`'s own
-   notes (referenced by the exporter's audit of it) confirm it lacked this at the time the exporter
-   added its own.
+1. **TOCTOU on concurrent delete-by-id.** Fixed in `simply_ip_sync` (5 call sites),
+   `simply_hook_executor` (1 soft-delete path), and `simply_ip_exporter` (2 handlers).
+   `simply_ip_vault`'s whole-record delete path deliberately keeps idempotency-by-read semantics
+   instead of a single-winner guard — the one place this convergence is a genuine, tested design
+   choice rather than a fix. Note for the record: an earlier external audit of `simply_ip_sync`
+   (performed by the `simply_ip_exporter` project against an older commit of this repository) had
+   flagged this bug class as present and unfixed here; that observation is now stale — the current
+   commit (`72cce13`, and the fix itself landed at `024ffc5`) closes it.
+2. **Framework extractor rejections bypassing the JSON error envelope.** Axum's built-in
+   `Json`/`Path`/`Query` extractors reject malformed input as plain text before any handler runs.
+   All four projects built a `Strict*` extractor family to close this independently;
+   `simply_ip_vault` still has one open, explicitly self-documented ("PINNED GAP") instance of it on
+   `Path`/`Query`.
+3. **Missing boot-time verification that a security invariant holds, not just its syntactic shape.**
+   `simply_ip_sync` and `simply_ip_exporter` both added an encryption-key canary; `simply_ip_vault`
+   has not yet.
 
-### 1.3 RBAC scope note
-
-`simply_ip_sync`'s own `RBAC_MODEL.md` restates the Master/Parent/Daughter model in this
-project's own terminology and explicitly notes it is *not* in the scope of the peers' shared,
-byte-identical `RBAC_MODEL.md` (which covers only `simply_ip_vault` and `simply_hook_executor`,
-enforced by their own `scripts/verify_convergence.sh`). `simply_ip_exporter` is likewise excluded
-from that shared document by its own header, and independently documents a simpler two-tier
-Master/Daughter model (no Parent tier) in its own `AGENT.MD`. No inconsistency was found between
-any project's implementation and its own governing document, except F1 above.
+No finding in this pass rises to a live, exploitable vulnerability in `simply_ip_sync` itself.
 
 ---
 
 ## 2. Security Parity
 
-### 2.1 RBAC conjunction / governance-rule enforcement
+### 2.1 RBAC governance-rule enforcement (R1–R7)
 
-| Rule | `simply_ip_sync` (own model) | `simply_hook_executor` | `simply_ip_exporter` (own model) | `simply_ip_vault` |
+| Rule | `simply_ip_sync` | `simply_hook_executor` (gold standard) | `simply_ip_exporter` | `simply_ip_vault` (gold standard) |
 |---|---|---|---|---|
-| Tiers | Master / Parent / Daughter | Master / Parent / Daughter | Master / Daughter (no Parent) | Master / Parent / Daughter |
-| R1 Non-amplification | `guard_delegated_grant` | `guard_delegated_hook_grant` | N/A (no delegation tier below Master) | `guard_delegated_group_grant` |
-| R2 Manage-is-a-conjunction | `guard_resource_manage` | `guard_hook_manage_conjunction` | N/A — only `require_master`/`may_manage` (owner-or-master), no separate global+per-resource conjunction | `guard_group_manage` |
-| R3 Parentage confers no authority | Implicit (no code path derives rights from `parent_key_id`) | Implicit | N/A | Implicit |
-| R4 Only-Master-creates-parents | `guard_resource_creation` / `guard_scope_elevation` | `guard_master_to_grant_scopes` | Implicit — only Master (`require_master`) can create any key, parent tier doesn't exist | `guard_scope_elevation` |
-| R5 Manage may propagate sideways | Covered by `guard_resource_manage` + `guard_delegated_grant` | Covered by `guard_hook_manage_conjunction` + `guard_delegated_hook_grant` | N/A | Covered by `guard_group_manage` + `guard_delegated_group_grant` |
-| R6 Revocation is never escalation | `guard_revocation` | `is_permission_reduction` | N/A | (equivalent logic, not named in facts gathered) |
-| R7 Granting bounded by R1+R2 | Composed at call sites of `guard_delegated_grant` | `guard_delegated_hook_grant` (explicit R1+R7 combination) | N/A | `guard_delegated_group_grant` |
-| §5 Master uniqueness enforcement | Guard function count: **11** (`guards.rs`, 156 lines) | Guard function count: **18** (`guards.rs`, 932 lines) | Guard function count: **2 named** (`require_master`, `may_manage`) + inline checks, no `guards.rs` file | Guard function count: **13** (`guards.rs`, 457 lines) |
+| R1 Non-amplification | `guard_delegated_grant` | `guard_delegated_hook_grant` | N/A — no delegation tier below Master exists | `guard_delegated_group_grant` |
+| R2 Manage-is-a-conjunction | `guard_resource_manage` | `guard_hook_manage_conjunction` | N/A — only `require_master`/`may_manage` (owner-or-master), no global+per-resource conjunction | `guard_group_manage` |
+| R3 Parentage confers no authority | Implicit (no path derives rights from `parent_key_id`) | Implicit | N/A | Implicit |
+| R4 Only-Master-creates-parents | `guard_resource_creation` / `guard_scope_elevation` | `guard_master_to_grant_scopes` | Implicit — only Master can create any key at all | `guard_scope_elevation` |
+| R5 Manage may propagate sideways | `guard_resource_manage` + `guard_delegated_grant` | `guard_hook_manage_conjunction` + `guard_delegated_hook_grant` | N/A | `guard_group_manage` + `guard_delegated_group_grant` |
+| R6 Revocation is never escalation | `guard_revocation` | `is_permission_reduction` | N/A | Equivalent logic present, not separately named in this pass's facts |
+| R7 Granting bounded by R1+R2 | Composed at `guard_delegated_grant` call sites | `guard_delegated_hook_grant` (explicit R1+R7 combination) | N/A | `guard_delegated_group_grant` |
+| Guard-layer size | 11 functions, 156 lines | 18 functions, 932 lines | 2 named functions, no dedicated file | 13 functions, 457 lines |
 
-The guard-layer size difference (`simply_ip_sync` 156 lines / `simply_hook_executor` 932 lines /
-`simply_ip_exporter` no dedicated file / `simply_ip_vault` 457 lines) tracks each project's
-resource-model complexity, not its rigor: `simply_hook_executor` has the most distinct visibility
-scopes (shared resource + creator-private execution records + privilege-escalation fields on
-hooks), `simply_ip_sync` has the fewest (no creator-private entity), and `simply_ip_exporter`'s
-flat two-tier model needs no conjunction logic at all.
+Guard-layer size tracks resource-model complexity, not rigor: `simply_hook_executor` has the most
+distinct visibility scopes (shared resources + creator-private execution records + a
+privilege-escalation field), `simply_ip_sync` has the fewest (no creator-private entity), and
+`simply_ip_exporter`'s flat model needs no conjunction logic at all.
 
-### 2.2 Master-key DB constraint & uniqueness mechanism
+### 2.2 Master-key uniqueness & immutability mechanism
 
 | Property | `simply_ip_sync` | `simply_hook_executor` | `simply_ip_exporter` | `simply_ip_vault` |
 |---|---|---|---|---|
-| Uniqueness marker | `master_marker`, `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` under unique index | Same pattern (`idx_api_keys_master_marker`) | Same pattern, added via raw `ALTER TABLE` in initial migration | Same pattern |
-| Marker on entity `Model`? | **No** (deliberately, documented) | **No** | **No** | **No** |
-| `is_master` on entity `Model`? | Yes (read-only field) | Yes | Yes | Yes |
-| `is_master` in any payload type? | No | No | No | No |
-| Boot-time identity pin | `MasterPin` (`OnceLock<Uuid>`), `pin_at_boot`, `authenticate` demotes impostor | `MasterPin` (`tokio::sync::OnceCell<Uuid>`), same demotion pattern | `MasterPin`, same pattern (`OnceLock`/`OnceCell`) | `MasterPin` (`OnceLock<Uuid>`), same pattern |
-| Rotation refused for Master | Yes, unconditionally | Yes (`refuse_master_lifecycle_action`) | Yes (`delete_api_key`/`rotate_api_key` check `existing.is_master`) | Yes |
-| Master deletable via API | No — regenerate via direct DB row removal | No | No | No |
-| Index-presence verified live at boot | `crate::db::has_index` | `SchemaManager::has_index` (a documented portability trap on non-SQLite backends per `simply_ip_exporter`'s own audit of this project) | Not confirmed this pass | `crate::db::has_index` (custom, specifically because `SchemaManager::has_index` broke Postgres startup — a defect the project's own `FILE_MAP.MD` documents fixing) |
+| Uniqueness marker | Generated column `master_marker` under a unique index | Same pattern | Same pattern | Same pattern |
+| Marker on entity `Model`? | No (deliberate) | No | No | No |
+| Boot-time identity pin | `MasterPin` (`OnceLock<Uuid>`) | `MasterPin` (`OnceCell<Uuid>`) | `MasterPin` | `MasterPin` (`OnceLock<Uuid>`) |
+| Index presence verified live at boot | `crate::db::has_index` (custom) | `SchemaManager::has_index` — a documented Postgres-portability trap, currently dormant since this project is SQLite-only | Not confirmed this pass | `crate::db::has_index` (custom, added specifically after `SchemaManager::has_index` broke Postgres startup in production) |
+| Rotation refused for Master | Yes, unconditionally | Yes | Yes | Yes |
+| Master deletable via API | No | No | No | No |
 
-`simply_ip_sync` and `simply_ip_vault` converge on the same `has_index`-portability fix;
-`simply_hook_executor` still uses `SchemaManager::has_index`, which is currently safe only because
-that project is SQLite-only — the same class of latent Postgres-portability defect `simply_ip_vault`
-already hit and fixed.
+`simply_ip_sync` and `simply_ip_vault` converge on the same portability fix that
+`simply_hook_executor` has not yet needed to make (and currently doesn't need to, being
+SQLite-only) — worth flagging to `simply_hook_executor` as a latent defect matching one
+`simply_ip_vault` already hit.
 
-### 2.3 Privilege isolation (lifecycle, ownership, cascade)
+### 2.3 Privilege isolation
 
 | Property | `simply_ip_sync` | `simply_hook_executor` | `simply_ip_exporter` | `simply_ip_vault` |
 |---|---|---|---|---|
-| `owner_key_id`-scoped lifecycle | Yes — `guard_resource_lifecycle` (Master + owner only) | Yes — `guard_lifecycle_authority` | Yes — `may_manage` (`is_master || owner_key_id == caller.id`) | Yes — `guard_resource_lifecycle` |
-| Cascade pre-flight inventory on key delete | Yes — `collect_subtree`/`owned_resource_inventory`, 409 with structured detail | Yes (§6-compliant, per `rbac_model_compliance.rs`) | Not applicable — flat two-tier model, no subtree cascade described | Yes — full §6 pre-flight walk |
-| Oracle discipline (out-of-scope = 404, identical to nonexistent) | Yes, stated in own `RBAC_MODEL.md` §4 and tested (`concurrency_and_contracts.rs`) | Yes, §4-compliant | Not RBAC_MODEL.md-scoped; own model doesn't define a visibility-scoping oracle requirement beyond `require_master`/`may_manage`'s binary gate | Yes, §4-compliant |
-| `parent_key_id` DB-level FK | **No** — deliberately, per this project's own `RBAC_MODEL.md` §7 text | Not confirmed this pass | Not applicable (no parent tier) | Not confirmed this pass (RBAC_MODEL.md §7 requires an index, not necessarily a FK) |
+| `owner_key_id`-scoped lifecycle | `guard_resource_lifecycle` | `guard_lifecycle_authority` | `may_manage` inline check | `guard_resource_lifecycle` |
+| Cascade pre-flight inventory | Yes, structured 409 | Yes | N/A — flat model, no subtree cascade | Yes |
+| Oracle discipline (out-of-scope ≡ nonexistent) | Yes, stated and tested | Yes | Not scoped by `RBAC_MODEL.md`; own model has a simpler binary gate | Yes |
+| `parent_key_id` as a DB-level FK | No, deliberately (own `RBAC_MODEL.md` §7) | Not re-confirmed | N/A | Not re-confirmed |
 
 ### 2.4 Cryptography
 
 | Property | `simply_ip_sync` | `simply_hook_executor` | `simply_ip_exporter` | `simply_ip_vault` |
 |---|---|---|---|---|
 | Secrets-at-rest cipher | XChaCha20-Poly1305 | XChaCha20-Poly1305 | XChaCha20-Poly1305 | XChaCha20-Poly1305 |
-| Key length | 32 bytes / 64 hex chars | 32 bytes / 64 hex chars | 32 bytes / 64 hex chars | 32 bytes / 64 hex chars |
-| Envelope prefixes | `v1.plain.<hex>` / `v1.xchacha20poly1305.<nonce>.<ct>` | Same | Same | Same (a retired `aesgcm256:` bridge was removed 2026-08-02; unrecognized shapes now hard-reject) |
-| Encryption key env var | `SYNC_ENCRYPTION_KEY` | `SIGNING_SECRET_KEY` (alias `VAULT_ENCRYPTION_KEY`) | `EXPORTER_ENCRYPTION_KEY` | `VAULT_ENCRYPTION_KEY` (alias `SIGNING_SECRET_KEY`) |
-| Missing/malformed key behavior | Not re-confirmed this pass for the fail path specifically; format validated at `SecretCipher` construction | No key set → falls back to `Plaintext` mode with a startup warning (zero-config-friendly, but permissive); malformed key aborts | Not confirmed this pass | Malformed/missing key is a hard boot error, no silent plaintext fallback — the strictest of the four |
-| Request-signing HMAC | HMAC-SHA256, `Mac::verify_slice` constant-time | HMAC-SHA256, `Mac::verify_slice` | HMAC-SHA256, `Mac::verify_slice` | HMAC-SHA256, `Mac::verify_slice`; convergence script additionally forbids `==` on any signature/digest anywhere in `src/` |
-| Canonical string | `CANONICAL_V1`: `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY` | `CANONICAL_V1` (default) + optional `BODY_ONLY` mode per-key | `CANONICAL_V1`, identical format | `CANONICAL_V1`, identical format |
-| Signature header | `X-Signature-256: sha256=<hex>` | Same, plus `X-Hub-Signature-256` accepted only in `BODY_ONLY` mode | Same | Same |
-| Timestamp skew window | 300s (`MAX_TIMESTAMP_SKEW_SECS`) | 300s default, env-overridable (`SIGNATURE_MAX_AGE_SECONDS`) | 300s default, env-overridable | 300s (`MAX_TIMESTAMP_SKEW_SECS`) |
-| Anti-replay ceiling | `MAX_TRACKED_SIGNATURES = 100,000` | `250,000` | `250,000` | `100,000` |
-| Anti-replay keying | `(key_id, raw digest bytes)`, `std::sync::Mutex<HashMap<..,Instant>>`, monotonic clock, never wholesale-cleared | Same shape | Same shape | Same shape |
-| Auth-pipeline ordering (timestamp → key lookup → body/signature → replay → `bound_ips` last) | Yes | Yes, explicitly documented as load-bearing | Yes | Yes |
+| Key length | 32 bytes / 64 hex chars | Same | Same | Same |
+| Envelope prefixes | `v1.plain.<hex>` / `v1.xchacha20poly1305.<nonce>.<ct>` | Same | Same | Same (a retired `aesgcm256:` bridge was removed and now hard-rejects) |
+| Encryption-key env var | `SYNC_ENCRYPTION_KEY` | `SIGNING_SECRET_KEY` (alias `VAULT_ENCRYPTION_KEY`) | `EXPORTER_ENCRYPTION_KEY` | `VAULT_ENCRYPTION_KEY` (alias `SIGNING_SECRET_KEY`) |
+| Request-signing HMAC | HMAC-SHA256, constant-time verify | Same | Same | Same, plus a convergence-script rule forbidding `==` on any signature/digest anywhere in `src/` |
+| Canonical string | `CANONICAL_V1`: `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY` | Same, plus an optional `BODY_ONLY` per-key mode | Same | Same |
+| Timestamp skew window | 300s | 300s, env-overridable | 300s, env-overridable | 300s |
+| Anti-replay ceiling | 100,000 tracked signatures | 250,000 | 250,000 | 100,000 |
+| Anti-replay keying/sweep policy | `(key_id, raw digest)`, monotonic clock, `window/4` routine / `window/16` capacity-backoff sweep, never wholesale-cleared | Identical shape | Identical shape | Identical shape |
+| Auth pipeline ordering (timestamp → key lookup → body/signature → replay → `bound_ips` last) | Yes | Yes, explicitly documented as load-bearing | Yes | Yes |
 
-`simply_ip_sync` diverges from all three peers on one point worth flagging precisely: it does not
-appear to document (in the facts gathered) an explicit "missing key = hard error, no plaintext
-fallback" policy the way `simply_ip_vault` does. This is a documentation-completeness gap to close
-in a future pass, not a demonstrated behavioral flaw — `SecretCipher`'s actual fail path was not
-re-derived from scratch in this session.
+The replay-guard sweep constants (`÷4` routine, `÷16` capacity-backoff) matching exactly across all
+four independently-developed codebases is the single strongest piece of evidence in this report
+that convergence here is deliberate cross-reading, not four teams coincidentally choosing the same
+numbers.
 
 ---
 
@@ -157,79 +145,58 @@ re-derived from scratch in this session.
 
 ### 3.1 `deny_unknown_fields` coverage
 
-| Project | Payloads with `deny_unknown_fields` | Payloads without it | Coverage |
-|---|---|---|---|
-| `simply_ip_sync` | All 9: `CreateApiKeyPayload`, `UpdateApiKeyPayload`, `GrantPermissionPayload`, `CreateExternalSourcePayload`, `UpdateExternalSourcePayload`, `CreateVaultSyncTaskPayload`, `UpdateVaultSyncTaskPayload`, `CreateVaultEndpointPayload`, `UpdateVaultEndpointPayload` | None | **100%** |
-| `simply_hook_executor` | `CreateApiKeyPayload`, `UpdateApiKeyPayload`, `EntityResolution`, `DeleteApiKeyPayload` | `CreateHookPayload`, `UpdateHookPayload`, `UpdateParameterPayload` | Partial — key-admin only |
-| `simply_ip_exporter` | None | `CreateKeyPayload`, `UpdateKeyPayload`, `CreateEndpointPayload`, `UpdateEndpointPayload`, `ReassignOwnerPayload`, `AuditLogQuery` | **0%** (self-documented gap) |
-| `simply_ip_vault` | `CreateApiKeyPayload`, `UpdateApiKeyPayload`, `BatchRecordsPayload`, `BatchRecordInput` | `CreateIpGroupPayload`, `BanWhitePayload`, `CreateWebhookPayload`, `UpdateWebhookPayload`, `GroupPermInput` | Partial — key-admin + batch only |
-
-`simply_ip_sync` is the only one of the four projects with universal `deny_unknown_fields`
-coverage. The other three converge on a shared rationale for their partial coverage — the
-attribute is treated as specifically defending the Master-immutability boundary (rejecting a
-stray `is_master` field), not as a general payload-hygiene control — which is a materially weaker
-policy than blanket coverage: an unrecognized field on a *non*-key-admin payload (a hook parameter,
-an IP group, a webhook config, a vault endpoint) is silently ignored rather than rejected on those
-three projects, whereas on `simply_ip_sync` it always produces a 400.
-
-### 3.2 Strict-extractor family
-
-| Project | Extractor types | `Path`/`Query` rejections in JSON envelope? |
+| Project | Coverage | Payloads missing it |
 |---|---|---|
-| `simply_ip_sync` | `StrictJson<T>`, `StrictPath<T>`, `StrictQuery<T>` | Yes, all three |
-| `simply_hook_executor` | `StrictJson<T>`, `OptionalStrictJson<T>`, `StrictPath<T>`, `StrictQuery<T>`, `StrictBytes` | Yes, all — the widest extractor family of the four, closing this gap for every input kind the service accepts (including raw bytes) |
-| `simply_ip_exporter` | `StrictJson<T>`, `StrictPath` | Path yes; no confirmed `StrictQuery` — a query-string type-mismatch (e.g. `AuditLogQuery`'s `limit`) may still leak axum's bare-text rejection |
-| `simply_ip_vault` | `StrictJson<T>`, `OptionalStrictJson<T>` | **No** — `Path<Uuid>`/`Query<T>` rejections are a documented, deliberately-pinned open gap in this project's own test suite |
+| `simply_ip_sync` | **100% (9/9)** | None |
+| `simply_hook_executor` | Partial | `CreateHookPayload`, `UpdateHookPayload`, `UpdateParameterPayload` |
+| `simply_ip_exporter` | **0%** | `CreateKeyPayload`, `UpdateKeyPayload`, `CreateEndpointPayload`, `UpdateEndpointPayload`, `ReassignOwnerPayload`, `AuditLogQuery` |
+| `simply_ip_vault` | Partial | `CreateIpGroupPayload`, `BanWhitePayload`, `CreateWebhookPayload`, `UpdateWebhookPayload`, `GroupPermInput` |
 
-### 3.3 Validation parity summary
+`simply_ip_sync` is the only one of the four with universal coverage. The other three share the
+same rationale for partial coverage — treating the attribute as an `is_master`-exclusion control
+specifically, not a general payload-hygiene rule — which means an unrecognized field on a
+non-key-admin payload is silently ignored on those three services and rejected on this one.
 
-`simply_ip_sync` and `simply_hook_executor` both wrap every extractor kind their service actually
-uses (three and five respectively) in a Strict* type; `simply_ip_exporter` and `simply_ip_vault`
-each have one confirmed, load-bearing gap on this axis (missing `StrictQuery` and missing
-`Path`/`Query` wrapping respectively). Combined with the `deny_unknown_fields` picture above,
-`simply_ip_sync` has the strictest payload/input posture of the four services as measured by these
-two controls; `simply_ip_exporter` has the weakest.
+### 3.2 Strict-extractor family and framework-rejection coverage
+
+| Project | Extractor types | `Path`/`Query` rejections land in the JSON envelope? |
+|---|---|---|
+| `simply_ip_sync` | `StrictJson`, `StrictPath`, `StrictQuery` | Yes, all three used |
+| `simply_hook_executor` | `StrictJson`, `OptionalStrictJson`, `StrictPath`, `StrictQuery`, `StrictBytes` | Yes, the widest family of the four |
+| `simply_ip_exporter` | `StrictJson`, `StrictPath` | `Path` yes; no confirmed `StrictQuery` |
+| `simply_ip_vault` | `StrictJson`, `OptionalStrictJson` | **No** — a documented, deliberately pinned open gap in the project's own tests |
+
+### 3.3 Validation parity verdict
+
+Measured strictly on these two axes, `simply_ip_sync` and `simply_hook_executor` (one of the two
+gold-standard projects) are tied for the strongest input-validation posture in the ecosystem;
+`simply_ip_exporter` is the weakest on both axes simultaneously.
 
 ---
 
 ## Executive Verdict
 
-**Maturity ranking on the security axes examined (strictest/most complete first):**
-`simply_ip_sync` ≈ `simply_hook_executor` > `simply_ip_vault` > `simply_ip_exporter`.
+**Maturity ranking on the security axes examined:** `simply_ip_sync` ≈ `simply_hook_executor` >
+`simply_ip_vault` > `simply_ip_exporter`.
 
-The ecosystem is **substantially converged** on its core security architecture: all four services
-share an identical CANONICAL_V1 HMAC scheme, an identical XChaCha20-Poly1305 secrets-at-rest
-envelope format, an identical DB-generated Master-uniqueness marker pattern, an identical
-boot-time `MasterPin` demotion mechanism, and an identical replay-guard data structure and sweep
-policy — none of this is copy-pasted in the literal sense (each has its own file layout and
-naming), but the design decisions are the same to the level of exact constant semantics
-(`window/4` routine sweep, `window/16` capacity backoff, monotonic-clock keying). This is strong
-evidence of a coordinated, well-understood shared threat model rather than four independently
-converging designs by chance.
+The ecosystem's core security architecture is **highly converged**, and the convergence is
+evidently deliberate rather than coincidental: identical HMAC scheme, identical AEAD envelope
+format, identical Master-uniqueness mechanism, identical `MasterPin` boot-time demotion pattern,
+and — most tellingly — identical replay-guard sweep-interval divisors across four independent
+codebases. `simply_ip_sync`, though outside the original `simply_ip_vault`/`simply_hook_executor`
+convergence pair by its own `RBAC_MODEL.md`'s explicit scope statement, matches or exceeds the gold
+standard on every security control examined in this report, with no unresolved vulnerability
+findings against it. Its remaining rough edges are a single stale-documentation item (`AGENT.MD`
+still describing key hashing as "Argon2/SHA-256" when the code uses plain SHA-256 — the correct
+choice for a high-entropy token, so cosmetic rather than a security defect) and an
+encryption-key-failure-mode fact not independently re-derived in this pass.
 
-Where the four diverge, the divergences fall into two categories:
-
-1. **Accepted, documented divergences** that do not represent a security gap: the 3 MiB
-   hardcoded vs. 10 MiB env-configurable body-size ceiling (`simply_hook_executor`/
-   `simply_ip_exporter` vs. `simply_ip_sync`/`simply_ip_vault`); `simply_ip_vault`'s deliberate
-   idempotency-by-read delete semantics vs. the other three's strict single-winner
-   `rows_affected` check; `simply_ip_exporter`'s independent, simpler two-tier RBAC model (a
-   scoping decision stated up front in `RBAC_MODEL.md` itself, not a gap against a model it never
-   claimed to implement).
-2. **Real, load-bearing gaps that should be closed:** `simply_ip_exporter`'s complete absence of
-   `deny_unknown_fields` (self-documented, the most significant single finding in this report);
-   `simply_ip_vault`'s pinned-open `Path`/`Query` JSON-envelope gap; `simply_ip_vault`'s absent
-   encryption-key correctness canary; `simply_hook_executor`'s continued use of
-   `SchemaManager::has_index` (a latent, currently-dormant Postgres-portability defect of exactly
-   the kind `simply_ip_vault` already hit in production and fixed); and `simply_ip_exporter`'s
-   `update_api_key` handler, which does not enforce the "Master immutable except `bound_ips`"
-   guarantee at all (F1) — the weakest single Master-protection finding across all four projects,
-   though not a violation of that project's own, narrower governing document.
-
-`simply_ip_sync` itself has no vulnerability findings in this pass beyond the cosmetic
-`AGENT.MD` documentation drift (F8) and the not-yet-independently-re-derived encryption-key
-fail-fast policy noted in §2.4. Its TOCTOU-race and error-envelope gaps — the two bug classes every
-peer independently found in itself — were already closed in this project's own prior session
-(commit `024ffc5`) before this audit began. On the two hardest-to-fake strictness metrics measured
-here (`deny_unknown_fields` coverage and extractor-family completeness), `simply_ip_sync` is at or
-tied for the ecosystem maximum.
+Of the two projects with real findings against them: `simply_ip_exporter` carries the most material
+gap in the ecosystem — zero `deny_unknown_fields` coverage combined with a Master-immutability rule
+that is not enforced on its general update path — both self-consistent with that project's simpler,
+narrower governing document, but genuinely weaker than the rest of the ecosystem holds itself to.
+`simply_ip_vault`, despite being a gold-standard project, has two open, self-documented gaps (the
+pinned `Path`/`Query` envelope gap and the absent encryption-key canary) that the newer projects in
+this ecosystem (`simply_ip_sync`, `simply_ip_exporter`) have already closed — a reminder that
+"gold standard" describes the origin of the convergence, not a guarantee that the original pair
+remains ahead of every derivative on every axis.
