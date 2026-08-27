@@ -7,7 +7,10 @@
 
 use simply_ip_sync::parsers;
 
-const MASS_SCANNER_URL: &str = "https://raw.githubusercontent.com/stamparm/maltrail/master/trails/static/mass_scanner.txt";
+/// Moved upstream 2026-08: maltrail relocated this list from `trails/static/` to `data/`. The old
+/// path returns `404`, which is exactly the drift this suite exists to surface — see
+/// `AGENT_NOTES.MD` Session 14.
+const MASS_SCANNER_URL: &str = "https://raw.githubusercontent.com/stamparm/maltrail/refs/heads/master/data/mass_scanner.txt";
 const DOH_IPV4_URL: &str = "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv4.txt";
 const VPN_IPV4_URL: &str = "https://raw.githubusercontent.com/NazgulCoder/IPLists/refs/heads/main/output/vpn-ipv4.txt";
 const DOH_IPV6_URL: &str = "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv6.txt";

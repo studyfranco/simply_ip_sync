@@ -1166,7 +1166,11 @@ fi
 
 if [[ "$NETWORK_REACHABLE" -eq 1 ]]; then
     declare -A LIVE_FEEDS=(
-        ["live-mass-scanner"]="https://raw.githubusercontent.com/stamparm/maltrail/master/trails/static/mass_scanner.txt"
+        # Moved upstream 2026-08: maltrail relocated this list from `trails/static/` to `data/`,
+        # and the old path now 404s. Kept as a live fetch rather than pinned to a local fixture on
+        # purpose — the whole point of this feed is to catch the real format drifting away from
+        # what REGEX_LINE expects, which a frozen copy can never do.
+        ["live-mass-scanner"]="https://raw.githubusercontent.com/stamparm/maltrail/refs/heads/master/data/mass_scanner.txt"
         ["live-doh-ipv4"]="https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv4.txt"
         ["live-vpn-ipv4"]="https://raw.githubusercontent.com/NazgulCoder/IPLists/refs/heads/main/output/vpn-ipv4.txt"
         ["live-doh-ipv6"]="https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv6.txt"

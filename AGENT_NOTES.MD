@@ -1450,3 +1450,44 @@ is launched as a separate process and curl has to be told where to find it.)
 
 **Not done:** no production code changed (the three mutations above were planted and reverted, and
 `git diff src/` is empty); nothing under `example/` touched.
+
+## Session 14 (2026-08-19): maltrail live-feed URL repointed — E2E back to 213/213
+
+Closes the finding Sessions 12 and 13 both recorded and neither resolved. The owner supplied the
+new upstream path: maltrail moved `trails/static/mass_scanner.txt` to `data/mass_scanner.txt`,
+which is why the old URL had been answering `404` while the repository itself stayed reachable.
+
+**Verified before editing, not after.** Sessions 12–13 deliberately refused to guess a replacement
+path; with one supplied, the first step was confirming it rather than trusting it — `curl` returned
+`200`, 665 KB, 19,329 lines, 17,222 IPv4-leading lines, and the expected maltrail format
+(`#`-prefixed licence header, then `<ip> # <hostname>` entries that `REGEX_LINE`'s comment
+stripping handles).
+
+**Two call sites, not one.** The task named `scripts/test_e2e.sh:1169`; a `grep` found the
+identical dead URL also in `tests/live_feed_ingestion_tests.rs`'s `MASS_SCANNER_URL`. Fixing only
+the script would have left `AGENT.MD`'s own rule — the `#[ignore]`d live suite "must still pass
+when run explicitly via `cargo test -- --ignored` before merging a change that touches the parser
+or ingestion pipeline" — pointing at a URL guaranteed to fail. Confirmed that suite failing on the
+old path first (`GET … returned 404 Not Found`), then fixed both and re-ran it green. Both edits
+carry a dated comment explaining the move, so the next reader hitting a 404 here knows this has
+happened before and where the path came from.
+
+**Deliberately still a live fetch.** Pinning this feed to a local fixture would have made the gate
+green permanently and worthless: its entire purpose is catching the real feed's format drifting
+away from what `REGEX_LINE` expects, which no frozen copy can detect. The failure mode this session
+fixed is the gate working exactly as intended — it noticed upstream changed.
+
+**Metrics after this session:**
+- `./scripts/test_e2e.sh`: **213/213 passed, 0 failed, 0 skipped** (was 211/213 in Sessions 12–13).
+  The repointed feed ingests end-to-end through the real pipeline, yielding **18,823** parsed
+  entries.
+- `cargo test -- --ignored` (live network): **5 passed / 0 failed** (was 4/5 — `mass_scanner_feed_parses_to_valid_entries`
+  was the failure).
+- `cargo test`: 184 passed / 0 failed / 5 ignored — unchanged, as expected: the default run is
+  offline and never touched this URL.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained.
+
+**Not done:** no production code under `src/` changed (`git diff src/` empty); nothing under
+`example/` touched. The other three live feeds were re-checked this session and all still return
+`200`, so no further URL rot to chase.
