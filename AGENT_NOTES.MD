@@ -1300,3 +1300,66 @@ name and still find what they're looking for.
 **Not done:** did not touch `example/` in any way (read-only per standing policy, and irrelevant to
 a purely local file-naming decision). Did not add a fourth migration or otherwise touch schema
 content — this was a rename-and-propagate-references pass only.
+
+## Session 12 (2026-08-19): `API_REFERENCE.md` — exhaustive endpoint catalog
+
+Requested as a fresh, zero-knowledge documentation audit: catalog every HTTP endpoint this service
+exposes, with no reliance on any prior summary of the API (there wasn't one — `API_REFERENCE.md`
+did not exist before this session).
+
+**Methodology.** Read `src/lib.rs`'s `create_app` route table directly (the single place every
+route is registered, including the `/healthz`/`/readyz` aliases), then every handler function in
+all seven files under `src/api/` (`health.rs`, `keys.rs`, `vaults.rs`, `sources.rs`,
+`sync_tasks.rs`, `sync_logs.rs`, `audit.rs` — confirmed exhaustive via `api/mod.rs`'s `mod`
+declarations, which name exactly these seven plus `guards`/`support`, neither of which registers a
+route), `src/middleware.rs` (header requirements and verification order), and `src/extract.rs`
+(`StrictJson`/`StrictPath`/`StrictQuery`'s exact rejection→status mapping). Every payload struct's
+field list, `#[serde(deny_unknown_fields)]` presence, and every guard function call site was read
+from the handler bodies directly, not inferred from names.
+
+**What the audit found:** 34 route registrations (method+path pairs) resolving to 32 distinct
+handler functions — `health_check` and `readiness_check` each answer two path spellings
+(`/health`+`/healthz`, `/ready`+`/readyz`). No handler was found unreachable from the route table
+and no route was found pointing at a function absent from `api/mod.rs`'s re-export surface — the
+route table and the handler set agree exactly.
+
+**Structure of `API_REFERENCE.md`:** an opening transport/authentication section (the exact header
+list and `auth_middleware` verification order, numbered 1–10, matching the real `if`/`?`
+sequence in the source — including the deliberate `bound_ips`-checked-last ordering and the
+`Content-Length`-precheck-then-`to_bytes`-cap two-step for the `413` path) and the standard error
+envelope/status table (from `error.rs`'s `AppError` match arms), then one section per resource
+(`/api/keys` split into 3.1 identity/listing, 3.2 lifecycle, 3.3 permission grants, since the file
+covers all three; `/api/vaults`, `/api/sources`, `/api/sync-tasks`, `/api/sync-logs`,
+`/api/audit-logs`), each with a per-route table (method/path/auth/body/response), the full response
+schema, and every request payload's field table with required/default/notes columns pulled from the
+`#[serde(default = "...")]` functions and doc comments actually attached to each field. Closes with
+an audit-action taxonomy (all 18 `action` string literals actually passed to `create_audit_log`,
+grep-confirmed) and a flat 34-row quick-reference index.
+
+**Cross-linked into the existing document hierarchy** (Task 3): `AGENT.MD`'s "Document & Context
+Hierarchy" list was stale before this edit — it said "responsibilities are split across three
+files" while already listing five (a drift from an earlier, unrelated addition); fixed the count
+wording to "these files" while adding `API_REFERENCE.md` and `RBAC_MODEL.md` as explicit entries
+(the latter was previously described only in its own file, never listed in `AGENT.MD`'s hierarchy
+at all — a second, separate staleness this pass also closed). `FILE_MAP.MD`'s "Companion documents"
+header line, which already named `AGENT.MD`/`SCHEMA.MD`/`RBAC_MODEL.md`/`AGENT_NOTES.MD`, now also
+names `API_REFERENCE.md`.
+
+**Verification:** `cargo check --all-targets`/`cargo clippy --all-targets -- -D warnings` clean
+(no source code was touched — this was a documentation-only session, `src/`/`tests/` diff is
+empty). `cargo test`: unchanged at 183 passed / 0 failed / 5 ignored. `./scripts/verify_convergence.sh`:
+still PASSED, 52 matching / 2 documented / 0 unexplained.
+
+`./scripts/test_e2e.sh` reported **211/213**, two failures, both in the same live-network
+subsection (`live-mass-scanner`, `https://raw.githubusercontent.com/stamparm/maltrail/master/trails/static/mass_scanner.txt`).
+Confirmed via a direct `curl` that the upstream file now answers `404` — it has been moved,
+renamed, or removed in the `stamparm/maltrail` repository since this fixture was last verified
+against the live source, unrelated to anything changed this session (`scripts/test_e2e.sh` itself
+has zero diff and was last touched two sessions ago, commit `a48e919`). Not fixed here: swapping or
+hardening a live external URL is a test-fixture maintenance task outside this session's scope
+(documentation only), and the same class of flakiness is exactly why `tests/live_feed_ingestion_tests.rs`
+is separately `#[ignore]`d from the default `cargo test` run. Left as a known, external, dated
+finding for whichever session next touches `scripts/test_e2e.sh`'s live-network fixture list.
+
+**Not done:** no changes to `RBAC_MODEL.md`'s own content (only referenced, not edited) or to any
+file under `example/`.

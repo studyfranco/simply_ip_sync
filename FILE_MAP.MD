@@ -4,8 +4,10 @@ An index of every `.rs` file in `src/`, written for someone (or something) arriv
 needing to know where a change belongs before making it.
 
 > Companion documents: `AGENT.MD` (architectural and security ruleset), `SCHEMA.MD` (database
-> schema), `RBAC_MODEL.md` (normative authorization specification), `AGENT_NOTES.MD` (session
-> worklog).
+> schema), `RBAC_MODEL.md` (normative authorization specification), `API_REFERENCE.md` (exhaustive
+> per-endpoint HTTP API catalog — method/path/aliases, RBAC guard, query parameters, request/
+> response payload shapes, generated directly from `src/api/*.rs` and `src/lib.rs`'s route table),
+> `AGENT_NOTES.MD` (session worklog).
 
 ---
 

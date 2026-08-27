@@ -6,11 +6,14 @@ Hello AI Agent! You are assisting with the development of `simply_ip_sync`. Read
 
 ## 📄 Document & Context Hierarchy
 
-To keep this context clean and modular, responsibilities are split across three files:
+To keep this context clean and modular, responsibilities are split across these files:
 1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, documentation standards, and testing directives.
 2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
-4. **`example/`**: You can find the code of other similar/linked project inside. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
+4. **`FILE_MAP.MD`**: Detailed file listings, module responsibilities, and code indexing (maintained by the AI Agent).
+5. **`API_REFERENCE.md`**: Exhaustive, per-endpoint HTTP API catalog (method/path/aliases, RBAC guard, query parameters, request/response payload shapes) generated directly from `src/api/*.rs` and `src/lib.rs`'s route table. Treat it as an official architectural document, not scratch output — it must be regenerated (not left stale) whenever a route, guard, or payload struct changes.
+6. **`RBAC_MODEL.md`**: Normative authorization specification — tiers, R1–R7 governance rules, §3–§7 guarantees. `API_REFERENCE.md`'s "Authorization / RBAC Guard" columns cite this document's section numbers rather than restating the rules.
+7. **`example/`**: You can find the code of other similar/linked project inside. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
 
 ---
 
