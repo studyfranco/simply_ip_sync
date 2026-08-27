@@ -311,3 +311,17 @@ coverage. Unlike `simply_ip_vault`/`simply_hook_executor`'s own copy of this scr
 not diff `RBAC_MODEL.md` for byte-identity — this project's copy is a deliberate restatement, not a
 shared file — so Pillar 0 instead checks structural section coverage plus rule-test coverage. See
 the script's own header comment for the full rationale and its `--verbose` flag.
+
+---
+
+## `static/` — the dashboard
+
+Vanilla HTML5/CSS3/JS with no build step and no external dependency, served by `lib.rs`'s
+`ServeDir` fallback. Structure and styling follow the ecosystem's shared conventions, verified
+against all three peers under `example/*/static/` (see `AGENT_NOTES.MD` Session 15 for the audit).
+
+| File | Responsibility |
+| :--- | :--- |
+| `index.html` | The page shell only — it contains no data-bearing markup. A `.login-screen` > `.login-card` sign-in view, then `#dashboard-container` holding a `.top-bar` (`.header` with `.logo`, the RBAC tier chip, Refresh/Logout) and a `nav.tab-nav[role=tablist]` of `.tab-btn[data-tab]`. Each `data-tab="X"` pairs with an empty `<main id="tab-X" class="tab-panel">` that `app.js` fills; `tests/source_hygiene.rs` enforces that pairing. `#toast-container` is the single mount point for notifications. |
+| `style.css` | The design system. Its `:root` block is **byte-identical** to `simply_ip_vault`/`simply_hook_executor`/`simply_ip_exporter` — a token meaning something different here than one service over is worse than no token, because everything built on it drifts silently. Below that, the shared component set (`.card`, `.data-table` in a `.table-container`, `.tab-nav`/`.tab-btn`, `.btn` family, `.form-group`/`.input-field`, `.badge` family, `.toast`, utilities). Components the peers have but this UI has no markup for (modals, pagination, batch selection) are deliberately absent rather than carried as dead rules. |
+| `app.js` | Everything dynamic: a pure-JS SHA-256/HMAC fallback for non-secure contexts (`crypto.subtle` is unavailable over plain-HTTP LAN), the `SyncClient` that signs every request with `CANONICAL_V1` and unwraps the `{"error": …}` envelope, `activateTab()` reactive menu switching, and one `render*`/`*Row`/`show*Form` trio per resource. One-time credentials render into a `.key-reveal` block rather than a `window.alert()`, since the value has to be selectable and re-readable. |

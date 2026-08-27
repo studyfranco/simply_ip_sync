@@ -1,54 +1,88 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>simply_ip_sync</title>
-<link rel="stylesheet" href="style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Simply IP Sync</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-<div id="login-screen">
-  <div class="panel">
-    <div class="panel-header"><h2>simply_ip_sync</h2></div>
-    <p style="color:var(--text-dim);font-size:13px;">Sign in with an API key and its signing secret. Credentials are kept only in this browser tab's memory.</p>
-    <form id="login-form" class="inline-form">
-      <label class="span-2">API Key
-        <input type="text" id="login-api-key" autocomplete="off" required>
-      </label>
-      <label class="span-2">Signing Secret
-        <input type="text" id="login-signing-secret" autocomplete="off" required>
-      </label>
-      <div class="form-actions">
-        <button type="submit" class="btn btn-primary">Sign in</button>
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- ═══════════════════════════════════════ -->
+  <!-- Login                                    -->
+  <!-- ═══════════════════════════════════════ -->
+  <section id="login-screen" class="login-screen">
+    <div class="login-card">
+      <div class="logo">
+        <div class="logo-icon"></div>
+        <h1>Simply IP Sync</h1>
       </div>
-    </form>
+      <h2>Sign in</h2>
+      <p class="subtitle">Enter an API key and its signing secret. Every request is signed
+        client-side (CANONICAL_V1 HMAC-SHA256) — the secret never leaves this page except as part
+        of a signature, and is kept only in this tab's memory.</p>
+      <form id="login-form" class="login-form">
+        <div class="form-group">
+          <label for="login-api-key">X-API-Key</label>
+          <input type="password" id="login-api-key" class="input-field" placeholder="Enter X-API-Key..." autocomplete="off" required>
+        </div>
+        <div class="form-group">
+          <label for="login-signing-secret">Signing secret</label>
+          <input type="password" id="login-signing-secret" class="input-field" placeholder="Enter HMAC signing secret..." autocomplete="off" required>
+          <small class="field-hint">Used locally to sign every request (HMAC-SHA256). Never transmitted.</small>
+        </div>
+        <button type="submit" class="btn btn-primary">Sign in</button>
+      </form>
+      <div id="login-error" class="message error hidden"></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════ -->
+  <!-- Dashboard                                -->
+  <!-- ═══════════════════════════════════════ -->
+  <div id="dashboard-container" class="hidden">
+
+    <div id="top-bar" class="top-bar">
+      <header class="header">
+        <div class="logo">
+          <div class="logo-icon"></div>
+          <h1>Simply IP Sync</h1>
+        </div>
+        <div id="header-actions" class="header-actions">
+          <!-- The signed-in key's RBAC tier (Master / Parent / Daughter). Shown so "why can't I
+               see the Audit Logs tab?" is answerable without reading RBAC_MODEL.md. -->
+          <span id="identity-name" class="text-muted text-sm"></span>
+          <span id="identity-badge" class="badge badge-tier" title="Your key's RBAC tier"></span>
+          <button id="btn-refresh" type="button" class="btn btn-secondary btn-sm">Refresh</button>
+          <button id="btn-logout" type="button" class="btn btn-logout btn-sm">Logout</button>
+        </div>
+      </header>
+
+      <nav class="tab-nav" role="tablist">
+        <button class="tab-btn active" data-tab="sources" role="tab" aria-selected="true">External Sources</button>
+        <button class="tab-btn" data-tab="sync-tasks" role="tab" aria-selected="false">Sync Tasks</button>
+        <button class="tab-btn" data-tab="vaults" role="tab" aria-selected="false">Vault Endpoints</button>
+        <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
+        <button class="tab-btn" data-tab="sync-logs" role="tab" aria-selected="false">Sync Logs</button>
+        <button class="tab-btn" data-tab="audit-logs" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
+      </nav>
+    </div>
+
+    <div class="container">
+      <!-- Panel bodies are rendered by app.js; each `data-tab="X"` above pairs with `id="tab-X"`
+           here, which is the invariant `tests/source_hygiene.rs` checks. -->
+      <main id="tab-sources" class="tab-panel active"></main>
+      <main id="tab-sync-tasks" class="tab-panel"></main>
+      <main id="tab-vaults" class="tab-panel"></main>
+      <main id="tab-keys" class="tab-panel"></main>
+      <main id="tab-sync-logs" class="tab-panel"></main>
+      <main id="tab-audit-logs" class="tab-panel"></main>
+    </div>
+
   </div>
-</div>
 
-<div id="app" class="hidden">
-  <header>
-    <h1>simply_ip_sync <span class="sub">threat sync orchestrator</span></h1>
-    <div id="identity"></div>
-  </header>
-  <nav id="tabs">
-    <button data-tab="sources" class="active">Sources</button>
-    <button data-tab="sync-tasks">Sync Tasks</button>
-    <button data-tab="vaults">Vaults</button>
-    <button data-tab="keys">Keys</button>
-    <button data-tab="sync-logs">Sync Logs</button>
-    <button data-tab="audit-logs">Audit Logs</button>
-  </nav>
-  <main>
-    <section id="tab-sources" class="tab-panel"></section>
-    <section id="tab-sync-tasks" class="tab-panel hidden"></section>
-    <section id="tab-vaults" class="tab-panel hidden"></section>
-    <section id="tab-keys" class="tab-panel hidden"></section>
-    <section id="tab-sync-logs" class="tab-panel hidden"></section>
-    <section id="tab-audit-logs" class="tab-panel hidden"></section>
-  </main>
-</div>
-
-<script src="app.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

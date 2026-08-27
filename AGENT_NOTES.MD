@@ -1491,3 +1491,85 @@ fixed is the gate working exactly as intended — it noticed upstream changed.
 **Not done:** no production code under `src/` changed (`git diff src/` empty); nothing under
 `example/` touched. The other three live feeds were re-checked this session and all still return
 `200`, so no further URL rot to chase.
+
+## Session 15 (2026-08-19): WebUI cross-audit and alignment with the ecosystem house style
+
+Requested: audit `static/` against all three peers and bring styling, navigation, and menu
+structure into line with the gold standard.
+
+**Peer pull (all three moved since Session 14).** `simply_hook_executor` `21d716b → 83549ea`,
+`simply_ip_exporter` `c2da8f2 → 94bdcca`, `simply_ip_vault` `b479539 → b8bd281`.
+
+**The audit, quantified rather than impressionistic.** Comparing class inventories across the
+three peers found **61 CSS classes present in all three** — that set is the de-facto shared
+component library, and it is what "house style" actually means here, as opposed to whatever one
+project happens to do. Measured against it, `simply_ip_sync` had **7 of 61**, plus 7 classes of its
+own nobody else uses (`.panel`, `.panel-header`, `.empty`, `.mono`, `.row-actions`, `.status-*`).
+The three peers' `:root` token blocks are **byte-identical** to each other (23 tokens, KDE Breeze
+palette); this project used a completely different palette under different token *names*
+(`--bg`/`--text-dim`/`--ok` vs `--bg-main`/`--text-muted`/`--success`), so not one component rule
+could be shared even in principle.
+
+That last point reverses a call made in an earlier session, which added the peers' *structural*
+tokens (`--radius-lg`, `--shadow`, `--font-mono`, `--transition-*`) while deliberately keeping this
+project's own colour identity, on the reasoning that the two are different products. This task
+asked for absolute consistency, which supersedes that judgement — and the earlier reasoning was
+weak anyway: a token named the same thing meaning something different one service over is worse
+than having no token, because every rule built on it drifts silently and invisibly.
+
+**What changed.**
+- `style.css` rewritten around the ecosystem `:root` block, now byte-identical to all three peers,
+  plus the shared component set: `.container`/`.top-bar`, `.login-screen`/`.login-card`/`.logo`,
+  `.header`/`.header-actions`, `.tab-nav`/`.tab-btn`, `.tab-panel` (inactive panels are
+  `display:none`, so their controls leave the tab order), `.card`/`.list-header`,
+  `.table-container` + `.data-table`, the `.btn` family, `.form-group`/`.input-field`/`.select-field`/
+  `.field-hint`/`.checkbox-container`, `.badge` family, `.key-reveal`, `.toast-container`/`.toast`,
+  and the utility classes. Shared-library coverage went **7/61 → 47/61**.
+- `index.html` restructured to the house skeleton: login card with logo and `#login-error`
+  (`.message.error`), `#dashboard-container` > `#top-bar` > `.header` (logo, RBAC tier chip,
+  Refresh, Logout) > `nav.tab-nav[role=tablist]`, six `.tab-btn[data-tab][role=tab][aria-selected]`
+  paired with six empty `<main id="tab-X" class="tab-panel">`, and a single `#toast-container`.
+- `app.js`: `activateTab()` now drives `.tab-btn`/`.tab-panel` `.active` state and keeps
+  `aria-selected` in step (previously toggled `.hidden` on bare `nav button` elements); toasts
+  render into `#toast-container` with the two-frame `.visible` transition the peers use; a new
+  `rbacTier()` derives Master/Parent/Daughter for the header chip and the keys table; Refresh and
+  Logout are wired (logout just drops the in-memory credentials — nothing was ever persisted);
+  sign-in failures show inline on the card instead of only as a toast; the six panel templates and
+  four form templates were migrated to the shared classes; sync-log statuses render as
+  `.badge-status-*` instead of bare coloured text; and the keys table gained a Tier column with
+  `.badge-scope` chips for global rights.
+- One-time credentials (key creation, key rotation, secret rotation) now render into a
+  `.key-reveal` block rather than three `window.alert()` calls. The server returns those values
+  exactly once; an alert is a poor container for something the user must copy — not reliably
+  selectable, unreadable once dismissed, and it covers the page while it is open.
+
+**The 14 shared classes still absent are deliberate, not oversights:** `.modal-overlay`,
+`.modal-card`, `.modal-header`, `.modal-actions`, `.btn-modal-close`, `.pagination`, `.filters`,
+`.batch-actions`, `.btn-batch-delete`, `.checkmark`, `.permissions-grid`, `.admin-section`,
+`.btn-icon`, `.form-row`. Each belongs to a feature this dashboard has no markup for (modal
+dialogs, pagination controls, multi-select batch actions). Shipping rules for components that do
+not exist would be dead CSS that a future reader would reasonably assume is load-bearing.
+
+**One test updated, deliberately.** `source_hygiene.rs::dynamic_tab_panel_id_construction_matches_every_nav_button`
+pins the literal expression `getElementById("tab-" + btn.dataset.tab)`, and failed the moment the
+lookup moved into `activateTab(tabName)`. That is the test doing its job — its own failure message
+says the pattern changing means the test needs revisiting rather than silently passing on nothing —
+so the pinned string was updated to `getElementById("tab-" + tabName)` and the doc comment records
+why it moved. The invariant it actually guards (every `data-tab="X"` has a matching `id="tab-X"`)
+is unchanged and still enforced.
+
+**Verification beyond the gates.** The static hygiene tests check ids exist and JS parses, but
+nothing in the suite checks markup validity, so three additional checks were run by hand: every one
+of the 36 `getElementById` references resolves (25 to `index.html`, 11 to ids `app.js` injects
+itself); every one of the 48 CSS classes used in markup is defined in `style.css`; `index.html` is
+tag-balanced, and so are all 11 `innerHTML` templates parsed in isolation with interpolations
+neutralised. Table column counts were also checked mechanically — all six tables have matching
+`<th>` count, empty-state `colspan`, and per-row `<td>` count (this caught the keys table, where
+adding the Tier column would otherwise have left a 5-wide header over 6-wide rows).
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **184 passed / 0 failed / 5 ignored**; `./scripts/test_e2e.sh` **213/213**;
+`./scripts/verify_convergence.sh` PASSED (52 matching / 2 documented / 0 unexplained).
+
+**Not done:** no `src/` change (`git diff src/` empty — this was a frontend and docs session);
+nothing under `example/` modified.

@@ -158,11 +158,16 @@ fn dynamically_injected_form_ids_are_queried_with_the_exact_same_spelling() {
     );
 }
 
-/// The one dynamic exception: `document.getElementById("tab-" + btn.dataset.tab)` builds its id
-/// at runtime from a nav button's `data-tab` attribute, so the literal-string check above cannot
-/// see it. Verify the underlying invariant directly instead: every `data-tab="X"` value present in
-/// `index.html` must have a matching `id="tab-X"` panel element, since that's exactly the pairing
-/// the runtime concatenation depends on.
+/// The one dynamic exception: `document.getElementById("tab-" + tabName)` inside `activateTab()`
+/// builds its id at runtime from a nav button's `data-tab` attribute, so the literal-string check
+/// above cannot see it. Verify the underlying invariant directly instead: every `data-tab="X"`
+/// value present in `index.html` must have a matching `id="tab-X"` panel element, since that's
+/// exactly the pairing the runtime concatenation depends on.
+///
+/// The pinned expression was `getElementById("tab-" + btn.dataset.tab)` until the WebUI was
+/// aligned with the ecosystem's `.tab-btn`/`.tab-panel` convention, which moved the lookup out of
+/// the click handler and into a reusable `activateTab(tabName)` — the concatenation, and therefore
+/// the invariant, is the same; only the variable it reads from changed.
 #[test]
 fn dynamic_tab_panel_id_construction_matches_every_nav_button() {
     let app_js = read("static/app.js");
@@ -170,7 +175,7 @@ fn dynamic_tab_panel_id_construction_matches_every_nav_button() {
     let html_ids = html_element_ids(&index_html);
 
     assert!(
-        app_js.contains(r#"getElementById("tab-" + btn.dataset.tab)"#),
+        app_js.contains(r#"getElementById("tab-" + tabName)"#),
         "this test pins a specific dynamic id-construction pattern in app.js; if it no longer \
          appears, the pattern changed and this test (and its rationale) need to be revisited \
          rather than silently passing on nothing"

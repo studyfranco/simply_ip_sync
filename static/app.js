@@ -172,20 +172,43 @@ class SyncClient {
 let client = null;
 let me = null;
 
+/// Renders a transient notification into `#toast-container`, matching the ecosystem convention:
+/// the toast is appended hidden (translated off-screen by `.toast`), then given `.visible` on the
+/// next frame so the CSS transition actually runs — appending an already-visible element would
+/// paint it in its final position with no animation. `kind` is `"success"` or `"error"`.
 function toast(msg, kind) {
+  const container = document.getElementById("toast-container");
+  if (!container) {
+    window.alert(msg);
+    return;
+  }
   const el = document.createElement("div");
-  el.className = "toast " + (kind || "");
+  el.className = "toast toast-" + (kind === "success" ? "success" : "error");
   el.textContent = msg;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 4500);
+  container.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("visible"));
+  setTimeout(() => {
+    el.classList.remove("visible");
+    setTimeout(() => el.remove(), 300);
+  }, 4000);
 }
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/// Shows a failure inline on the login card (`#login-error`, the ecosystem's `.message.error`
+/// element) rather than only as a toast: a sign-in error belongs next to the form that produced
+/// it, where it stays put while the user corrects the field.
+function showLoginError(message) {
+  const box = document.getElementById("login-error");
+  box.textContent = message;
+  box.classList.remove("hidden");
+}
+
 document.getElementById("login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  document.getElementById("login-error").classList.add("hidden");
   const apiKey = document.getElementById("login-api-key").value.trim();
   const signingSecret = document.getElementById("login-signing-secret").value.trim();
   const candidate = new SyncClient(apiKey, signingSecret);
@@ -193,38 +216,77 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
     me = await candidate.get("/api/auth/me");
     client = candidate;
     document.getElementById("login-screen").classList.add("hidden");
-    document.getElementById("app").classList.remove("hidden");
+    document.getElementById("dashboard-container").classList.remove("hidden");
     renderIdentity();
     setupTabs();
     await loadTab("sources");
   } catch (err) {
-    toast("Sign-in failed: " + err.message, "err");
+    showLoginError("Sign-in failed: " + err.message);
   }
 });
 
+/// The caller's RBAC tier, per `RBAC_MODEL.md` §1: Master (unique), Parent (`can_manage_keys`), or
+/// Daughter (neither). Shown as a header chip so a missing tab is self-explanatory.
+function rbacTier(key) {
+  if (key.is_master) return "Master";
+  return key.can_manage_keys ? "Parent" : "Daughter";
+}
+
 function renderIdentity() {
-  const rights = [];
-  if (me.is_master) rights.push("MASTER");
-  if (me.can_manage_keys) rights.push("can_manage_keys");
-  if (me.can_manage_sources) rights.push("can_manage_sources");
-  if (me.can_manage_vaults) rights.push("can_manage_vaults");
-  document.getElementById("identity").innerHTML =
-    `<span>${escapeHtml(me.name)}</span>` + rights.map((r) => `<span class="badge">${escapeHtml(r)}</span>`).join("");
-  if (!me.is_master) {
-    document.querySelector('nav button[data-tab="audit-logs"]').classList.add("hidden");
-  }
+  const tier = rbacTier(me);
+  document.getElementById("identity-name").textContent = me.name;
+
+  const badge = document.getElementById("identity-badge");
+  badge.textContent = tier;
+  badge.className = "badge badge-tier" + (me.is_master ? " badge-master" : me.can_manage_keys ? " badge-parent" : "");
+  const scopes = [
+    me.can_manage_keys && "can_manage_keys",
+    me.can_manage_sources && "can_manage_sources",
+    me.can_manage_vaults && "can_manage_vaults",
+  ].filter(Boolean);
+  badge.title = scopes.length ? `${tier} — ${scopes.join(", ")}` : `${tier} — no global rights`;
+
+  // Hide tabs the caller's tier can never load, rather than letting them render a 403. The server
+  // is still the authority (`api/guards.rs`); this only keeps the menu honest.
+  document.getElementById("audit-tab-btn").classList.toggle("hidden", !me.is_master);
+  document.getElementById("keys-tab-btn").classList.toggle("hidden", !(me.is_master || me.can_manage_keys));
+}
+
+/// Switches the active tab: one `.tab-btn`/`.tab-panel` pair gains `.active` and every other pair
+/// loses it. Inactive panels are `display: none` entirely (see `.tab-panel` in style.css), so their
+/// controls stay out of the tab order. `aria-selected` is kept in step for screen readers.
+function activateTab(tabName) {
+  document.querySelectorAll(".tab-btn").forEach((b) => {
+    const isActive = b.dataset.tab === tabName;
+    b.classList.toggle("active", isActive);
+    b.setAttribute("aria-selected", isActive ? "true" : "false");
+  });
+  document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+  const panel = document.getElementById("tab-" + tabName);
+  if (panel) panel.classList.add("active");
 }
 
 function setupTabs() {
-  document.querySelectorAll("nav button[data-tab]").forEach((btn) => {
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      document.querySelectorAll("nav button[data-tab]").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
-      const panel = document.getElementById("tab-" + btn.dataset.tab);
-      panel.classList.remove("hidden");
+      activateTab(btn.dataset.tab);
       await loadTab(btn.dataset.tab);
     });
+  });
+
+  document.getElementById("btn-refresh").addEventListener("click", async () => {
+    const active = document.querySelector(".tab-btn.active");
+    if (active) await loadTab(active.dataset.tab);
+  });
+
+  document.getElementById("btn-logout").addEventListener("click", () => {
+    // Credentials only ever lived in this closure, so dropping them is the whole logout: nothing
+    // was written to storage that could outlive the tab.
+    client = null;
+    me = null;
+    document.getElementById("login-form").reset();
+    document.getElementById("dashboard-container").classList.add("hidden");
+    document.getElementById("login-screen").classList.remove("hidden");
   });
 }
 
@@ -237,7 +299,7 @@ async function loadTab(tab) {
     else if (tab === "sync-logs") await renderSyncLogs();
     else if (tab === "audit-logs") await renderAuditLogs();
   } catch (err) {
-    toast("Failed to load: " + err.message, "err");
+    toast("Failed to load: " + err.message, "error");
   }
 }
 
@@ -250,18 +312,20 @@ async function renderSources() {
   const sources = await client.get("/api/sources");
   const vaults = await client.get("/api/vaults").catch(() => []);
   panel.innerHTML = `
-    <div class="panel">
-      <div class="panel-header"><h2>External Sources</h2>
+    <section class="card">
+      <div class="list-header"><h2>External Sources</h2>
         ${me.is_master || me.can_manage_sources ? '<button class="btn btn-primary" id="new-source-btn">+ New Source</button>' : ""}
       </div>
       <div id="source-form-slot"></div>
-      <table>
+      <div class="table-container">
+        <table class="data-table">
         <thead><tr><th>Name</th><th>URL</th><th>Parser</th><th>Schedule</th><th>Group</th><th>Active</th><th>Last Run</th><th></th></tr></thead>
         <tbody>
-          ${sources.length ? sources.map(sourceRow).join("") : '<tr><td colspan="8" class="empty">No sources yet.</td></tr>'}
+          ${sources.length ? sources.map(sourceRow).join("") : '<tr><td colspan="8" class="empty-state">No sources yet.</td></tr>'}
         </tbody>
       </table>
-    </div>`;
+      </div>
+    </section>`;
 
   if (document.getElementById("new-source-btn")) {
     document.getElementById("new-source-btn").addEventListener("click", () => showSourceForm(null, vaults));
@@ -280,9 +344,9 @@ async function renderSources() {
 function sourceRow(s) {
   return `<tr>
     <td>${escapeHtml(s.name)}</td>
-    <td class="mono">${escapeHtml(s.source_url)}</td>
+    <td class="font-mono">${escapeHtml(s.source_url)}</td>
     <td>${escapeHtml(s.parser_type)}</td>
-    <td class="mono">${escapeHtml(s.cron_schedule)}</td>
+    <td class="font-mono">${escapeHtml(s.cron_schedule)}</td>
     <td>${escapeHtml(s.target_group_name)}</td>
     <td>${s.is_active ? "yes" : "no"}</td>
     <td>${escapeHtml(s.last_run_at || "never")}</td>
@@ -298,30 +362,30 @@ function showSourceForm(existing, vaults) {
   const slot = document.getElementById("source-form-slot");
   const vaultOptions = vaults.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join("");
   slot.innerHTML = `
-    <form class="inline-form" id="source-form">
-      <label>Name<input name="name" required value="${escapeHtml(existing?.name || "")}"></label>
-      <label>Source URL<input name="source_url" required value="${escapeHtml(existing?.source_url || "")}"></label>
-      <label>Parser Type
-        <select name="parser_type">
+    <form class="form-grid" id="source-form">
+      <label class="form-group"><span>Name</span><input class="input-field" name="name" required value="${escapeHtml(existing?.name || "")}"></label>
+      <label class="form-group"><span>Source URL</span><input class="input-field" name="source_url" required value="${escapeHtml(existing?.source_url || "")}"></label>
+      <label class="form-group"><span>Parser Type
+        </span><select class="select-field" name="parser_type">
           <option value="REGEX_LINE" ${existing?.parser_type === "REGEX_LINE" ? "selected" : ""}>REGEX_LINE</option>
           <option value="JSON_PATH" ${existing?.parser_type === "JSON_PATH" ? "selected" : ""}>JSON_PATH</option>
         </select>
       </label>
-      <label>Cron Schedule<input name="cron_schedule" required placeholder="0 0 * * *" value="${escapeHtml(existing?.cron_schedule || "")}"></label>
-      <label>Target Group Name<input name="target_group_name" required value="${escapeHtml(existing?.target_group_name || "")}"></label>
-      <label>Active
-        <select name="is_active">
+      <label class="form-group"><span>Cron Schedule</span><input class="input-field" name="cron_schedule" required placeholder="0 0 * * *" value="${escapeHtml(existing?.cron_schedule || "")}"></label>
+      <label class="form-group"><span>Target Group Name</span><input class="input-field" name="target_group_name" required value="${escapeHtml(existing?.target_group_name || "")}"></label>
+      <label class="form-group"><span>Active
+        </span><select class="select-field" name="is_active">
           <option value="true" ${existing?.is_active !== false ? "selected" : ""}>true</option>
           <option value="false" ${existing?.is_active === false ? "selected" : ""}>false</option>
         </select>
       </label>
-      <label class="span-2">Parser Config JSON<textarea name="parser_config_json">${escapeHtml(existing?.parser_config_json || "")}</textarea></label>
-      <label class="span-2">Target Vaults (select one or more)
-        <select name="targets" multiple size="4">${vaultOptions}</select>
+      <label class="form-group form-group-grow"><span>Parser Config JSON</span><textarea class="input-field" name="parser_config_json">${escapeHtml(existing?.parser_config_json || "")}</textarea></label>
+      <label class="form-group form-group-grow"><span>Target Vaults (select one or more)
+        </span><select class="select-field" name="targets" multiple size="4">${vaultOptions}</select>
       </label>
       <div class="form-actions">
         <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create"}</button>
-        <button type="button" class="btn" id="source-form-cancel">Cancel</button>
+        <button type="button" class="btn btn-cancel" id="source-form-cancel">Cancel</button>
       </div>
     </form>`;
 
@@ -352,11 +416,11 @@ function showSourceForm(existing, vaults) {
     try {
       if (existing) await client.patch("/api/sources/" + existing.id, payload);
       else await client.post("/api/sources", payload);
-      toast("Source saved", "ok");
+      toast("Source saved", "success");
       slot.innerHTML = "";
       await renderSources();
     } catch (err) {
-      toast("Save failed: " + err.message, "err");
+      toast("Save failed: " + err.message, "error");
     }
   });
 }
@@ -370,18 +434,20 @@ async function renderSyncTasks() {
   const tasks = await client.get("/api/sync-tasks");
   const vaults = await client.get("/api/vaults").catch(() => []);
   panel.innerHTML = `
-    <div class="panel">
-      <div class="panel-header"><h2>Inter-Vault Sync Tasks</h2>
+    <section class="card">
+      <div class="list-header"><h2>Inter-Vault Sync Tasks</h2>
         ${me.is_master || me.can_manage_vaults ? '<button class="btn btn-primary" id="new-task-btn">+ New Task</button>' : ""}
       </div>
       <div id="task-form-slot"></div>
-      <table>
+      <div class="table-container">
+        <table class="data-table">
         <thead><tr><th>Name</th><th>Source Vault</th><th>Source Group</th><th>Target Group</th><th>Schedule</th><th>Active</th><th>Last Sync</th><th></th></tr></thead>
         <tbody>
-          ${tasks.length ? tasks.map((t) => taskRow(t, vaults)).join("") : '<tr><td colspan="8" class="empty">No sync tasks yet.</td></tr>'}
+          ${tasks.length ? tasks.map((t) => taskRow(t, vaults)).join("") : '<tr><td colspan="8" class="empty-state">No sync tasks yet.</td></tr>'}
         </tbody>
       </table>
-    </div>`;
+      </div>
+    </section>`;
 
   if (document.getElementById("new-task-btn")) {
     document.getElementById("new-task-btn").addEventListener("click", () => showTaskForm(null, vaults));
@@ -404,7 +470,7 @@ function taskRow(t, vaults) {
     <td>${escapeHtml(sourceVault?.name || t.source_vault_id)}</td>
     <td>${escapeHtml(t.source_group_name)}</td>
     <td>${escapeHtml(t.target_group_name)}</td>
-    <td class="mono">${escapeHtml(t.cron_schedule)}</td>
+    <td class="font-mono">${escapeHtml(t.cron_schedule)}</td>
     <td>${t.is_active ? "yes" : "no"}</td>
     <td>${escapeHtml(t.last_sync_at || "never")}</td>
     <td class="row-actions">
@@ -419,26 +485,26 @@ function showTaskForm(existing, vaults) {
   const slot = document.getElementById("task-form-slot");
   const vaultOptions = vaults.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join("");
   slot.innerHTML = `
-    <form class="inline-form" id="task-form">
-      <label>Name<input name="name" required value="${escapeHtml(existing?.name || "")}"></label>
-      <label>Source Vault
-        <select name="source_vault_id" required>${vaultOptions}</select>
+    <form class="form-grid" id="task-form">
+      <label class="form-group"><span>Name</span><input class="input-field" name="name" required value="${escapeHtml(existing?.name || "")}"></label>
+      <label class="form-group"><span>Source Vault
+        </span><select class="select-field" name="source_vault_id" required>${vaultOptions}</select>
       </label>
-      <label>Source Group Name<input name="source_group_name" required value="${escapeHtml(existing?.source_group_name || "")}"></label>
-      <label>Target Group Name<input name="target_group_name" required value="${escapeHtml(existing?.target_group_name || "")}"></label>
-      <label>Cron Schedule<input name="cron_schedule" required placeholder="0 * * * *" value="${escapeHtml(existing?.cron_schedule || "")}"></label>
-      <label>Active
-        <select name="is_active">
+      <label class="form-group"><span>Source Group Name</span><input class="input-field" name="source_group_name" required value="${escapeHtml(existing?.source_group_name || "")}"></label>
+      <label class="form-group"><span>Target Group Name</span><input class="input-field" name="target_group_name" required value="${escapeHtml(existing?.target_group_name || "")}"></label>
+      <label class="form-group"><span>Cron Schedule</span><input class="input-field" name="cron_schedule" required placeholder="0 * * * *" value="${escapeHtml(existing?.cron_schedule || "")}"></label>
+      <label class="form-group"><span>Active
+        </span><select class="select-field" name="is_active">
           <option value="true" ${existing?.is_active !== false ? "selected" : ""}>true</option>
           <option value="false" ${existing?.is_active === false ? "selected" : ""}>false</option>
         </select>
       </label>
-      <label class="span-2">Target Vaults (select one or more)
-        <select name="targets" multiple size="4">${vaultOptions}</select>
+      <label class="form-group form-group-grow"><span>Target Vaults (select one or more)
+        </span><select class="select-field" name="targets" multiple size="4">${vaultOptions}</select>
       </label>
       <div class="form-actions">
         <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create"}</button>
-        <button type="button" class="btn" id="task-form-cancel">Cancel</button>
+        <button type="button" class="btn btn-cancel" id="task-form-cancel">Cancel</button>
       </div>
     </form>`;
 
@@ -469,11 +535,11 @@ function showTaskForm(existing, vaults) {
     try {
       if (existing) await client.patch("/api/sync-tasks/" + existing.id, payload);
       else await client.post("/api/sync-tasks", payload);
-      toast("Sync task saved", "ok");
+      toast("Sync task saved", "success");
       slot.innerHTML = "";
       await renderSyncTasks();
     } catch (err) {
-      toast("Save failed: " + err.message, "err");
+      toast("Save failed: " + err.message, "error");
     }
   });
 }
@@ -486,18 +552,20 @@ async function renderVaults() {
   const panel = document.getElementById("tab-vaults");
   const vaults = await client.get("/api/vaults");
   panel.innerHTML = `
-    <div class="panel">
-      <div class="panel-header"><h2>Vault Endpoints</h2>
+    <section class="card">
+      <div class="list-header"><h2>Vault Endpoints</h2>
         ${me.is_master || me.can_manage_vaults ? '<button class="btn btn-primary" id="new-vault-btn">+ New Vault</button>' : ""}
       </div>
       <div id="vault-form-slot"></div>
-      <table>
+      <div class="table-container">
+        <table class="data-table">
         <thead><tr><th>Name</th><th>Target URL</th><th>Description</th><th></th></tr></thead>
         <tbody>
-          ${vaults.length ? vaults.map(vaultRow).join("") : '<tr><td colspan="4" class="empty">No vault endpoints yet.</td></tr>'}
+          ${vaults.length ? vaults.map(vaultRow).join("") : '<tr><td colspan="4" class="empty-state">No vault endpoints yet.</td></tr>'}
         </tbody>
       </table>
-    </div>`;
+      </div>
+    </section>`;
 
   if (document.getElementById("new-vault-btn")) {
     document.getElementById("new-vault-btn").addEventListener("click", () => showVaultForm(null));
@@ -513,7 +581,7 @@ async function renderVaults() {
 function vaultRow(v) {
   return `<tr>
     <td>${escapeHtml(v.name)}</td>
-    <td class="mono">${escapeHtml(v.target_url)}</td>
+    <td class="font-mono">${escapeHtml(v.target_url)}</td>
     <td>${escapeHtml(v.description || "")}</td>
     <td class="row-actions">
       <button class="btn btn-sm" data-edit-vault="${v.id}">Edit</button>
@@ -525,15 +593,15 @@ function vaultRow(v) {
 function showVaultForm(existing) {
   const slot = document.getElementById("vault-form-slot");
   slot.innerHTML = `
-    <form class="inline-form" id="vault-form">
-      <label>Name<input name="name" required value="${escapeHtml(existing?.name || "")}"></label>
-      <label>Target URL<input name="target_url" required value="${escapeHtml(existing?.target_url || "")}"></label>
-      <label>Remote X-API-Key${existing ? " (leave blank to keep)" : ""}<input name="api_key" ${existing ? "" : "required"}></label>
-      <label>Remote Signing Secret${existing ? " (leave blank to keep)" : ""}<input name="signing_secret" ${existing ? "" : "required"}></label>
-      <label class="span-2">Description<input name="description" value="${escapeHtml(existing?.description || "")}"></label>
+    <form class="form-grid" id="vault-form">
+      <label class="form-group"><span>Name</span><input class="input-field" name="name" required value="${escapeHtml(existing?.name || "")}"></label>
+      <label class="form-group"><span>Target URL</span><input class="input-field" name="target_url" required value="${escapeHtml(existing?.target_url || "")}"></label>
+      <label class="form-group"><span>Remote X-API-Key${existing ? " (leave blank to keep)" : ""}</span><input class="input-field" name="api_key" ${existing ? "" : "required"}></label>
+      <label class="form-group"><span>Remote Signing Secret${existing ? " (leave blank to keep)" : ""}</span><input class="input-field" name="signing_secret" ${existing ? "" : "required"}></label>
+      <label class="form-group form-group-grow"><span>Description</span><input class="input-field" name="description" value="${escapeHtml(existing?.description || "")}"></label>
       <div class="form-actions">
         <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create"}</button>
-        <button type="button" class="btn" id="vault-form-cancel">Cancel</button>
+        <button type="button" class="btn btn-cancel" id="vault-form-cancel">Cancel</button>
       </div>
     </form>`;
 
@@ -551,11 +619,11 @@ function showVaultForm(existing) {
     try {
       if (existing) await client.patch("/api/vaults/" + existing.id, payload);
       else await client.post("/api/vaults", payload);
-      toast("Vault endpoint saved", "ok");
+      toast("Vault endpoint saved", "success");
       slot.innerHTML = "";
       await renderVaults();
     } catch (err) {
-      toast("Save failed: " + err.message, "err");
+      toast("Save failed: " + err.message, "error");
     }
   });
 }
@@ -568,18 +636,20 @@ async function renderKeys() {
   const panel = document.getElementById("tab-keys");
   const keys = await client.get("/api/keys");
   panel.innerHTML = `
-    <div class="panel">
-      <div class="panel-header"><h2>API Keys</h2>
+    <section class="card">
+      <div class="list-header"><h2>API Keys</h2>
         ${me.is_master || me.can_manage_keys ? '<button class="btn btn-primary" id="new-key-btn">+ New Key</button>' : ""}
       </div>
       <div id="key-form-slot"></div>
-      <table>
-        <thead><tr><th>Name</th><th>Prefix</th><th>Rights</th><th>Parent</th><th></th></tr></thead>
+      <div class="table-container">
+        <table class="data-table">
+        <thead><tr><th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Parent</th><th></th></tr></thead>
         <tbody>
-          ${keys.length ? keys.map(keyRow).join("") : '<tr><td colspan="5" class="empty">No keys visible.</td></tr>'}
+          ${keys.length ? keys.map(keyRow).join("") : '<tr><td colspan="6" class="empty-state">No keys visible.</td></tr>'}
         </tbody>
       </table>
-    </div>`;
+      </div>
+    </section>`;
 
   if (document.getElementById("new-key-btn")) {
     document.getElementById("new-key-btn").addEventListener("click", () => showKeyForm());
@@ -596,9 +666,18 @@ async function renderKeys() {
 }
 
 function keyRow(k) {
-  const rights = [k.is_master && "MASTER", k.can_manage_keys && "keys", k.can_manage_sources && "sources", k.can_manage_vaults && "vaults"]
+  const tier = rbacTier(k);
+  const tierModifier = k.is_master ? " badge-master" : k.can_manage_keys ? " badge-parent" : "";
+  const scopes = [
+    k.can_manage_keys && "can_manage_keys",
+    k.can_manage_sources && "can_manage_sources",
+    k.can_manage_vaults && "can_manage_vaults",
+  ]
     .filter(Boolean)
-    .join(", ");
+    .map((s) => `<span class="badge badge-scope">${escapeHtml(s)}</span>`)
+    .join(" ");
+  // The Master key is neither deletable nor rotatable through the API (RBAC §5), so it gets no
+  // action buttons at all rather than buttons that would only ever return 403.
   const actions = k.is_master
     ? ""
     : `<button class="btn btn-sm" data-rotate-key="${k.id}">Rotate Key</button>
@@ -606,9 +685,10 @@ function keyRow(k) {
        <button class="btn btn-sm btn-danger" data-delete-key="${k.id}">Delete</button>`;
   return `<tr>
     <td>${escapeHtml(k.name)}</td>
-    <td class="mono">${escapeHtml(k.prefix)}</td>
-    <td>${escapeHtml(rights)}</td>
-    <td class="mono">${escapeHtml(k.parent_key_id || "")}</td>
+    <td class="font-mono">${escapeHtml(k.prefix)}</td>
+    <td><span class="badge badge-tier${tierModifier}">${escapeHtml(tier)}</span></td>
+    <td>${scopes || '<span class="text-muted text-sm">none</span>'}</td>
+    <td class="font-mono text-sm">${escapeHtml(k.parent_key_id || "")}</td>
     <td class="row-actions">${actions}</td>
   </tr>`;
 }
@@ -616,17 +696,17 @@ function keyRow(k) {
 function showKeyForm() {
   const slot = document.getElementById("key-form-slot");
   slot.innerHTML = `
-    <form class="inline-form" id="key-form">
-      <label>Name<input name="name" required></label>
-      <label>Bound IPs (CIDR, comma-separated)<input name="bound_ips" placeholder="0.0.0.0/0,::/0"></label>
+    <form class="form-grid" id="key-form">
+      <label class="form-group"><span>Name</span><input class="input-field" name="name" required></label>
+      <label class="form-group"><span>Bound IPs (CIDR, comma-separated)</span><input class="input-field" name="bound_ips" placeholder="0.0.0.0/0,::/0"></label>
       ${me.is_master ? `
-      <label>can_manage_keys <input type="checkbox" name="can_manage_keys"></label>
-      <label>can_manage_sources <input type="checkbox" name="can_manage_sources"></label>
-      <label>can_manage_vaults <input type="checkbox" name="can_manage_vaults"></label>
+      <label class="checkbox-container"><input type="checkbox" name="can_manage_keys"><span>can_manage_keys</span></label>
+      <label class="checkbox-container"><input type="checkbox" name="can_manage_sources"><span>can_manage_sources</span></label>
+      <label class="checkbox-container"><input type="checkbox" name="can_manage_vaults"><span>can_manage_vaults</span></label>
       ` : ""}
       <div class="form-actions">
         <button type="submit" class="btn btn-primary">Create</button>
-        <button type="button" class="btn" id="key-form-cancel">Cancel</button>
+        <button type="button" class="btn btn-cancel" id="key-form-cancel">Cancel</button>
       </div>
     </form>`;
 
@@ -643,16 +723,48 @@ function showKeyForm() {
     };
     try {
       const result = await client.post("/api/keys", payload);
-      slot.innerHTML = "";
       await renderKeys();
-      alert(
-        "Save these now — they will not be shown again:\n\n" +
-          "API Key: " + result.plaintext_key + "\n" +
-          "Signing Secret: " + result.plaintext_signing_secret
-      );
+      revealCredentials("Key created — save these now, they are not recoverable", [
+        ["API key", result.plaintext_key],
+        ["Signing secret", result.plaintext_signing_secret],
+      ]);
     } catch (err) {
-      toast("Create failed: " + err.message, "err");
+      toast("Create failed: " + err.message, "error");
     }
+  });
+}
+
+/// Renders one-time credentials into the keys tab's form slot using the ecosystem's `.key-reveal`
+/// block, rather than a `window.alert()`.
+///
+/// The server returns a freshly minted key or secret exactly once (see `API_REFERENCE.md` §3.2);
+/// after this render there is no endpoint that can produce it again. An `alert()` was a poor fit
+/// for that: its text is not selectable in every browser, it cannot be re-read once dismissed, and
+/// it blocks the page while the value the user has to copy sits behind it.
+///
+/// Called after `renderKeys()` has rebuilt the panel, so `#key-form-slot` is the freshly rendered
+/// one — writing into the pre-render slot would paint the credentials into a node that
+/// `renderKeys()` then discards.
+function revealCredentials(title, pairs) {
+  const slot = document.getElementById("key-form-slot");
+  if (!slot) {
+    toast(pairs.map(([label, value]) => `${label}: ${value}`).join(" | "), "success");
+    return;
+  }
+  slot.innerHTML = `
+    <div class="key-reveal">
+      <p class="mb-4"><strong>${escapeHtml(title)}</strong></p>
+      ${pairs
+        .map(
+          ([label, value]) => `
+        <span class="key-reveal-label">${escapeHtml(label)}</span>
+        <code class="key-reveal-value">${escapeHtml(value)}</code>`
+        )
+        .join("")}
+      <button type="button" class="btn btn-secondary btn-sm" id="key-reveal-dismiss">Dismiss</button>
+    </div>`;
+  document.getElementById("key-reveal-dismiss").addEventListener("click", () => {
+    slot.innerHTML = "";
   });
 }
 
@@ -660,9 +772,12 @@ async function rotateKey(id) {
   if (!confirm("Rotate this key's plaintext credential? The old one stops working immediately.")) return;
   try {
     const result = await client.post("/api/keys/" + id + "/rotate");
-    alert("New API key (save this now):\n\n" + result.plaintext_key);
+    await renderKeys();
+    revealCredentials("Key rotated — save this now, it is not recoverable", [
+      ["New API key", result.plaintext_key],
+    ]);
   } catch (err) {
-    toast("Rotation failed: " + err.message, "err");
+    toast("Rotation failed: " + err.message, "error");
   }
 }
 
@@ -670,9 +785,12 @@ async function rotateSecret(id) {
   if (!confirm("Rotate this key's signing secret? The old one stops working immediately.")) return;
   try {
     const result = await client.post("/api/keys/" + id + "/rotate-secret");
-    alert("New signing secret (save this now):\n\n" + result.plaintext_signing_secret);
+    await renderKeys();
+    revealCredentials("Signing secret rotated — save this now, it is not recoverable", [
+      ["New signing secret", result.plaintext_signing_secret],
+    ]);
   } catch (err) {
-    toast("Rotation failed: " + err.message, "err");
+    toast("Rotation failed: " + err.message, "error");
   }
 }
 
@@ -684,55 +802,66 @@ async function renderSyncLogs() {
   const panel = document.getElementById("tab-sync-logs");
   const logs = await client.get("/api/sync-logs?limit=100");
   panel.innerHTML = `
-    <div class="panel">
-      <div class="panel-header"><h2>Sync Logs</h2></div>
-      <table>
+    <section class="card">
+      <div class="list-header"><h2>Sync Logs</h2></div>
+      <div class="table-container">
+        <table class="data-table">
         <thead><tr><th>Timestamp</th><th>Job</th><th>Name</th><th>Status</th><th>Items</th><th>Chunks</th><th>ms</th><th>Error</th></tr></thead>
         <tbody>
-          ${logs.length ? logs.map(logRow).join("") : '<tr><td colspan="8" class="empty">No log entries yet.</td></tr>'}
+          ${logs.length ? logs.map(logRow).join("") : '<tr><td colspan="8" class="empty-state">No log entries yet.</td></tr>'}
         </tbody>
       </table>
-    </div>`;
+      </div>
+    </section>`;
+}
+
+/// Maps a `JobSummary::status` string onto its badge modifier. Anything unrecognised is treated as
+/// a failure rather than rendered bare: an unstyled status cell would read as "no problem".
+function statusBadge(status) {
+  const modifier =
+    status === "SUCCESS" ? "success" : status === "PARTIAL" ? "partial" : "failed";
+  return `<span class="badge badge-status-${modifier}">${escapeHtml(status)}</span>`;
 }
 
 function logRow(l) {
-  const cls = l.status === "SUCCESS" ? "status-ok" : l.status === "PARTIAL" ? "status-partial" : "status-failed";
   return `<tr>
-    <td>${escapeHtml(l.timestamp)}</td>
+    <td class="font-mono text-sm">${escapeHtml(l.timestamp)}</td>
     <td>${escapeHtml(l.job_type)}</td>
     <td>${escapeHtml(l.job_name)}</td>
-    <td class="${cls}">${escapeHtml(l.status)}</td>
+    <td>${statusBadge(l.status)}</td>
     <td>${l.items_processed}</td>
     <td>${l.chunks_sent}</td>
     <td>${l.duration_ms}</td>
-    <td>${escapeHtml(l.error_message || "")}</td>
+    <td class="text-muted text-sm">${escapeHtml(l.error_message || "")}</td>
   </tr>`;
 }
 
 async function renderAuditLogs() {
   const panel = document.getElementById("tab-audit-logs");
   if (!me.is_master) {
-    panel.innerHTML = '<div class="panel empty">Audit logs are visible to the Master key only.</div>';
+    panel.innerHTML = '<section class="card"><p class="empty-state">Audit logs are visible to the Master key only.</p></section>';
     return;
   }
   const logs = await client.get("/api/audit-logs?limit=100");
   panel.innerHTML = `
-    <div class="panel">
-      <div class="panel-header"><h2>Audit Logs</h2></div>
-      <table>
+    <section class="card">
+      <div class="list-header"><h2>Audit Logs</h2></div>
+      <div class="table-container">
+        <table class="data-table">
         <thead><tr><th>Timestamp</th><th>Actor</th><th>Client IP</th><th>Action</th><th>Target</th></tr></thead>
         <tbody>
-          ${logs.length ? logs.map(auditRow).join("") : '<tr><td colspan="5" class="empty">No audit entries yet.</td></tr>'}
+          ${logs.length ? logs.map(auditRow).join("") : '<tr><td colspan="5" class="empty-state">No audit entries yet.</td></tr>'}
         </tbody>
       </table>
-    </div>`;
+      </div>
+    </section>`;
 }
 
 function auditRow(a) {
   return `<tr>
     <td>${escapeHtml(a.timestamp)}</td>
-    <td>${escapeHtml(a.api_key_name || "")} <span class="mono">${escapeHtml(a.api_key_prefix || "")}</span></td>
-    <td class="mono">${escapeHtml(a.client_ip || "")}</td>
+    <td>${escapeHtml(a.api_key_name || "")} <span class="font-mono">${escapeHtml(a.api_key_prefix || "")}</span></td>
+    <td class="font-mono">${escapeHtml(a.client_ip || "")}</td>
     <td>${escapeHtml(a.action)}</td>
     <td>${escapeHtml(a.target_resource || "")}</td>
   </tr>`;
@@ -746,18 +875,18 @@ async function deleteResource(path, tab) {
   if (!confirm("Delete this resource? This cannot be undone.")) return;
   try {
     await client.del(path);
-    toast("Deleted", "ok");
+    toast("Deleted", "success");
     await loadTab(tab);
   } catch (err) {
-    toast("Delete failed: " + err.message, "err");
+    toast("Delete failed: " + err.message, "error");
   }
 }
 
 async function triggerResource(path) {
   try {
     const result = await client.post(path);
-    toast(`Triggered: ${result.status} — ${result.items_processed} items, ${result.chunks_sent} chunks`, result.status === "FAILED" ? "err" : "ok");
+    toast(`Triggered: ${result.status} — ${result.items_processed} items, ${result.chunks_sent} chunks`, result.status === "FAILED" ? "error" : "success");
   } catch (err) {
-    toast("Trigger failed: " + err.message, "err");
+    toast("Trigger failed: " + err.message, "error");
   }
 }
