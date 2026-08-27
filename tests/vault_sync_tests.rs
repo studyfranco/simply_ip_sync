@@ -667,3 +667,304 @@ async fn mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at()
          re-pushes the entire delta rather than skipping what bad_target only partially received"
     );
 }
+
+// =============================================================================================
+// High-volume, two-vault convergence scenario
+//
+// Everything above this line drives *stateless* `wiremock` stubs: every response is a fixture, so
+// those tests can prove what the engine asked for (page count, chunk count, query string) but not
+// what the target ended up holding. The tests below drive `common::MockVault`, which keeps a real
+// record store behind the same two endpoints, so the assertions are about **convergence** —
+// distinct record counts, dedup on the canonical address, tombstone flags, and an untouched
+// sibling group.
+// =============================================================================================
+
+/// Deterministic address for `index` inside `10.<block>.0.0/16`: `10.<block>.<index/256>.<index%256>`.
+///
+/// Index 1 → `10.<block>.0.1`, index 1000 → `10.<block>.3.232`, index 1524 → `10.<block>.5.244`.
+fn block_ip(block: u32, index: u32) -> String {
+    format!("10.{block}.{}.{}", index / 256, index % 256)
+}
+
+/// Inclusive index range as addresses in `10.<block>.0.0/16`.
+fn block_range(block: u32, from: u32, to: u32) -> Vec<String> {
+    (from..=to).map(|i| block_ip(block, i)).collect()
+}
+
+const ALPHA_BLOCK: u32 = 0;
+const BETA_BLOCK: u32 = 1;
+
+/// Vault A holds indices 1..=1000 in each group.
+const A_FIRST: u32 = 1;
+const A_LAST: u32 = 1_000;
+/// Vault B's overlap with A: indices 501..=1000 (`10.x.1.245` … `10.x.3.232`), 500 addresses.
+const OVERLAP_FIRST: u32 = 501;
+const OVERLAP_LAST: u32 = 1_000;
+/// Vault B's own unique block: indices 1025..=1524 (`10.x.4.1` … `10.x.5.244`), 500 addresses.
+const B_UNIQUE_FIRST: u32 = 1_025;
+const B_UNIQUE_LAST: u32 = 1_524;
+/// Records added to Vault A between the two sync passes: indices 1525..=1624, 100 addresses,
+/// deliberately past B's unique block so they are genuinely new to the target.
+const ADDED_FIRST: u32 = 1_525;
+const ADDED_LAST: u32 = 1_624;
+/// Records soft-deleted on Vault A between the two passes: indices 1..=200, all of which reached
+/// Vault B in the first pass, so the tombstones have something to land on.
+const DELETED_FIRST: u32 = 1;
+const DELETED_LAST: u32 = 200;
+
+/// Builds the two-vault fixture described above and returns `(vault_a, vault_b, seeded_at)`.
+///
+/// `seeded_at` is deliberately an hour in the past: the second sync pass filters on
+/// `since = last_sync_at`, so the untouched bulk of the dataset has to sit clearly *outside* that
+/// window for "only the changed records come back" to mean anything. Seeded at "now", every record
+/// would land on the boundary and the differential assertion would pass for the wrong reason.
+async fn build_two_vault_fixture() -> (common::MockVault, common::MockVault, chrono::DateTime<Utc>) {
+    let vault_a = common::MockVault::start().await;
+    let vault_b = common::MockVault::start().await;
+    let seeded_at = Utc::now() - chrono::Duration::hours(1);
+
+    // Vault A: 1,000 records in each of two groups.
+    vault_a.seed("group_alpha", block_range(ALPHA_BLOCK, A_FIRST, A_LAST), seeded_at);
+    vault_a.seed("group_beta", block_range(BETA_BLOCK, A_FIRST, A_LAST), seeded_at);
+
+    // Vault B: 1,000 records in each group — half overlapping A, half unique to B.
+    for (group, block) in [("group_alpha", ALPHA_BLOCK), ("group_beta", BETA_BLOCK)] {
+        vault_b.seed(group, block_range(block, OVERLAP_FIRST, OVERLAP_LAST), seeded_at);
+        vault_b.seed(group, block_range(block, B_UNIQUE_FIRST, B_UNIQUE_LAST), seeded_at);
+    }
+
+    assert_eq!(vault_a.record_count("group_alpha"), 1_000, "fixture: Vault A group_alpha");
+    assert_eq!(vault_a.record_count("group_beta"), 1_000, "fixture: Vault A group_beta");
+    assert_eq!(vault_b.record_count("group_alpha"), 1_000, "fixture: Vault B group_alpha");
+    assert_eq!(vault_b.record_count("group_beta"), 1_000, "fixture: Vault B group_beta");
+
+    (vault_a, vault_b, seeded_at)
+}
+
+/// Wires a sync task replicating `group_alpha` from `source` to `target`, same group name on both
+/// sides.
+async fn insert_alpha_task(conn: &sea_orm::DatabaseConnection, source_vault_id: Uuid, target_vault_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    vault_sync_task::ActiveModel {
+        id: Set(id),
+        name: Set("alpha-replication".to_owned()),
+        source_vault_id: Set(source_vault_id),
+        source_group_name: Set("group_alpha".to_owned()),
+        target_group_name: Set("group_alpha".to_owned()),
+        cron_schedule: Set("0 0 * * *".to_owned()),
+        last_sync_at: Set(None),
+        mode: Set("upsert".to_owned()),
+        is_active: Set(true),
+        owner_key_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(conn)
+    .await
+    .expect("insert task");
+    vault_sync_task_target::ActiveModel {
+        vault_sync_task_id: Set(id),
+        target_vault_id: Set(target_vault_id),
+        target_group_name: Set(None),
+    }
+    .insert(conn)
+    .await
+    .expect("insert task target");
+    id
+}
+
+/// High-volume replication between two vaults holding partially overlapping datasets, then an
+/// incremental second pass carrying additions and tombstones.
+///
+/// # Pass 1 — full replication into a partially-populated target
+///
+/// Vault A's `group_alpha` (1,000 records) replicates into Vault B's `group_alpha`, which already
+/// holds 1,000 records of its own: 500 shared with A and 500 A has never seen. The target must
+/// converge on **1,500 distinct records** — the 500 overlapping addresses updating in place rather
+/// than doubling — and B's `group_beta` must be untouched throughout.
+///
+/// # Pass 2 — differential delivery
+///
+/// 200 of A's `group_alpha` records are soft-deleted and 100 new ones appear. The second run filters
+/// on `since = last_sync_at`, so exactly those 300 must come back — not the 800 that did not change,
+/// and not the full 1,100. The 200 tombstones must propagate as `is_deleted = true` onto rows that
+/// already exist in B.
+///
+/// # On pagination
+///
+/// At 1,000 records the client's 5,000-record page size means the delta is one page, and this test
+/// asserts exactly that — one `GET /api/ips` carrying `limit=5000&offset=0`, correct
+/// `group_name`/`include_deleted`, and a fetch loop that consumed the whole result. Multi-page
+/// paging (15,001 records across 4 pages, including the short final page) is exercised separately
+/// by `source_vault_delta_spanning_multiple_pages_is_fetched_completely` above; asserting a page
+/// boundary here that the engine does not actually cross would be asserting a fiction.
+#[tokio::test]
+async fn test_inter_vault_sync_high_volume_partial_overlap() {
+    let (conn, state, _master) = common::setup().await;
+    let (vault_a, vault_b, seeded_at) = build_two_vault_fixture().await;
+
+    let source_id = insert_vault(&conn, "vault-a", &vault_a.uri()).await;
+    let target_id = insert_vault(&conn, "vault-b", &vault_b.uri()).await;
+    let task_id = insert_alpha_task(&conn, source_id, target_id).await;
+
+    // ── Pass 1 ────────────────────────────────────────────────────────────────────────────────
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("first pass runs");
+
+    assert_eq!(summary.status, "SUCCESS", "error: {:?}", summary.error_message);
+    assert_eq!(summary.items_processed, 1_000, "the full source group must be fetched");
+    assert_eq!(summary.chunks_sent, 1, "1,000 records at a 5,000-record chunk size is a single batch");
+
+    // The fetch side: one correctly-parameterised page (see the doc comment on why one).
+    let gets = vault_a.gets();
+    assert_eq!(gets.len(), 1, "1,000 records fits in one 5,000-record page, so exactly one GET is correct");
+    let first_get = &gets[0];
+    assert_eq!(first_get.group_name.as_deref(), Some("group_alpha"));
+    assert_eq!(first_get.include_deleted.as_deref(), Some("true"), "tombstones must be requested every run");
+    assert_eq!(first_get.limit, Some(5_000), "the client must page with an explicit limit");
+    assert_eq!(first_get.offset, Some(0));
+    assert_eq!(first_get.since, None, "the first run has no high-water mark yet, so it must fetch everything");
+    assert_eq!(first_get.returned, 1_000);
+
+    // The push side: one upsert batch carrying the whole delta, with no address sent twice.
+    let batches = vault_b.batches();
+    assert_eq!(batches.len(), 1, "one fetched chunk means one batch request");
+    assert_eq!(batches[0].group_name, "group_alpha");
+    assert_eq!(batches[0].mode, "upsert", "inter-vault sync must never send full_replace — a delta is not a full set");
+    assert_eq!(batches[0].records, 1_000);
+    let mut pushed_sorted = batches[0].addresses.clone();
+    pushed_sorted.sort();
+    let mut pushed_unique = pushed_sorted.clone();
+    pushed_unique.dedup();
+    assert_eq!(
+        pushed_sorted.len(),
+        pushed_unique.len(),
+        "the engine must not send the same canonical address twice within a batch"
+    );
+
+    // ── Convergence ───────────────────────────────────────────────────────────────────────────
+    assert_eq!(
+        vault_b.record_count("group_alpha"),
+        1_500,
+        "500 pre-existing B-only + 500 overlapping (updated in place, not duplicated) + 500 newly \
+         pushed from A = 1,500 distinct records"
+    );
+    assert!(
+        vault_b.deleted_addresses("group_alpha").is_empty(),
+        "an upsert pass must never tombstone anything"
+    );
+
+    // Every address from either side is present exactly once, and nothing else is.
+    let converged = vault_b.records("group_alpha");
+    let mut expected: Vec<String> = block_range(ALPHA_BLOCK, A_FIRST, A_LAST);
+    expected.extend(block_range(ALPHA_BLOCK, B_UNIQUE_FIRST, B_UNIQUE_LAST));
+    expected.sort();
+    expected.dedup();
+    assert_eq!(expected.len(), 1_500, "fixture arithmetic: the union of both datasets is 1,500 addresses");
+    let mut actual: Vec<String> = converged.keys().cloned().collect();
+    actual.sort();
+    assert_eq!(actual, expected, "the target must hold exactly the union of both datasets");
+
+    // The 500 addresses both vaults already had must have been *updated*, not re-created: their
+    // `created_at` still carries B's original seeding stamp.
+    let seeded_naive = seeded_at.naive_utc();
+    for address in block_range(ALPHA_BLOCK, OVERLAP_FIRST, OVERLAP_LAST) {
+        let record = converged.get(&address).unwrap_or_else(|| panic!("{address} missing from the target"));
+        assert_eq!(
+            record.created_at, seeded_naive,
+            "{address} existed on B before the sync; an upsert must update it in place, not replace the row"
+        );
+    }
+
+    // The group nobody asked to replicate must be byte-for-byte untouched.
+    assert_eq!(vault_b.record_count("group_beta"), 1_000, "group_beta must not gain records from an alpha-only task");
+    assert!(vault_b.deleted_addresses("group_beta").is_empty(), "group_beta must not gain tombstones either");
+    assert!(
+        vault_b.batches().iter().all(|b| b.group_name == "group_alpha"),
+        "no batch may be addressed to any group other than the task's target group"
+    );
+
+    let after_pass_one = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
+    let first_high_water = after_pass_one.last_sync_at.expect("a fully successful pass must advance last_sync_at");
+
+    // ── Pass 2: mutate the source, then sync differentially ───────────────────────────────────
+    let mutated_at = Utc::now();
+    let deleted = block_range(ALPHA_BLOCK, DELETED_FIRST, DELETED_LAST);
+    vault_a.soft_delete("group_alpha", &deleted, mutated_at);
+    vault_a.seed("group_alpha", block_range(ALPHA_BLOCK, ADDED_FIRST, ADDED_LAST), mutated_at);
+
+    let summary2 = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("second pass runs");
+
+    assert_eq!(summary2.status, "SUCCESS", "error: {:?}", summary2.error_message);
+    assert_eq!(
+        summary2.items_processed, 300,
+        "the differential pass must fetch exactly the 200 tombstoned + 100 added records — not the \
+         800 that did not change, and not all 1,100"
+    );
+
+    let gets2 = vault_a.gets();
+    assert_eq!(gets2.len(), 2, "the second pass adds exactly one more paged fetch");
+    let second_get = &gets2[1];
+    assert_eq!(
+        second_get.since.as_deref(),
+        Some(first_high_water.timestamp().to_string().as_str()),
+        "the second pass must filter on the high-water mark the first pass recorded"
+    );
+    assert_eq!(
+        second_get.include_deleted.as_deref(),
+        Some("true"),
+        "without include_deleted the 200 tombstones would be invisible and the deletions would never replicate"
+    );
+    assert_eq!(second_get.returned, 300);
+
+    // Tombstone delivery: the second batch must carry all 200 deletions, flagged.
+    let batches2 = vault_b.batches();
+    assert_eq!(batches2.len(), 2, "one delta chunk per pass");
+    let delta_batch = &batches2[1];
+    assert_eq!(delta_batch.records, 300);
+    let tombstoned_in_batch: Vec<&String> = delta_batch
+        .addresses
+        .iter()
+        .zip(&delta_batch.tombstones)
+        .filter(|(_, is_deleted)| **is_deleted)
+        .map(|(address, _)| address)
+        .collect();
+    assert_eq!(tombstoned_in_batch.len(), 200, "all 200 deletions must be pushed as tombstones, not silently dropped");
+
+    // ── Convergence, second pass ──────────────────────────────────────────────────────────────
+    assert_eq!(
+        vault_b.record_count("group_alpha"),
+        1_600,
+        "1,500 after the first pass + 100 newly added on the source = 1,600 distinct records; the 200 \
+         deletions tombstone existing rows rather than removing them"
+    );
+
+    let mut b_deleted = vault_b.deleted_addresses("group_alpha");
+    b_deleted.sort();
+    let mut expected_deleted = deleted.clone();
+    expected_deleted.sort();
+    assert_eq!(b_deleted, expected_deleted, "exactly the 200 addresses deleted on the source must be tombstoned on the target");
+
+    for address in block_range(ALPHA_BLOCK, ADDED_FIRST, ADDED_LAST) {
+        let records = vault_b.records("group_alpha");
+        let record = records.get(&address).unwrap_or_else(|| panic!("newly added {address} never reached the target"));
+        assert!(!record.is_deleted, "{address} was added, not deleted");
+    }
+
+    assert_eq!(
+        vault_b.live_addresses("group_alpha").len(),
+        1_400,
+        "1,600 total less the 200 tombstoned leaves 1,400 live records"
+    );
+
+    // Still untouched, two passes in.
+    assert_eq!(vault_b.record_count("group_beta"), 1_000, "group_beta must survive both passes unchanged");
+    assert!(vault_b.deleted_addresses("group_beta").is_empty());
+
+    let after_pass_two = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
+    let second_high_water = after_pass_two.last_sync_at.expect("the second pass must also advance last_sync_at");
+    assert!(
+        second_high_water > first_high_water,
+        "last_sync_at must move forward to this execution's start ({second_high_water} vs {first_high_water})"
+    );
+}

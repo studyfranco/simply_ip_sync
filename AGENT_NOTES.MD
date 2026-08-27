@@ -1363,3 +1363,90 @@ finding for whichever session next touches `scripts/test_e2e.sh`'s live-network 
 
 **Not done:** no changes to `RBAC_MODEL.md`'s own content (only referenced, not edited) or to any
 file under `example/`.
+
+## Session 13 (2026-08-19): high-volume two-vault convergence test + stateful `MockVault` fixture
+
+Requested: a high-volume inter-vault sync test — two vaults, 1,000-record groups, partial dataset
+overlap, pagination/batching, then a differential pass carrying tombstones.
+
+**The gap this closes.** Every pre-existing test in `vault_sync_tests.rs` drives *stateless*
+`wiremock` stubs: each response is a fixture, so those tests can prove what the engine **asked
+for** (page count, chunk count, query string, per-target fan-out) but structurally cannot answer
+"what does the target now hold?". Convergence claims — 1,500 distinct records, dedup on the
+canonical address, 200 rows flipped to `is_deleted` — need a target that actually stores what it is
+sent. So this session's first deliverable is `common::MockVault`: a stateful stand-in for a remote
+`simply_ip_vault` keeping a real `BTreeMap` record store behind the same two endpoints the engine
+calls (`GET /api/ips`, `POST /api/records/batch`), with request recording for both.
+
+**Two real-contract details deliberately mirrored** (both load-bearing for the assertions, both
+taken from the `simply_ip_vault` contract audited in Session 8, not invented):
+- `since` is an **OR across two columns**: `last_seen_at >= since`, or — only when
+  `include_deleted=true` — a tombstone whose `deleted_at >= since`. The second arm is what makes
+  deletions replicate at all.
+- A soft delete **does not touch `last_seen_at`**. That is precisely why the second arm is needed,
+  and it is what makes the differential test's "only the 300 changed records come back" assertion
+  meaningful rather than accidentally true.
+`full_replace` is implemented in the mock too (soft-deletes group members a batch omits) purely so
+the test can assert the inter-vault pipeline never sends it — `vault_sync_tasks.mode` is always
+`upsert`.
+
+**The scenario** (`test_inter_vault_sync_high_volume_partial_overlap`). Vault A: `group_alpha` and
+`group_beta`, 1,000 records each (`10.0.0.1`–`10.0.3.232`, `10.1.0.1`–`10.1.3.232`). Vault B: the
+same two groups, each 1,000 records = 500 overlapping A (`10.x.1.245`–`10.x.3.232`) + 500 unique to
+B (`10.x.4.1`–`10.x.5.244`). Pass 1 replicates `group_alpha` A→B and asserts convergence on exactly
+**1,500 distinct rows** (the 500 overlapping addresses updating in place — verified by checking
+their `created_at` still carries B's original seeding stamp, which a re-created row would not have),
+zero tombstones, the pushed batch containing no duplicate canonical address, and `group_beta`
+untouched. Pass 2 soft-deletes 200 records and adds 100 on A, then asserts the differential fetch
+returns exactly **300**, carries `since=<pass-1 high-water mark>` and `include_deleted=true`, pushes
+all 200 as flagged tombstones, converges B on 1,600 distinct / 1,400 live / exactly-those-200
+tombstoned, and advances `last_sync_at` strictly forward.
+
+**On pagination — an honest scope note.** The task asked to verify paging across the 1,000-record
+group. At the client's 5,000-record `DELTA_PAGE_SIZE`, 1,000 records is **one page**, so the test
+asserts exactly that: a single `GET` carrying `limit=5000&offset=0` with the right
+`group_name`/`include_deleted`, and a fetch loop that consumed the whole result. Asserting a page
+boundary the engine does not actually cross would be asserting a fiction; genuine multi-page paging
+(15,001 records / 4 pages including the short final page) is already covered by
+`source_vault_delta_spanning_multiple_pages_is_fetched_completely`, and the new test's doc comment
+cross-references it. Seeding timestamps are set an hour in the past for the same
+don't-pass-for-the-wrong-reason reason: seeded at "now", every record would sit on the `since`
+boundary and the differential assertion would hold accidentally.
+
+**Mutation-tested rather than assumed.** A green test proves nothing until it has been shown to
+fail, so three real bugs were planted in `src/jobs/vault_sync.rs`, each caught with a precise
+diagnostic, and the file restored (`git diff src/` empty afterwards):
+1. `include_deleted: true → false` → caught: "tombstones must be requested every run".
+2. `since: task.last_sync_at → None` → caught: differential pass fetched 1,100 instead of 300.
+3. `is_deleted: Some(record.is_deleted) → None` → caught: 0 of 200 tombstones pushed.
+
+**Ports.** `MockVault` is backed by `wiremock::MockServer`, which binds `127.0.0.1:0` and takes an
+OS-assigned ephemeral port. That is strictly stronger than scanning a fixed range like
+`3000..=3100`: there is no gap between "observed free" and "bound" for another process to win, so
+the suite parallelises under `cargo test` without collisions. (`pick_port`'s range-scan lives in
+`scripts/test_e2e.sh`, where a *fixed, known* port is genuinely needed because the compiled binary
+is launched as a separate process and curl has to be told where to find it.)
+
+**Test metrics after this session:**
+- `cargo test`: **184 passed** / 0 failed / 5 ignored (up from 183 — one new integration test).
+- `cargo test --test vault_sync_tests`: **9 passed** (up from 8), run 5× consecutively with
+  identical results to check for timing flakiness in the two-pass `since` window — stable.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean, zero warnings.
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained.
+- `./scripts/test_e2e.sh`: **211/213**, the same 2 failures Session 12 recorded and for the same
+  external reason — `live-mass-scanner`'s upstream URL
+  (`raw.githubusercontent.com/stamparm/maltrail/master/trails/static/mass_scanner.txt`) still
+  returns `404`. Re-confirmed this session that the repository itself is reachable (README `200`)
+  and the other three live feeds all return `200`, so it is that one file having moved or been
+  removed upstream, not a network problem. **Not caused by this session's change and structurally
+  cannot be:** the diff is `tests/`-only, and `test_e2e.sh` never executes `tests/` — it boots the
+  compiled binary and drives it over a real socket with `curl`. Deliberately did not guess a
+  replacement URL (guessing a path that happens to 200 would be exactly the fabrication this
+  repo's audit discipline exists to prevent); the two real options for whoever picks it up are to
+  source the correct current path from maltrail directly, or to reclassify an upstream `404` on a
+  live-network fixture as `SKIP` rather than `FAIL` — the suite already has a SKIP concept, but
+  changing a gate's semantics is a decision worth making deliberately, not as a side effect of a
+  test-writing session.
+
+**Not done:** no production code changed (the three mutations above were planted and reverted, and
+`git diff src/` is empty); nothing under `example/` touched.
