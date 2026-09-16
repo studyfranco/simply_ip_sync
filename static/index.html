@@ -33,6 +33,17 @@
           <input type="password" id="login-signing-secret" class="input-field" placeholder="Enter HMAC signing secret..." autocomplete="off" required>
           <small class="field-hint">Used locally to sign every request (HMAC-SHA256). Never transmitted.</small>
         </div>
+        <div class="form-group">
+          <label for="login-api-base">API base path override</label>
+          <input type="text" id="login-api-base" class="input-field" placeholder="/api" autocomplete="off">
+          <small class="field-hint">
+            Leave blank unless a reverse proxy rewrites the path. Requests are always sent to
+            where this page is served from, but the <em>signature</em> must cover the path the
+            <strong>server</strong> sees: if the proxy strips a mount prefix
+            (<code>/ip_sync/api/keys</code> → <code>/api/keys</code>), keep the default
+            <code>/api</code>; if it forwards the prefix untouched, set <code>/ip_sync/api</code>.
+          </small>
+        </div>
         <button type="submit" class="btn btn-primary">Sign in</button>
       </form>
       <div id="login-error" class="message error hidden"></div>

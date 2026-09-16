@@ -1573,3 +1573,133 @@ adding the Tier column would otherwise have left a 5-wide header over 6-wide row
 
 **Not done:** no `src/` change (`git diff src/` empty — this was a frontend and docs session);
 nothing under `example/` modified.
+
+## Session 16 (2026-09-16): production reverse-proxy fixes — master bootstrap noise, TRUSTED_PROXIES hostnames, WebUI subpath mounting
+
+Three operational issues reported from a real deployment behind Traefik, none of them findable by
+any existing test because all three only manifest under conditions the test suite doesn't
+exercise: a specific log message an operator found alarming, a specific env var value that only
+occurs in a container-orchestrated network, and a specific `window.location.pathname` this suite
+never runs the dashboard from.
+
+### 1. Master bootstrap warning realigned with `simply_ip_vault`
+
+The reported symptom — `No INITIAL_MASTER_KEY set; generated a one-time Master key` at every
+normal boot — was this service treating the *absence* of `INITIAL_MASTER_KEY` as the anomaly
+worth a `warn!`. Read `simply_ip_vault::main.rs::bootstrap_master_key` and found the opposite
+convention: random generation is undocumented, silent, normal behaviour; a `warn!` fires only when
+`INITIAL_MASTER_KEY`/`INITIAL_MASTER_SIGNING_SECRET` is explicitly *set*, because that is the
+unusual path (deterministic test/CI bootstrap) and the one worth a human noticing in a real
+deployment's logs. Ported that convention exactly, and ported the boxed `tracing::info!` banner
+that shows both credentials together after the row is inserted, regardless of which path produced
+them — the only moment either is knowable again, since RBAC §5 refuses rotation for the Master key.
+
+Also hardened `InvalidInitialMasterKey`/`InvalidInitialMasterSigningSecret` from unit structs to
+carry `got`/`detail` fields (character count, and whether non-hex characters were the problem),
+matching `simply_ip_vault::config`'s error message exactly — an operator now sees *why* their value
+was rejected, not just that it was.
+
+**Did not** port `simply_ip_vault::main.rs`'s workaround of logging the error before returning it
+(that project's `main()` returns `Result` from `#[tokio::main]`, which the runtime renders with
+`Debug` and would otherwise swallow the message). This service's own `main()` already logs its
+top-level error via `{e}` (`Display`), not `{e:?}`, so the workaround has nothing to fix here —
+verified this is deliberate, not an oversight, before deciding not to copy it.
+
+Verified live, not just by reading the diff: booted the compiled binary with `RUST_LOG=info` and no
+`INITIAL_MASTER_KEY` set — confirmed the old warning is gone and the boxed banner renders exactly
+as designed.
+
+### 2. `TRUSTED_PROXIES` accepts hostnames — the actual reported crash
+
+`traefik_tomidejetsu` (a Docker Compose service name) previously failed
+`entry.parse::<IpNetwork>()` outright, and `parse_trusted_proxies` had no other spelling to try, so
+`TrustedProxies::from_env` (then just `trusted_proxies_from_env`) returned `Err` and the process
+exited before binding a listener — exactly the reported "crashes startup" symptom.
+
+Ported `simply_ip_vault::config`'s `TrustedProxies` machinery in full: `ProxyMatcher::{Network,
+Hostname}`, `hostname_rejection` (a hostname is accepted unless it contains `/`/`:`, is
+digits-and-dots-only, or has a non-alphanumeric edge — byte-for-byte the same rule the peer
+documents as shared with `simply_hook_executor`), and the resolution cache
+(`tokio::net::lookup_host` at **request time**, 30s positive / 5s negative TTL, a 60s boot grace
+period before an unresolved entry is reported as persistent rather than a boot race). A hostname
+that fails to resolve is untrusted for that entry alone — it cannot widen trust, and it cannot take
+a healthy literal CIDR down with it.
+
+**One deliberate structural improvement over the peer, not a blind port.** `simply_ip_vault::main.rs`
+constructs `TrustedProxies::from_env()` *twice* — once locally for its own boot-time log line and
+`prime_with_grace()` call, and again inside `AppState::new()` for the instance the request path
+actually reads from. Those are two independent resolution caches; priming the first does nothing
+for the second. This service instead builds `TrustedProxies` exactly once, inside
+`AppState::new()`, and has `main.rs` log and prime `state.trusted_proxies` directly after
+`setup_state()` returns — one instance, one cache, actually warmed before the first request needs
+it. Recorded here rather than converged away, per this project's own stated policy on deliberate
+divergences from the peer.
+
+`state.rs`: `AppState::trusted_proxies` changed from `Arc<Vec<IpNetwork>>` to
+`config::TrustedProxies` (already `Arc`-backed internally, so no double-wrapping).
+`middleware.rs::auth_middleware` now awaits `state.trusted_proxies.resolved()` before calling
+`resolve_client_ip` — the only per-request behavioural change, and it's a no-op cost (an `Arc`
+clone, no lock) for every deployment that names its proxies by address rather than hostname, which
+remains the common case.
+
+Verified live: booted the compiled binary with `TRUSTED_PROXIES=traefik_tomidejetsu,127.0.0.1/32`
+(the exact reported value plus a literal to prove mixed configs work) — it now boots, stays up, and
+logs the unresolved hostname as a `TAMPER`-free, non-fatal `ERROR` with a 60s retry, rather than
+exiting.
+
+### 3. WebUI subpath mounting (`/ip_sync/`)
+
+`static/app.js`'s `SyncClient` previously had no path derivation at all — every call site already
+spelled its endpoint as a literal `/api/...`, which `fetch()` resolves against the *domain* root,
+not the page's own directory. Mounted at `https://host/ip_sync/`, every request went to
+`https://host/api/...` instead of through the proxy's `/ip_sync/` prefix.
+
+Ported `simply_ip_vault::static/app.js`'s two-base design (`requestBase`/`signingBase`), adapted to
+this service's call-site shape (endpoints already carry `/api/...` themselves, unlike the peer's,
+so the bases here are bare mount prefixes — `""` at root, `/ip_sync` under a subpath — not
+`/api`-inclusive ones):
+
+- `requestBase` — derived from `window.location.pathname` (`deriveRequestBase()`), needs zero
+  configuration, covers "where to send".
+- `signingBase` — defaults to `requestBase`, independently overridable via a new "API base path
+  override" login field (persisted in `localStorage`, mirroring the peers' `login-api-base`
+  convention), covers "what to sign". The two are genuinely different paths whenever a reverse
+  proxy strips the mount prefix before forwarding to this service — `middleware.rs::signed_target`
+  verifies against whatever `OriginalUri` the *server* receives, which the browser has no way to
+  introspect. Deliberately **not** the peer's own quirk of stripping the query string before
+  signing: this service's server-side `signed_target` includes the query (confirmed by re-reading
+  `middleware.rs` before writing the client, not assumed from the peer's behaviour), so the client
+  signs the full path-plus-query, matching what this server actually verifies.
+
+Also added `Vec<'static>`-free regression coverage in `tests/source_hygiene.rs` (no JS runtime
+exists in this repository to execute `app.js` against, so these check the code's *shape* rather
+than its runtime behaviour — the same approach the file's pre-existing tab-panel-id test already
+uses): the request-base derivation reads `window.location.pathname`; the override mechanism and its
+`localStorage` key exist; the sole `fetch()` call site is prefixed with `this.requestBase`; the
+signed message covers `this.signingBase`; the login field exists and is optional (not `required` —
+a mandatory field here would break every direct, non-proxied deployment, the common case this fix
+must not regress). **Mutation-tested, not merely written:** reverted the `fetch()` call to a bare
+`fetch(path)` and reverted the signed message to omit `signingBase`, confirmed each planted bug was
+caught with the expected assertion failure, then restored the file (`git diff static/app.js` clean
+before re-applying the real fix).
+
+### Verification
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: **202 passed / 0 failed / 5 ignored** (up from 184 — 13 new `config::tests` covering
+  hostname parsing/rejection/resolution/caching plus the hardened master-key error fields, 5 new
+  `source_hygiene` regression tests for the subpath mechanism).
+- `./scripts/test_e2e.sh`: **213/213**, unchanged — no existing E2E assertion touches these three
+  code paths' exact log text or a proxied deployment.
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
+  `resolve_client_ip`/`normalize_ip`/`is_trusted` are untouched by this session (only their callers
+  and the matcher type they receive changed), so Pillar 1's function-body diff against the peer
+  still matches byte-for-byte.
+- Manual, live verification beyond the automated gates (both confirmed above): the master-bootstrap
+  banner, and the exact reported `TRUSTED_PROXIES` value booting successfully where it previously
+  crashed. No leftover processes after either manual run.
+
+**Not done:** did not add a `verify_convergence.sh` pillar for the new `TrustedProxies` machinery —
+the script's existing pillars diff specific function *bodies* against the peer, and `TrustedProxies`
+was ported with one deliberate structural divergence (§2 above) that a byte-diff would incorrectly
+flag as drift. Nothing under `example/` modified.

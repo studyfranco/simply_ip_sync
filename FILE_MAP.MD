@@ -17,9 +17,23 @@ needing to know where a change belongs before making it.
 
 Startup sequence, in order, and nothing else: env → connect → pragmas → migrate → bootstrap
 Master (`bootstrap_master_key`, the only writer of `is_master = true` in the service) → build
-state (`setup_state`) → `master_pin.pin_at_boot()` → `scheduler.boot()` → bind → serve → graceful
-shutdown. Moving the pin later than it is now would reopen the tampering window it exists to
-close (see `master.rs`).
+state (`setup_state`) → `master_pin.pin_at_boot()` → log `TRUSTED_PROXIES` posture + prime its
+hostnames (`state.trusted_proxies.prime_with_grace()`) → `scheduler.boot()` → bind → serve →
+graceful shutdown. Moving the pin later than it is now would reopen the tampering window it exists
+to close (see `master.rs`).
+
+`bootstrap_master_key`'s `INITIAL_MASTER_KEY`/`INITIAL_MASTER_SIGNING_SECRET` handling matches
+`simply_ip_vault`'s convention exactly: **generation is the normal path and is silent**; a warning
+fires only when one of the two env vars is explicitly *set* (deterministic test/CI bootstrap,
+never a real deployment). Either way, the resulting credentials are shown exactly once in a boxed
+`tracing::info!` banner after the row is inserted — rotation is refused for the Master key through
+the API (RBAC §5), so this is the only moment they are ever knowable again.
+
+The `TRUSTED_PROXIES` boot log reads `state.trusted_proxies` (not a second, independently-built
+`TrustedProxies`) deliberately — a second instance would carry its own resolution cache, so
+priming it would warm a cache nothing on the request path ever reads from. This is a considered
+divergence from `simply_ip_vault`'s own `main.rs`, which does construct two instances (see
+`AGENT_NOTES.MD`).
 
 ### `src/lib.rs` — router assembly and the crate's public surface
 
@@ -40,8 +54,9 @@ inspection, never DML.
 
 ### `src/state.rs` — shared application state
 
-`AppState`: `db`, `cipher`, `replay`, `master_pin`, `trusted_proxies`, `http` (outbound client),
-`scheduler`. Every field is behind an `Arc` (or its own internal `Arc`/`OnceLock`), so `#[derive(Clone)]`
+`AppState`: `db`, `cipher`, `replay`, `master_pin`, `trusted_proxies` (a `config::TrustedProxies`,
+already `Arc`-backed internally — see `config.rs`), `http` (outbound client), `scheduler`. Every
+field is behind an `Arc` (or its own internal `Arc`/`OnceLock`), so `#[derive(Clone)]`
 can never silently hand a request its own private copy of a security primitive. `for_tests`
 constructs state with a pre-pinned Master and a `Plaintext` cipher for the integration suites.
 
@@ -55,7 +70,9 @@ Neither substitutes for the other — see the module doc comment.
 
 ### `src/middleware.rs` — inbound authentication
 
-`auth_middleware`: resolves client IP → validates `X-Timestamp` (no DB round-trip) → looks up the
+`auth_middleware`: awaits `state.trusted_proxies.resolved()` (re-resolves any configured hostname
+whose cache entry has expired; a no-hostname configuration never touches the lock) → resolves
+client IP → validates `X-Timestamp` (no DB round-trip) → looks up the
 key by `SHA-256(X-API-Key)` → checks a declared `Content-Length` against `max_body_bytes()` and
 rejects with `413` before reading a byte if it's over → buffers the body (remapping `to_bytes`'s
 own overflow fallback to `413` too, for a body without a declared length) and verifies the
@@ -80,15 +97,29 @@ authentication error against the *vault* rather than a local misconfiguration.
 ### `src/config.rs` — environment parsing and client-address resolution
 
 `resolve_client_ip` (right-to-left `X-Forwarded-For` walk, trusted-peer gated), `normalize_ip`,
-`parse_trusted_proxies`, `resolve_bind_addr`, `validate_initial_master_key`, `max_body_bytes`,
-`outbound_http_timeout`, `max_decompressed_bytes` (decompression-bomb ceiling, shared by
-`jobs::decompress`'s two independent expansion points). `TRUSTED_PROXIES` and `INITIAL_MASTER_KEY`
-are security boundaries and fail hard on a malformed value; tuning variables (`MAX_BODY_SIZE_MIB`,
-`MAX_DECOMPRESSED_BYTES`, `OUTBOUND_HTTP_TIMEOUT_SECS`) fail soft to a default with a logged
-warning. `outbound_max_retries`/`outbound_retry_backoff` (`retry.rs`'s two tunables) are
-deliberately **not** `OnceLock`-cached the way the others are — they read `env::var` fresh on every
-call, specifically so a test can set one and see it take effect immediately rather than being stuck
-with whatever the first caller in the process observed.
+`resolve_bind_addr`, `validate_initial_master_key`, `max_body_bytes`, `outbound_http_timeout`,
+`max_decompressed_bytes` (decompression-bomb ceiling, shared by `jobs::decompress`'s two
+independent expansion points). `TRUSTED_PROXIES` and `INITIAL_MASTER_KEY` are security boundaries
+and fail hard on a malformed value; tuning variables (`MAX_BODY_SIZE_MIB`, `MAX_DECOMPRESSED_BYTES`,
+`OUTBOUND_HTTP_TIMEOUT_SECS`) fail soft to a default with a logged warning. `outbound_max_retries`/
+`outbound_retry_backoff` (`retry.rs`'s two tunables) are deliberately **not** `OnceLock`-cached the
+way the others are — they read `env::var` fresh on every call, specifically so a test can set one
+and see it take effect immediately rather than being stuck with whatever the first caller in the
+process observed.
+
+**`TrustedProxies`** — ported from `simply_ip_vault`/`simply_ip_exporter` to close a real
+production bug: `TRUSTED_PROXIES` previously accepted only IPs/CIDRs, so a Docker Compose service
+name (`traefik_tomidejetsu`) refused to parse and crashed startup. `parse_trusted_proxies` now
+tries, in order, a CIDR, a bare IP, then a hostname (`ProxyMatcher::Hostname`) — rejected only if
+it's shaped like neither (`hostname_rejection`: contains `/`/`:`, is digits-and-dots only, or has a
+non-alphanumeric edge). A hostname is resolved via `tokio::net::lookup_host` **at request time**,
+not once at startup, with a 30s positive / 5s negative TTL cache (`ResolutionCache`) so a container
+restart's new IP is picked up without restarting this service, and a hostname that fails to
+resolve fails *closed* for that entry alone rather than widening trust or taking healthy literal
+entries down with it. `prime_with_grace()` resolves every hostname once at boot and retries after a
+60s grace period (a daemon and its reverse proxy often start racing each other) — called from
+`main.rs` on `state.trusted_proxies` directly, never on a second instance (see `main.rs`'s entry
+above).
 
 ### `src/replay.rs` — anti-replay guard
 
@@ -295,7 +326,7 @@ paths cannot describe different tables.
 | `health_probes.rs` | `/health` never touches the database even when it's closed; `/ready` independently depends on both a live database and the boot-time Master pin (including a startup-ordering test — an unpinned `MasterPin` swapped into `AppState` post-setup — that a steady-state-only suite can't produce); the liveness body has exactly the two documented fields; neither probe leaks internal error text |
 | `concurrency_and_contracts.rs` | Real multi-task/thread contention the router's single-connection SQLite pool can't otherwise expose: 16 OS threads hammering `ReplayGuard::check_and_record` directly via a `Barrier` (exactly one admitted; distinct signatures never block each other), 16 concurrent `tokio::spawn`ed deletes of the same resource (exactly one `204`), and the `StrictPath`/`StrictQuery` JSON-envelope-totality contract (malformed path/query, and the oracle-discipline pairing between a malformed id and a nonexistent one) |
 | `client_resilience_tests.rs` | Outbound retry/backoff on transient vault failures, adaptive batch splitting on `413`, `full_replace`'s chunk-0-only rule surviving a `413` split, and per-page retry on the delta-fetch side |
-| `source_hygiene.rs` | `static/app.js` parses as valid ECMAScript (`oxc_parser`, self-tested against a known-broken fixture); every literal `document.getElementById()` reference resolves against `index.html` or an id `app.js` injects itself; the one dynamic id-construction pattern is verified against its actual invariant (every nav button's `data-tab` has a matching panel id) |
+| `source_hygiene.rs` | `static/app.js` parses as valid ECMAScript (`oxc_parser`, self-tested against a known-broken fixture); every literal `document.getElementById()` reference resolves against `index.html` or an id `app.js` injects itself; the one dynamic id-construction pattern is verified against its actual invariant (every nav button's `data-tab` has a matching panel id); reverse-proxy subpath support — `SyncClient` derives its request base from `window.location.pathname`, the one `fetch()` call site is prefixed with `requestBase`, the signed message covers `signingBase`, and `login-api-base` exists as an optional (never `required`) override field, each mutation-tested to confirm it actually catches the hardcoded-path regression it targets |
 
 `scripts/test_e2e.sh` (repository root, not under `tests/`) is the complementary black-box gate:
 it boots the real compiled binary and drives it with `curl` over a real socket, which none of the
@@ -322,6 +353,6 @@ against all three peers under `example/*/static/` (see `AGENT_NOTES.MD` Session 
 
 | File | Responsibility |
 | :--- | :--- |
-| `index.html` | The page shell only — it contains no data-bearing markup. A `.login-screen` > `.login-card` sign-in view, then `#dashboard-container` holding a `.top-bar` (`.header` with `.logo`, the RBAC tier chip, Refresh/Logout) and a `nav.tab-nav[role=tablist]` of `.tab-btn[data-tab]`. Each `data-tab="X"` pairs with an empty `<main id="tab-X" class="tab-panel">` that `app.js` fills; `tests/source_hygiene.rs` enforces that pairing. `#toast-container` is the single mount point for notifications. |
+| `index.html` | The page shell only — it contains no data-bearing markup. A `.login-screen` > `.login-card` sign-in view (including the optional "API base path override" field — see `app.js`), then `#dashboard-container` holding a `.top-bar` (`.header` with `.logo`, the RBAC tier chip, Refresh/Logout) and a `nav.tab-nav[role=tablist]` of `.tab-btn[data-tab]`. Each `data-tab="X"` pairs with an empty `<main id="tab-X" class="tab-panel">` that `app.js` fills; `tests/source_hygiene.rs` enforces that pairing. `#toast-container` is the single mount point for notifications. Both `<link>`/`<script>` tags reference `style.css`/`app.js` with **no leading slash**, so they resolve relative to whatever directory the page is served from. |
 | `style.css` | The design system. Its `:root` block is **byte-identical** to `simply_ip_vault`/`simply_hook_executor`/`simply_ip_exporter` — a token meaning something different here than one service over is worse than no token, because everything built on it drifts silently. Below that, the shared component set (`.card`, `.data-table` in a `.table-container`, `.tab-nav`/`.tab-btn`, `.btn` family, `.form-group`/`.input-field`, `.badge` family, `.toast`, utilities). Components the peers have but this UI has no markup for (modals, pagination, batch selection) are deliberately absent rather than carried as dead rules. |
-| `app.js` | Everything dynamic: a pure-JS SHA-256/HMAC fallback for non-secure contexts (`crypto.subtle` is unavailable over plain-HTTP LAN), the `SyncClient` that signs every request with `CANONICAL_V1` and unwraps the `{"error": …}` envelope, `activateTab()` reactive menu switching, and one `render*`/`*Row`/`show*Form` trio per resource. One-time credentials render into a `.key-reveal` block rather than a `window.alert()`, since the value has to be selectable and re-readable. |
+| `app.js` | Everything dynamic: a pure-JS SHA-256/HMAC fallback for non-secure contexts (`crypto.subtle` is unavailable over plain-HTTP LAN), the `SyncClient` that signs every request with `CANONICAL_V1` and unwraps the `{"error": …}` envelope, `activateTab()` reactive menu switching, and one `render*`/`*Row`/`show*Form` trio per resource. One-time credentials render into a `.key-reveal` block rather than a `window.alert()`, since the value has to be selectable and re-readable. **Reverse-proxy subpath support:** `SyncClient` carries two independent path prefixes — `requestBase` (where to *send*, derived from `window.location.pathname` via `deriveRequestBase()`, so a dashboard mounted at `/ip_sync/` needs no configuration) and `signingBase` (what to *sign*, defaulting to `requestBase` but overridable via the login form's "API base path override" field, persisted in `localStorage` under `simply_ip_sync_api_base`). The two diverge only when a reverse proxy strips the mount prefix before forwarding — a fact the browser cannot discover on its own, which is why the override exists at all. See `tests/source_hygiene.rs`'s dedicated regression tests for the exact shape a regression here would take. |

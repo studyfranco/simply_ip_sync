@@ -120,12 +120,76 @@ class SyncClient {
   constructor(apiKey, signingSecret) {
     this.apiKey = apiKey;
     this.signingSecret = signingSecret;
+
+    // Two distinct bases, because behind a reverse proxy they are genuinely different paths:
+    //
+    //   requestBase — where to SEND. Derived from the directory this page is served from, so a
+    //                 dashboard mounted at /ip_sync/ fetches /ip_sync/api/sources with no
+    //                 configuration at all.
+    //   signingBase — what to SIGN. The path the server itself sees after the proxy is done
+    //                 rewriting, which no amount of introspection in the browser can discover —
+    //                 hence the override. Defaults to `requestBase`, the case where the proxy
+    //                 forwards the mount prefix through untouched.
+    //
+    // Signing the browser's own URL unconditionally would break the moment a proxy strips a
+    // prefix: the server would verify `/api/sources` against a signature computed over
+    // `/ip_sync/api/sources` and reject it as a bad signature (`middleware::auth_middleware`
+    // signs whatever `OriginalUri` the server actually receives).
+    this.requestBase = SyncClient.deriveRequestBase();
+    const override = localStorage.getItem("simply_ip_sync_api_base") || "";
+    this.signingBase = override ? SyncClient.normalizeBasePath(override) : this.requestBase;
+  }
+
+  /**
+   * The prefix every request is sent to, derived from the directory this page is served from.
+   *
+   * Served at `/` this yields `""` — every call site already spells its endpoint as `/api/...`,
+   * so an empty prefix reproduces the previous hardcoded-root behaviour exactly. Served at
+   * `/ip_sync/` it yields `/ip_sync`, which is what makes a sub-path mount work with no
+   * configuration at all.
+   */
+  static deriveRequestBase() {
+    const path = window.location.pathname;
+    // Everything up to and including the last '/': '/ip_sync/index.html' -> '/ip_sync/', '/' -> '/'.
+    const dir = path.slice(0, path.lastIndexOf("/") + 1) || "/";
+    return dir === "/" ? "" : dir.replace(/\/+$/, "");
+  }
+
+  /**
+   * Cleans up a user-typed base-path override: trims it, guarantees exactly one leading slash, and
+   * drops any trailing one. A blank value normalizes to `""` — "no override, fall back to
+   * `requestBase`" — rather than a fixed default, since the correct default under a subpath is
+   * whatever this page is actually served from, not `/api` specifically.
+   */
+  static normalizeBasePath(raw) {
+    const trimmed = (raw || "").trim();
+    if (!trimmed) return "";
+    return "/" + trimmed.replace(/^\/+/, "").replace(/\/+$/, "");
+  }
+
+  /**
+   * Persists (or clears) the signing-base override and applies it to this session.
+   *
+   * Only signing is affected — where requests are *sent* stays derived from the page location.
+   * The two are independent precisely because a prefix-stripping proxy makes them differ.
+   */
+  setApiBaseOverride(raw) {
+    const normalized = SyncClient.normalizeBasePath(raw);
+    if (normalized) {
+      this.signingBase = normalized;
+      localStorage.setItem("simply_ip_sync_api_base", normalized);
+    } else {
+      this.signingBase = this.requestBase;
+      localStorage.removeItem("simply_ip_sync_api_base");
+    }
   }
 
   async request(method, path, body) {
     const timestamp = Math.floor(Date.now() / 1000).toString();
     const bodyBytes = body !== undefined ? new TextEncoder().encode(JSON.stringify(body)) : new Uint8Array(0);
-    const message = new TextEncoder().encode(`${method}\n${path}\n${timestamp}\n`);
+    // The signed target is path *and* query string, matching `middleware.rs::signed_target` —
+    // `path` here already carries any `?query` a call site appended (e.g. `/api/sync-logs?limit=100`).
+    const message = new TextEncoder().encode(`${method}\n${this.signingBase}${path}\n${timestamp}\n`);
     const full = concatBytes(message, bodyBytes);
     const signature = "sha256=" + (await hmacSha256Hex(this.signingSecret, full));
 
@@ -136,7 +200,7 @@ class SyncClient {
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
 
-    const resp = await fetch(path, {
+    const resp = await fetch(`${this.requestBase}${path}`, {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -206,12 +270,17 @@ function showLoginError(message) {
   box.classList.remove("hidden");
 }
 
+// Pre-fills the override field with whatever is already persisted, so a returning operator sees
+// their own prior setting rather than a blank field that silently means the same thing.
+document.getElementById("login-api-base").value = localStorage.getItem("simply_ip_sync_api_base") || "";
+
 document.getElementById("login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   document.getElementById("login-error").classList.add("hidden");
   const apiKey = document.getElementById("login-api-key").value.trim();
   const signingSecret = document.getElementById("login-signing-secret").value.trim();
   const candidate = new SyncClient(apiKey, signingSecret);
+  candidate.setApiBaseOverride(document.getElementById("login-api-base").value);
   try {
     me = await candidate.get("/api/auth/me");
     client = candidate;

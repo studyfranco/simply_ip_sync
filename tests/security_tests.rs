@@ -162,7 +162,9 @@ async fn trusted_proxy_forwarded_client_ip_is_checked_against_bound_ips() {
     active.update(&conn).await.unwrap();
 
     // The peer (127.0.0.1) is a trusted load balancer; the real client sits behind it.
-    state.trusted_proxies = std::sync::Arc::new(vec!["127.0.0.1/32".parse().unwrap()]);
+    state.trusted_proxies = simply_ip_sync::config::TrustedProxies::new(vec![
+        "127.0.0.1/32".parse().map(simply_ip_sync::config::ProxyMatcher::Network).unwrap(),
+    ]);
 
     let app = simply_ip_sync::create_app(state);
     let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
@@ -192,7 +194,7 @@ async fn spoofed_forwarded_for_from_an_untrusted_peer_does_not_bypass_bound_ips(
 
     // Nothing is trusted — the peer below must be evaluated on its own address, never on a
     // header it supplies about itself.
-    state.trusted_proxies = std::sync::Arc::new(Vec::new());
+    state.trusted_proxies = simply_ip_sync::config::TrustedProxies::default();
 
     let app = simply_ip_sync::create_app(state);
     let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();

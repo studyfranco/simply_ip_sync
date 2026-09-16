@@ -101,6 +101,7 @@ directory that contains a `.git` — see that script for the graceful offline-mo
   - Exceptions: `src/migration/` for DDL generated columns, and SQLite `PRAGMA` setup in `src/db.rs`.
 - **Database Setup (`src/db.rs`):** SQLite connection pool pinned to `max_connections = 1` with 4 WAL session pragmas (`foreign_keys=ON`, `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`).
 - **Frontend:** STRICTLY Vanilla JS, HTML5, and CSS3. **NO external dependencies** (No React, Vue, Tailwind, Bootstrap, CDN links, or Axios). Native `fetch()` only.
+  - **Reverse-proxy subpath aware:** `static/app.js`'s `SyncClient` derives its request path from `window.location.pathname` (`deriveRequestBase`), so mounting the dashboard under a prefix (e.g. `https://host/ip_sync/`) needs no build-time configuration. A separate, operator-overridable `signingBase` (the "API base path override" login field, persisted in `localStorage`) covers the one thing the browser cannot discover: whether the proxy strips that prefix before forwarding to this service, which changes what path `middleware.rs::signed_target` actually verifies against.
 - **Quality & Safety:**
   - Zero compiler warnings, zero `clippy` warnings.
   - **Zero `.unwrap()` or `.expect()`** in production or HTTP handlers. Use structured `AppError` and Axum's `IntoResponse`.
@@ -128,7 +129,16 @@ directory that contains a `.git` — see that script for the graceful offline-mo
 #### IP Extraction & Trusted Proxies
 - Respect `X-Forwarded-For` / `X-Real-IP` **only** when TCP peer is in `TRUSTED_PROXIES`.
 - Walk `X-Forwarded-For` right-to-left, skipping trusted proxy hops.
-- Invalid syntax in `TRUSTED_PROXIES` is fatal at startup.
+- `TRUSTED_PROXIES` accepts three spellings, comma-separated: a CIDR (`172.16.0.0/12`), a bare IP
+  (`127.0.0.1`, promoted to a single-host network), or a **hostname** (`traefik`,
+  `traefik_tomidejetsu`) — the shape a Docker Compose service name or a Kubernetes service takes.
+  A hostname is resolved via DNS **at request time**, not once at startup, and re-resolved on a
+  short TTL (`config::TrustedProxies`), so a proxy container's restart-and-new-IP is picked up
+  without restarting this service. See `src/config.rs`'s module doc for the full mechanism
+  (positive/negative caching, the boot-time grace period for a DNS race, `ProxyMatcher`).
+- Invalid syntax in `TRUSTED_PROXIES` is fatal at startup — this is purely syntactic (a hostname
+  that merely doesn't resolve *yet* is not an error); an unset variable is not an error either and
+  means "trust nothing".
 
 ---
 

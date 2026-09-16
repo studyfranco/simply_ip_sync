@@ -198,3 +198,87 @@ fn html_element_ids(html: &str) -> HashSet<String> {
     let id_attr = Regex::new(r#"\bid="([A-Za-z0-9_-]+)""#).expect("valid regex");
     id_attr.captures_iter(html).map(|c| c[1].to_owned()).collect()
 }
+
+// ---------------------------------------------------------------------------------------------
+// Reverse-proxy subpath support — regression coverage for a mechanism nothing else exercises.
+//
+// `app.js` runs only in a browser, and this repository has no JS test runner (`source_hygiene.rs`
+// only *parses* it — see the module doc comment). A behavioural test of `SyncClient` deriving the
+// right base path for a given `window.location.pathname` is therefore not possible here; what
+// *is* checkable without a runtime is the property a regression would actually break: that every
+// outbound request is built through `this.requestBase`/`this.signingBase` rather than a
+// reintroduced hardcoded absolute path. These tests exist to catch exactly that reintroduction —
+// e.g. a future edit that "simplifies" `request()` back to `fetch(path)` — which is precisely the
+// bug this task fixed and precisely the kind of regression a syntax check cannot see.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn sync_client_derives_its_request_base_from_the_page_location_rather_than_a_hardcoded_root() {
+    let app_js = read("static/app.js");
+    assert!(
+        app_js.contains("static deriveRequestBase()") && app_js.contains("window.location.pathname"),
+        "SyncClient must derive its request base from window.location.pathname, so a dashboard \
+         mounted under a reverse-proxy subpath (e.g. /ip_sync/) needs no build-time configuration"
+    );
+}
+
+/// The signing base must be independently overridable, because the browser cannot discover
+/// whether a reverse proxy strips the mount prefix before forwarding to this service — that is a
+/// fact about the proxy's own configuration, not about where the page happens to be served from.
+#[test]
+fn sync_client_exposes_an_independently_overridable_signing_base() {
+    let app_js = read("static/app.js");
+    assert!(
+        app_js.contains("setApiBaseOverride") && app_js.contains("simply_ip_sync_api_base"),
+        "the signing-base override must exist and persist via localStorage under a stable key, \
+         matching the ecosystem's login-api-base convention"
+    );
+}
+
+/// The one and only `fetch()` call in the file must go through `requestBase`, not a bare path —
+/// this is the literal shape of the bug this task fixes: a hardcoded `fetch(\"/api/...\")` (or
+/// `fetch(path)` with no prefix at all) reaches the wrong URL the moment the dashboard is mounted
+/// under a subpath, because the browser resolves a leading-`/` path against the domain root, not
+/// against the page's own directory.
+#[test]
+fn the_one_fetch_call_site_is_prefixed_with_the_derived_request_base() {
+    let app_js = read("static/app.js");
+    let fetch_calls: Vec<&str> = Regex::new(r"fetch\([^)]*\)")
+        .expect("valid regex")
+        .find_iter(&app_js)
+        .map(|m| m.as_str())
+        .collect();
+    assert_eq!(fetch_calls.len(), 1, "expected exactly one fetch() call site in app.js: {fetch_calls:?}");
+    assert!(
+        fetch_calls[0].contains("this.requestBase"),
+        "the fetch() call must be prefixed with this.requestBase: {}",
+        fetch_calls[0]
+    );
+}
+
+/// Every request signature must cover `this.signingBase`, not a bare path — otherwise the override
+/// field this task added would exist in the DOM but have no effect on what is actually signed.
+#[test]
+fn the_signed_message_includes_the_signing_base() {
+    let app_js = read("static/app.js");
+    assert!(
+        app_js.contains("${method}\\n${this.signingBase}${path}\\n${timestamp}"),
+        "the CANONICAL_V1 message must be built over this.signingBase, or a reverse proxy that \
+         strips the mount prefix will sign a path the server never actually receives"
+    );
+}
+
+/// `index.html`'s login form must offer the override field `app.js` reads from, and it must be a
+/// plain optional text input (not `required`) — a field an operator must fill in to log in at all
+/// would break every direct, non-proxied deployment, which is the common case this fix must not
+/// regress.
+#[test]
+fn login_form_exposes_an_optional_api_base_override_field() {
+    let index_html = read("static/index.html");
+    let input = Regex::new(r#"<input[^>]*id="login-api-base"[^>]*>"#)
+        .expect("valid regex")
+        .find(&index_html)
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| panic!("static/index.html must have an #login-api-base input"));
+    assert!(!input.contains("required"), "the API base override must be optional: {input}");
+}

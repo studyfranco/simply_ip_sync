@@ -38,6 +38,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pinned = state.master_pin.pin_at_boot(&state.db).await?;
     tracing::info!("Master key identity pinned: {pinned}");
 
+    // Logged from `state.trusted_proxies` (not a second, separately-constructed
+    // `TrustedProxies::from_env()` local) deliberately: a second instance would carry its own
+    // resolution cache, so priming it here would warm a cache nothing ever reads from — the very
+    // request path uses `state`'s own copy. Same reasoning as every other security-relevant field
+    // on `AppState`: one instance, shared, not one built per call site that happens to need it.
+    if state.trusted_proxies.is_empty() {
+        tracing::warn!(
+            "{} is not set: X-Forwarded-For and X-Real-IP are IGNORED and every key is matched \
+             against its raw TCP peer address. This is correct for a directly-exposed deployment; \
+             behind a reverse proxy you must set it, or CIDR-bound keys will be rejected.",
+            simply_ip_sync::config::TRUSTED_PROXIES_ENV
+        );
+    } else {
+        tracing::info!(
+            "{} is set: forwarding headers are honoured from {} matcher(s): {:?}",
+            simply_ip_sync::config::TRUSTED_PROXIES_ENV,
+            state.trusted_proxies.matchers().len(),
+            state.trusted_proxies.matchers()
+        );
+    }
+    // Resolves every configured hostname once, now, so a typo is reported at boot rather than
+    // discovered as an unexplained 403 later. Detached and non-blocking: an unresolvable entry is
+    // retried after a grace period and left untrusted meanwhile, never a reason to refuse to start.
+    state.trusted_proxies.prime_with_grace();
+
     state.scheduler.boot(&state).await?;
 
     // Detached, not drained on shutdown: a retention sweep is a bounded, idempotent DELETE, unlike
@@ -99,6 +124,13 @@ async fn verify_encryption_key(db: &DatabaseConnection) -> Result<(), Box<dyn st
 
 /// Bootstraps the sole Master key on first boot. A no-op if a Master already exists. The only
 /// place in the service that ever writes `is_master = true`.
+///
+/// Random generation is the **normal** path and is not warned about — an operator running the
+/// service exactly as documented sees no noise about it. `INITIAL_MASTER_KEY`/
+/// `INITIAL_MASTER_SIGNING_SECRET` exist purely for deterministic test/CI bootstrap (a harness
+/// that needs to know the credential up front rather than scraping it back out of a log), and it
+/// is *that* — the unusual path — that gets a warning, matching `simply_ip_vault`'s convention:
+/// setting either in a real deployment is the thing worth a human noticing, not their absence.
 async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
     let existing = ApiKey::find().filter(api_key::Column::IsMaster.eq(true)).count(db).await?;
     if existing > 0 {
@@ -106,40 +138,38 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     }
 
     let plaintext_key = match std::env::var(simply_ip_sync::config::INITIAL_MASTER_KEY_ENV) {
-        Ok(raw) => {
-            simply_ip_sync::config::validate_initial_master_key(&raw)?;
-            raw
-        }
-        Err(_) => {
-            let generated = simply_ip_sync::api::generate_random_key();
+        Ok(raw) if !raw.is_empty() => {
+            simply_ip_sync::config::validate_initial_master_key(&raw).map_err(|e| {
+                tracing::error!("Refusing to start: {e}");
+                e
+            })?;
             tracing::warn!(
-                "No {} set; generated a one-time Master key. This will not be shown again: {generated}",
+                "{} is set: using the provided value as the Master key instead of generating a \
+                 random one. This is intended for deterministic test/CI bootstrap only — do not \
+                 set this in a real deployment.",
                 simply_ip_sync::config::INITIAL_MASTER_KEY_ENV
             );
-            generated
+            raw
         }
+        _ => simply_ip_sync::api::generate_random_key(),
     };
 
     let cipher = simply_ip_sync::crypto::SecretCipher::from_env()?;
     let signing_secret = match std::env::var(simply_ip_sync::config::INITIAL_MASTER_SIGNING_SECRET_ENV) {
-        Ok(raw) => {
-            simply_ip_sync::config::validate_initial_master_signing_secret(&raw)?;
-            raw
-        }
-        Err(_) => {
-            let generated = simply_ip_sync::crypto::generate_signing_secret();
-            // Rotation is refused for the Master key through the API (RBAC §5: rotation always
-            // returns a fresh credential, and the Master's is never reachable that way). This log
-            // line is therefore the only time a *generated* secret is ever knowable — it must be
-            // surfaced unconditionally in this branch. (When the operator supplied one via
-            // INITIAL_MASTER_SIGNING_SECRET instead, they already have it and logging it back
-            // would just be needless secret exposure in the log stream.)
+        Ok(raw) if !raw.is_empty() => {
+            simply_ip_sync::config::validate_initial_master_signing_secret(&raw).map_err(|e| {
+                tracing::error!("Refusing to start: {e}");
+                e
+            })?;
             tracing::warn!(
-                "No {} set; generated a one-time Master signing secret. This will not be shown again: {generated}",
+                "{} is set: using the provided value as the Master key's HMAC signing secret \
+                 instead of generating a random one. Intended for deterministic test/CI bootstrap \
+                 only — do not set this in a real deployment.",
                 simply_ip_sync::config::INITIAL_MASTER_SIGNING_SECRET_ENV
             );
-            generated
+            raw
         }
+        _ => simply_ip_sync::crypto::generate_signing_secret(),
     };
     let now = Utc::now();
 
@@ -159,7 +189,37 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
         updated_at: Set(now),
     };
     ApiKey::insert(model).exec(db).await?;
-    tracing::info!("Bootstrapped the Master API key.");
+
+    // Shown unconditionally — regardless of whether the values above were generated or
+    // operator-supplied — because this is the one and only moment either is knowable: rotation is
+    // refused for the Master key through the API (RBAC §5), so there is no way to recover them
+    // later. The box is drawn against an explicit inner width rather than hardcoded runs of `═`,
+    // so the borders stay aligned around a 64-hex-character credential.
+    const W: usize = 82;
+    let border = "═".repeat(W);
+    let body: String = [
+        format!("X-API-Key      : {plaintext_key}"),
+        format!("Signing secret : {signing_secret}"),
+        format!("Bound IPs      : {BOOTSTRAP_SUBNET}"),
+        String::new(),
+        "Both values are needed to sign requests (X-Timestamp + X-Signature-256).".to_owned(),
+        "They will NOT be shown again — store them securely!".to_owned(),
+    ]
+    .iter()
+    .map(|row| format!("║ {row:<W$} ║\n"))
+    .collect();
+
+    tracing::info!(
+        "\n╔{border}╗\n║ {:<W$} ║\n╠{border}╣\n{body}╚{border}╝",
+        "BOOTSTRAP: Master API Key Generated"
+    );
+
+    // tracing's fmt subscriber buffers writes; flushing makes the banner's appearance in a
+    // redirected/tailed log deterministic rather than a short race against the next log line.
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
+
     Ok(())
 }
 

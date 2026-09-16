@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
-use ipnetwork::IpNetwork;
 use reqwest::Client;
 use sea_orm::DatabaseConnection;
 
+use crate::config::TrustedProxies;
 use crate::crypto::SecretCipher;
 use crate::jobs::RunningJobs;
 use crate::master::MasterPin;
@@ -46,8 +46,10 @@ pub struct AppState {
     pub replay: Arc<ReplayGuard>,
     /// Master identity pin.
     pub master_pin: Arc<MasterPin>,
-    /// Parsed `TRUSTED_PROXIES` CIDR list.
-    pub trusted_proxies: Arc<Vec<IpNetwork>>,
+    /// Parsed `TRUSTED_PROXIES` list — CIDRs/IPs plus any hostnames, resolved (and cached) at
+    /// request time via `TrustedProxies::resolved`. Already `Arc`-backed internally, so this field
+    /// carries no extra `Arc` wrapper of its own.
+    pub trusted_proxies: TrustedProxies,
     /// Outbound HTTP client used to call remote vault endpoints.
     pub http: Client,
     /// The cron scheduler handle.
@@ -63,7 +65,7 @@ impl AppState {
     /// security boundaries and fail hard on a malformed value.
     pub async fn new(db: DatabaseConnection) -> Result<Self, StartupConfigError> {
         let cipher = SecretCipher::from_env()?;
-        let trusted_proxies = crate::config::trusted_proxies_from_env()?;
+        let trusted_proxies = TrustedProxies::from_env()?;
         let http = crate::client::build_http_client()?;
         let scheduler = SchedulerHandle::new()
             .await
@@ -74,7 +76,7 @@ impl AppState {
             cipher: Arc::new(cipher),
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::new()),
-            trusted_proxies: Arc::new(trusted_proxies),
+            trusted_proxies,
             http,
             scheduler: Arc::new(scheduler),
             running_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -92,7 +94,7 @@ impl AppState {
             cipher: Arc::new(SecretCipher::Plaintext),
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::pinned_to(master_id)),
-            trusted_proxies: Arc::new(Vec::new()),
+            trusted_proxies: TrustedProxies::default(),
             http: crate::client::build_http_client().expect("http client builds"),
             scheduler: Arc::new(scheduler),
             running_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),

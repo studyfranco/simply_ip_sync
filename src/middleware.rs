@@ -70,7 +70,13 @@ pub async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    let client_ip = crate::config::resolve_client_ip(addr.ip(), &headers, &state.trusted_proxies);
+    // `resolved()` is what turns a hostname entry (e.g. a Docker Compose service name) into
+    // addresses, re-resolving on the TTL described in `config::TrustedProxies`. Awaited per
+    // request so a container's restart-and-new-IP is picked up without a restart of this service;
+    // the no-hostname case (every deployment naming its proxies by address) never touches the
+    // resolution lock at all.
+    let trusted_proxies = state.trusted_proxies.resolved().await;
+    let client_ip = crate::config::resolve_client_ip(addr.ip(), &headers, &trusted_proxies);
 
     // Timestamp validation first: cheap, no DB round-trip, and rejects a stale/malformed request
     // before spending a lookup on it.
