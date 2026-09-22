@@ -236,6 +236,41 @@ class SyncClient {
 let client = null;
 let me = null;
 
+/* ---------------------------------------------------------------------- *
+ * Shared vault-list cache.
+ *
+ * `GET /api/vaults` is fetched from three independent places: this tab's own render, and the
+ * Sources / Sync Tasks forms, which both need the list to populate a "target vault(s)" dropdown.
+ * `CANONICAL_V1` signs at whole-second granularity (`Math.floor(Date.now() / 1000)`), so two of
+ * those three firing within the same second produce a byte-identical signature over an identical
+ * method/target/body — the server's anti-replay guard then correctly rejects the second as a
+ * replay (`401`). That is trivial to hit in practice: the Sources tab auto-loads on sign-in and
+ * fetches this same endpoint immediately, so a user who clicks over to "Vault Endpoints" within a
+ * second of landing on the dashboard collided with it. An uncaught 401 inside `renderVaults()`
+ * left the tab permanently blank with no visible error — the toast from `loadTab()`'s catch is the
+ * only trace, and it fades in a few seconds.
+ *
+ * Routing every caller through one cache removes the redundant, colliding fetches instead of
+ * papering over the failure they cause: at most one real request happens per cache generation, no
+ * matter how many tabs ask for the list "at once". Staleness is handled explicitly rather than by
+ * re-fetching eagerly — invalidated on login (a fresh session starts clean), on Refresh, and after
+ * any local create/update/delete of a vault endpoint, which is every place the true list can
+ * actually change from this tab.
+ * ---------------------------------------------------------------------- */
+
+let vaultsCache = null;
+
+async function getVaultsCached() {
+  if (vaultsCache === null) {
+    vaultsCache = await client.get("/api/vaults").catch(() => []);
+  }
+  return vaultsCache;
+}
+
+function invalidateVaultsCache() {
+  vaultsCache = null;
+}
+
 /// Renders a transient notification into `#toast-container`, matching the ecosystem convention:
 /// the toast is appended hidden (translated off-screen by `.toast`), then given `.visible` on the
 /// next frame so the CSS transition actually runs — appending an already-visible element would
@@ -284,6 +319,7 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
   try {
     me = await candidate.get("/api/auth/me");
     client = candidate;
+    invalidateVaultsCache();
     document.getElementById("login-screen").classList.add("hidden");
     document.getElementById("dashboard-container").classList.remove("hidden");
     renderIdentity();
@@ -344,15 +380,20 @@ function setupTabs() {
   });
 
   document.getElementById("btn-refresh").addEventListener("click", async () => {
+    // Refresh means "show me the true current state", so the cache must not survive it — a stale
+    // vault list silently surviving an explicit refresh would defeat the button's own purpose.
+    invalidateVaultsCache();
     const active = document.querySelector(".tab-btn.active");
     if (active) await loadTab(active.dataset.tab);
   });
 
   document.getElementById("btn-logout").addEventListener("click", () => {
     // Credentials only ever lived in this closure, so dropping them is the whole logout: nothing
-    // was written to storage that could outlive the tab.
+    // was written to storage that could outlive the tab. The vaults cache goes with it too — a
+    // different key logging in next has no business inheriting what the previous one could see.
     client = null;
     me = null;
+    invalidateVaultsCache();
     document.getElementById("login-form").reset();
     document.getElementById("dashboard-container").classList.add("hidden");
     document.getElementById("login-screen").classList.remove("hidden");
@@ -379,7 +420,7 @@ async function loadTab(tab) {
 async function renderSources() {
   const panel = document.getElementById("tab-sources");
   const sources = await client.get("/api/sources");
-  const vaults = await client.get("/api/vaults").catch(() => []);
+  const vaults = await getVaultsCached();
   panel.innerHTML = `
     <section class="card">
       <div class="list-header"><h2>External Sources</h2>
@@ -501,7 +542,7 @@ function showSourceForm(existing, vaults) {
 async function renderSyncTasks() {
   const panel = document.getElementById("tab-sync-tasks");
   const tasks = await client.get("/api/sync-tasks");
-  const vaults = await client.get("/api/vaults").catch(() => []);
+  const vaults = await getVaultsCached();
   panel.innerHTML = `
     <section class="card">
       <div class="list-header"><h2>Inter-Vault Sync Tasks</h2>
@@ -619,7 +660,16 @@ function showTaskForm(existing, vaults) {
 
 async function renderVaults() {
   const panel = document.getElementById("tab-vaults");
-  const vaults = await client.get("/api/vaults");
+  // Deliberately not `getVaultsCached()`: that helper swallows a fetch failure to `[]`, which is
+  // the right tradeoff for a secondary dropdown (Sources/Sync Tasks forms) but wrong for this
+  // tab's own authoritative view — a genuine failure here should still surface as the visible
+  // toast `loadTab()`'s catch produces, not silently render as "no vaults". Reusing an
+  // already-populated cache is what actually prevents the collision (see the cache's own doc
+  // comment); a cache miss here still fetches for real and lets a real error propagate.
+  if (vaultsCache === null) {
+    vaultsCache = await client.get("/api/vaults");
+  }
+  const vaults = vaultsCache;
   panel.innerHTML = `
     <section class="card">
       <div class="list-header"><h2>Vault Endpoints</h2>
@@ -690,6 +740,7 @@ function showVaultForm(existing) {
       else await client.post("/api/vaults", payload);
       toast("Vault endpoint saved", "success");
       slot.innerHTML = "";
+      invalidateVaultsCache();
       await renderVaults();
     } catch (err) {
       toast("Save failed: " + err.message, "error");
@@ -945,6 +996,9 @@ async function deleteResource(path, tab) {
   try {
     await client.del(path);
     toast("Deleted", "success");
+    // A deleted vault endpoint must not linger in the cached dropdown list Sources/Sync Tasks
+    // build their forms from.
+    if (tab === "vaults") invalidateVaultsCache();
     await loadTab(tab);
   } catch (err) {
     toast("Delete failed: " + err.message, "error");

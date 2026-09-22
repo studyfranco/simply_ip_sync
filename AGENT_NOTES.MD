@@ -1703,3 +1703,95 @@ before re-applying the real fix).
 the script's existing pillars diff specific function *bodies* against the peer, and `TrustedProxies`
 was ported with one deliberate structural divergence (§2 above) that a byte-diff would incorrectly
 flag as drift. Nothing under `example/` modified.
+
+## Session 17 (2026-09-22): WebUI Vault Endpoints tab silently empty — anti-replay collision from redundant `/api/vaults` fetches
+
+User report: "The web page not working." No repro steps given. Root-caused and fixed via live
+browser testing (no browser-automation tool exists in this environment or as an MCP tool — used
+headless `/usr/bin/chromium --headless=new --dump-dom` directly against the real server instead,
+since `tests/source_hygiene.rs` only checks `app.js`'s *shape*, not runtime behaviour, and would not
+have caught this).
+
+### Root cause
+
+`renderSources()`, `renderSyncTasks()`, and `renderVaults()` in `static/app.js` each independently
+called `client.get("/api/vaults")` to populate a vault dropdown/list. `CANONICAL_V1` signs at
+whole-second granularity (`Math.floor(Date.now() / 1000)` client-side), so two of these calls
+landing in the same wall-clock second — the common case: the Sources tab auto-loads on sign-in and
+prefetches `/api/vaults` for its dropdown, and a user who clicks the Vaults tab within that same
+second triggers a second, byte-identical signature — collide with `src/replay.rs::ReplayGuard`,
+which correctly rejects the second one as a replay (`401`, key on `(key_id, raw signature digest)`).
+This is the anti-replay guard working as designed; the defect was the client producing an
+accidental duplicate signature, not a server-side flaw.
+
+`renderVaults()` had no `.catch()` on that call, so the rejection propagated out of the function
+entirely; `loadTab()`'s generic try/catch caught it and showed a transient toast, but the Vaults
+tab's `<main>` panel was left with `innerHTML` never set — permanently blank with no persistent
+on-screen error, exactly matching "the web page not working."
+
+Confirmed independently of the browser two ways: (1) a headless-Chromium tab-tour test showed
+`tab-vaults`'s panel at `htmlLength: 0` on every run while every other tab varied correctly with
+content; (2) an isolated HTTP probe (hand-signed `CANONICAL_V1` requests, no browser involved) sent
+two identically-timestamped `GET /api/vaults` requests back-to-back — first `200`, second `401
+{"error":"This request signature has already been used; sign a fresh request"}` — proving the exact
+mechanism outside any browser or test-harness ambiguity.
+
+### Fix (`static/app.js`)
+
+Rejected the shallow fix (`.catch(() => [])` on `renderVaults()` too) — it would have hidden the
+error but rendered an incorrect "no vaults" empty state even when vaults genuinely exist, silently
+showing wrong data instead of no data. Instead fixed the actual defect (redundant, colliding
+fetches) by routing every caller through a single shared, session-scoped cache:
+
+```js
+let vaultsCache = null;
+async function getVaultsCached() {
+  if (vaultsCache === null) vaultsCache = await client.get("/api/vaults").catch(() => []);
+  return vaultsCache;
+}
+function invalidateVaultsCache() { vaultsCache = null; }
+```
+
+`renderSources()` and `renderSyncTasks()` (secondary dropdown consumers, where "no vaults" degrading
+gracefully is an acceptable tradeoff) now call `getVaultsCached()`. `renderVaults()` — the tab's own
+authoritative view — deliberately does **not** use the swallowing helper: on a cache miss it still
+issues a raw, uncaught `client.get("/api/vaults")`, so a genuine server-side failure still surfaces
+via the existing toast instead of being silently hidden. A cache *hit* (the collision case) is what
+actually eliminates the redundant fetch; the asymmetric error handling is preserved on every miss.
+
+Cache invalidated at five points where staleness would be wrong: sign-in (right after `client` is
+set, so a freshly authenticated session never inherits a state from before auth), `btn-refresh`
+(refresh must mean "true current state," not "whatever's cached"), after a vault is created
+(`showVaultForm`'s submit handler), after a vault is deleted (`deleteResource`, gated on `tab ===
+"vaults"`), and on logout (alongside clearing `client`/`me`, so the next key to sign in doesn't
+inherit what the previous one could see).
+
+### Verification
+
+- `cargo test --test source_hygiene`: 11/11, unaffected — confirms no syntax regression and that the
+  one `fetch()` call site's request/signing-base prefixing (Session 16) is untouched.
+- Live end-to-end re-test against the fixed file: injected a login-and-tab-tour script directly into
+  the *real*, served `static/index.html` (backed up first, restored and diff-verified against HEAD
+  immediately after), loaded via the actual `http://127.0.0.1:.../` origin (not `file://` — a
+  `file://` + `<base href>` harness was tried first and abandoned: it makes Chromium resolve
+  absolute-path `fetch()` targets against the local filesystem instead of the `<base>` origin, a
+  pure test-methodology artifact unrelated to the app, confirmed as such before moving on), and
+  driven with `chromium --headless=new --disable-gpu --no-sandbox --virtual-time-budget=4000
+  --dump-dom`. Script clicked straight to the Vaults tab immediately after login — the exact
+  worst-case collision timing — then cycled all six tabs plus a repeat Vaults click. Result: zero
+  JS errors, every tab (including both Vaults visits) rendered non-empty content
+  (`tab-vaults` `htmlLength: 540` both times). `static/index.html` confirmed clean via `git diff`
+  afterward — only `static/app.js` carries this session's change.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean (no Rust source
+  touched this session).
+- `cargo test`: 59/59 across all test binaries, 0 failed.
+- `./scripts/test_e2e.sh`: 213/213, unchanged.
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
+- No leftover chromium or `simply_ip_sync` processes after the manual test server was stopped.
+
+**Not done:** did not add a `tests/source_hygiene.rs` regression test for this specific defect —
+the existing suite checks `app.js`'s static shape (syntax, ID references, call-site prefixing), not
+timing-dependent runtime behaviour across two signed requests, which would require either a real JS
+runtime or a browser in CI; neither exists in this repository today. Flagging as a gap rather than
+silently leaving it uncovered: a future session adding JS runtime testing infrastructure should
+consider a same-second-double-fetch regression case for this exact scenario.
