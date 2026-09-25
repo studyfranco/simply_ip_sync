@@ -126,10 +126,13 @@ class SyncClient {
     //   requestBase — where to SEND. Derived from the directory this page is served from, so a
     //                 dashboard mounted at /ip_sync/ fetches /ip_sync/api/sources with no
     //                 configuration at all.
-    //   signingBase — what to SIGN. The path the server itself sees after the proxy is done
+    //   signingBase — what to SIGN in front of `path` (call sites already spell their endpoint as
+    //                 `/api/...`). The prefix the server itself sees after the proxy is done
     //                 rewriting, which no amount of introspection in the browser can discover —
-    //                 hence the override. Defaults to `requestBase`, the case where the proxy
-    //                 forwards the mount prefix through untouched.
+    //                 hence the override. Defaults to `""` (sign `path` exactly as called), which
+    //                 is correct for both a direct deployment and the common reverse-proxy case
+    //                 where the proxy strips its own mount prefix before forwarding here — the
+    //                 same convention `simply_ip_exporter` uses for the same call-site shape.
     //
     // Signing the browser's own URL unconditionally would break the moment a proxy strips a
     // prefix: the server would verify `/api/sources` against a signature computed over
@@ -137,7 +140,7 @@ class SyncClient {
     // signs whatever `OriginalUri` the server actually receives).
     this.requestBase = SyncClient.deriveRequestBase();
     const override = localStorage.getItem("simply_ip_sync_api_base") || "";
-    this.signingBase = override ? SyncClient.normalizeBasePath(override) : this.requestBase;
+    this.signingBase = SyncClient.normalizeBasePath(override);
   }
 
   /**
@@ -157,9 +160,9 @@ class SyncClient {
 
   /**
    * Cleans up a user-typed base-path override: trims it, guarantees exactly one leading slash, and
-   * drops any trailing one. A blank value normalizes to `""` — "no override, fall back to
-   * `requestBase`" — rather than a fixed default, since the correct default under a subpath is
-   * whatever this page is actually served from, not `/api` specifically.
+   * drops any trailing one. A blank value normalizes to `""` — sign `path` exactly as called, with
+   * no mount prefix at all — which is the default (see the constructor) and matches the common
+   * strip-prefix reverse-proxy configuration with zero configuration required.
    */
   static normalizeBasePath(raw) {
     const trimmed = (raw || "").trim();
@@ -175,11 +178,10 @@ class SyncClient {
    */
   setApiBaseOverride(raw) {
     const normalized = SyncClient.normalizeBasePath(raw);
+    this.signingBase = normalized;
     if (normalized) {
-      this.signingBase = normalized;
       localStorage.setItem("simply_ip_sync_api_base", normalized);
     } else {
-      this.signingBase = this.requestBase;
       localStorage.removeItem("simply_ip_sync_api_base");
     }
   }

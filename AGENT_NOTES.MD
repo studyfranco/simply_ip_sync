@@ -1795,3 +1795,76 @@ timing-dependent runtime behaviour across two signed requests, which would requi
 runtime or a browser in CI; neither exists in this repository today. Flagging as a gap rather than
 silently leaving it uncovered: a future session adding JS runtime testing infrastructure should
 consider a same-second-double-fetch regression case for this exact scenario.
+
+## Session 18 (2026-09-25): Session 16's subpath fix had an inverted default — signing failed on every real Traefik deployment leaving the override blank
+
+User report from the same real deployment (`https://lab.tomidejetsu.ovh:42363/ip_sync/`): sign-in now
+failed with a clean `401 Invalid request signature` (progress from Session 16 — the page itself
+loaded, `app.js`/`style.css` served correctly through the proxy — but auth still failed). Investigated
+by comparing this service's `static/app.js` two-base design (added Session 16) against the
+equivalent, already-correct implementations in `example/simply_ip_vault`, `example/simply_hook_executor`,
+and `example/simply_ip_exporter` — a fresh `git pull` in each (`example/*` are independent git
+checkouts of the sibling services, not submodules) confirmed all three were already up to date before
+comparing.
+
+### Root cause
+
+Session 16's `SyncClient` constructor set `this.signingBase = override ? normalizeBasePath(override) : this.requestBase` — i.e. **leaving the override blank made the client sign its own `requestBase`** (`/ip_sync` when served at that subpath). But the deployment's Traefik config — confirmed by the fact `/ip_sync/app.js` and `/ip_sync/style.css` returned `200` from the root-mounted `ServeDir`, which has no subpath awareness — **strips the `/ip_sync` prefix** before forwarding to the Rust process (`middleware.rs::signed_target` reads `OriginalUri`, which after Axum's own routing only ever sees the bare `/api/...` the process was actually asked for). So the client signed `/ip_sync/api/auth/me`, the server verified against `/api/auth/me`, and the HMACs necessarily differed — a genuine bug, not `ReplayGuard` behaving correctly as in Session 17.
+
+Worse: `static/index.html`'s own hint text explicitly told operators to "keep the default `/api`" when the proxy strips the prefix — describing behavior the shipped code did not implement. Any operator who read the hint and left the field blank (the documented, expected path) hit this bug.
+
+Confirmed against all three peers that a **blank override should mean "sign `path` exactly as called, no mount prefix"** — the correct default for the common strip-prefix proxy config, since it's what the server actually receives:
+- `simply_ip_vault`/`simply_hook_executor`: `normalizeBasePath("")` returns the fixed literal `'/api'` (their call sites are bare, e.g. `/vaults`, so this reconstructs the same server-facing path).
+- `simply_ip_exporter`: `normalizeBasePath("")` returns `''` — the closer analog, since its call sites already spell `/api/...` literally, exactly like this service's.
+
+### Fix (`static/app.js`, `static/index.html`)
+
+Changed the blank-override fallback from `this.requestBase` to `""` (adopting `simply_ip_exporter`'s
+convention, the correct analog for this service's call-site shape) in three places: the constructor,
+`setApiBaseOverride()`'s "cleared" branch, and the `normalizeBasePath()` doc comment. `requestBase`
+(where to *send*) is untouched — only the signing default changed.
+
+Rewrote `index.html`'s hint text and placeholder (`"/api"` → `"leave blank"`) to match the corrected
+behavior, and to fix a **second, independent bug in the hint's own advice**: it told operators to set
+the override to `/ip_sync/api` for the "proxy forwards the prefix through untouched" case — but
+because call sites already carry `/api/...` literally, that override value would have signed
+`/ip_sync/api` + `/api/keys` = a doubled `/ip_sync/api/api/keys`, itself wrong. The correct override
+for that (uncommon) case is the bare mount prefix alone, `/ip_sync`.
+
+**Also discovered, not fixed (pre-existing, orthogonal, out of scope for this bug):** the "proxy
+forwards the prefix through untouched" case is not actually reachable end-to-end with this service's
+current Axum routing regardless of what the client signs — `create_app` (`src/lib.rs`) only nests
+routes under the literal `/api` prefix, so a request that actually arrives as `/ip_sync/api/...`
+(prefix not stripped) 404s before signature verification is ever reached, independent of the override
+field. The override field's "forward-through" branch is real config surface with no working
+deployment target today. Confirmed by direct HTTP probe (see Verification) rather than assumed.
+Flagging for a future session; not touched here since the reported bug (and every real deployment
+this ecosystem actually runs, per the peers' shared convention) is the strip-prefix case, which now
+works correctly.
+
+### Verification
+
+- Read `static/app.js`, `static/index.html`, `src/middleware.rs::signed_target`, and `src/lib.rs::create_app`
+  directly (not solely relying on delegated investigation) to confirm the mismatch and the server-side
+  `OriginalUri` behavior firsthand before editing.
+- `example/simply_ip_vault`, `example/simply_hook_executor`, `example/simply_ip_exporter`: `git pull
+  --ff-only` in each, already up to date; compared their `normalizeBasePath("")`/constructor defaults
+  directly against this service's, confirming the exact divergence above.
+- Live end-to-end re-test of the reported scenario: launched a fresh server instance with fixed
+  `INITIAL_MASTER_KEY`/`INITIAL_MASTER_SIGNING_SECRET`, wrote a minimal Python `http.server`-based
+  reverse proxy (`strip_proxy.py`, scratchpad-only) that mounts the app at `/ip_sync/` and strips the
+  prefix before forwarding — reproducing the real Traefik config this bug report is from without
+  requiring nginx/socat (neither installed in this environment) — then injected a login-automation
+  script into the real, served `static/index.html` (backed up via git, restored via `git checkout --`
+  immediately after, diff-verified clean) and drove it with headless Chromium
+  (`--headless=new --virtual-time-budget=3000 --dump-dom`) against `http://127.0.0.1:.../ip_sync/`
+  with the override field left blank, exactly as the bug report's operator had it. Result: sign-in
+  succeeded (`loginOk: true`, zero JS errors, Sources tab rendered `587` chars of content) — previously
+  this exact configuration produced the reported `401`.
+- Separately confirmed via isolated HTTP probe that the "forward-through" override case 404s at the
+  routing layer regardless of signature correctness (see "Also discovered" above).
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: all test binaries green (0 failed), including `source_hygiene`'s 11 tests unaffected.
+- `./scripts/test_e2e.sh`: 213/213, unchanged.
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
+- No leftover chromium, `simply_ip_sync`, or `strip_proxy.py` processes after cleanup.
