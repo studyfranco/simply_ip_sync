@@ -192,6 +192,21 @@ fn signed_headers(
     Ok((endpoint.api_key.clone(), timestamp, signature))
 }
 
+/// Appends `path` (e.g. `/api/ips`) to `base`, keeping the entirety of `base`'s own path as a
+/// fixed prefix. `Url::join` cannot be used for this: per RFC 3986 §5.3, a reference starting
+/// with `/` is an absolute-path reference, so `base.join("/api/ips")` discards `base`'s path
+/// outright and reproduces only its scheme and authority — a `target_url` configured behind a
+/// reverse-proxy subpath (e.g. `https://host/direct/ip_vault/`) would then have that subpath
+/// silently dropped from every outbound request, landing on the wrong location at the target
+/// host (observed in production as the remote edge returning a 500 for a request that never
+/// reached `simply_ip_vault` at all). Plain string concatenation after trimming `base`'s trailing
+/// slash(es) has no such foot-gun and matches the mental model operators actually have: `target_url`
+/// is a prefix, and this appends to it.
+fn join_endpoint(base: &Url, path: &str) -> Result<Url, ClientError> {
+    let trimmed = base.as_str().trim_end_matches('/');
+    Url::parse(&format!("{trimmed}{path}")).map_err(|e| ClientError::InvalidUrl(e.to_string()))
+}
+
 /// Sends one HTTP `POST {target_url}/api/records/batch` attempt, no retry and no splitting. The
 /// building block both [`post_batch`] and its retry loop are made of.
 async fn post_batch_once(
@@ -203,9 +218,7 @@ async fn post_batch_once(
     mode: BatchMode,
 ) -> Result<BatchRecordsResponse, ClientError> {
     let base = Url::parse(&endpoint.target_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
-    let url = base
-        .join("/api/records/batch")
-        .map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    let url = join_endpoint(&base, "/api/records/batch")?;
     let target = url.path().to_owned();
 
     #[derive(Serialize)]
@@ -351,7 +364,7 @@ async fn get_ips_page(
     include_deleted: bool,
     offset: u64,
 ) -> Result<Vec<IpRecordResponse>, ClientError> {
-    let mut url = base.join("/api/ips").map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    let mut url = join_endpoint(base, "/api/ips")?;
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("group_name", group_name);

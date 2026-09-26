@@ -175,7 +175,13 @@ act on for exactly these three cases.
 internally). Both sign with `CANONICAL_V1` using the target `vault_endpoints` row's decrypted
 `signing_secret`. `build_http_client` refuses redirects. No SSRF private-IP blocklist —
 `vault_endpoints` are admin-configured, `can_manage_vaults`-gated internal services, not
-arbitrary user-supplied URLs; see the module doc comment for the full reasoning.
+arbitrary user-supplied URLs; see the module doc comment for the full reasoning. Both call sites
+build their request URL through `join_endpoint(base, path)` — plain string concatenation after
+trimming `base`'s trailing slash(es), **not** `base.join(path)`: a leading-slash argument to
+`Url::join` is an RFC 3986 §5.3 absolute-path reference and silently discards `base`'s entire path,
+which previously dropped a reverse-proxy subpath (`target_url: https://host/direct/ip_vault/`)
+from every outbound request, landing at the domain root instead — see AGENT_NOTES.MD Session 19
+and `tests/security_tests.rs`'s `*_preserves_a_reverse_proxy_subpath_in_target_url` tests.
 
 ### `src/scheduler.rs` — in-process cron scheduler
 
@@ -313,7 +319,7 @@ paths cannot describe different tables.
 | File | Owns |
 | :--- | :--- |
 | `common/mod.rs` | Shared harness: in-memory DB + pinned Master, `insert_key` (mints credentials directly against the database), `sign`/`signed_request` (real `CANONICAL_V1` signing), and `MockVault` — a **stateful** stand-in for a remote `simply_ip_vault` that actually stores records behind `GET /api/ips` + `POST /api/records/batch`, so a test can assert what the target *converged on* (distinct counts, canonical dedup, tombstone flags) rather than only what the engine asked for. Mirrors two real contract details the tests turn on: `since` is an OR across `last_seen_at` and (when `include_deleted`) a tombstone's `deleted_at`, and a soft delete never touches `last_seen_at` |
-| `security_tests.rs` | Inbound HMAC verification, replay, `bound_ips`, outbound signature generation against a `wiremock`-mocked vault, and trusted-proxy `X-Forwarded-For` handling (permitted when forwarded through a trusted peer, never a `bound_ips` bypass from an untrusted one) |
+| `security_tests.rs` | Inbound HMAC verification, replay, `bound_ips`, outbound signature generation against a `wiremock`-mocked vault (including a `target_url` with a reverse-proxy subpath, on both the push and delta-fetch sides, mutation-tested against the `Url::join` leading-slash bug it regresses — see AGENT_NOTES.MD Session 19), and trusted-proxy `X-Forwarded-For` handling (permitted when forwarded through a trusted peer, never a `bound_ips` bypass from an untrusted one) |
 | `parser_tests.rs` | `REGEX_LINE`/`JSON_PATH` black-box behavior through the public `parsers` API, local fixtures reproducing StopForumSpam's ZIP and Spamhaus's JSONL feed shapes (both inspected against the real downloads) via `tempfile::tempdir()` for automatic cleanup, and HTML-masquerading-as-a-feed fixtures (block page, captive portal, a large synthetic body) |
 | `chunking_tests.rs` | Batch chunking never exceeds `MAX_BATCH_SIZE` at any boundary |
 | `api_validation_tests.rs` | Malformed `cron_schedule` on `POST`/`PATCH` for both `/api/sources` and `/api/sync-tasks` is rejected with `400` before any database write |

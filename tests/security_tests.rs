@@ -324,6 +324,109 @@ async fn outbound_get_ips_delta_signs_correctly_with_since_and_include_deleted()
     assert!(records.is_empty());
 }
 
+/// Regression test: a `target_url` configured behind a reverse-proxy subpath (a real production
+/// shape, e.g. `https://host/direct/ip_vault/`) must keep that subpath on every outbound request.
+/// `client::join_endpoint` replaced a `base.join("/api/ips")` call — a leading-slash argument to
+/// `Url::join` is an RFC 3986 §5.3 absolute-path reference, which silently discards the entirety
+/// of `base`'s own path — so the prior code dropped `/direct/ip_vault` and sent every delta fetch
+/// to the bare domain root instead. That surfaced in production as a clean `500` from whatever
+/// unrelated service happened to sit at the domain root, while the real vault never saw the
+/// request at all. Both existing outbound tests above use a bare-root mock URL, so neither would
+/// have caught this; this test deliberately configures `target_url` with a non-trivial path.
+#[tokio::test]
+async fn outbound_get_ips_delta_preserves_a_reverse_proxy_subpath_in_target_url() {
+    let mock_server = MockServer::start().await;
+    let shared_secret = "outbound-subpath-test-secret";
+
+    Mock::given(method("GET"))
+        .and(path("/direct/ip_vault/api/ips"))
+        .respond_with(move |req: &wiremock::Request| {
+            let sig_header = req.headers.get("X-Signature-256").expect("signature header present").to_str().expect("utf8");
+            let ts_header = req.headers.get("X-Timestamp").expect("timestamp header present").to_str().expect("utf8");
+            let target = format!("{}?{}", req.url.path(), req.url.query().expect("query string present"));
+            // The signed target must carry the subpath too -- a signature computed only over
+            // "/api/ips" would fail verification against the actual (subpath-prefixed) request.
+            assert!(target.starts_with("/direct/ip_vault/api/ips"), "signed target must include the subpath, got {target}");
+            let digest = simply_ip_sync::crypto::verify_signature(shared_secret, "GET", &target, ts_header, b"", sig_header);
+            assert!(digest.is_some(), "remote side must be able to verify the outbound signature");
+            ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new())
+        })
+        .mount(&mock_server)
+        .await;
+
+    let cipher = simply_ip_sync::crypto::SecretCipher::Plaintext;
+    let sealed_secret = cipher.seal(shared_secret).expect("seal");
+    let endpoint = simply_ip_sync::entities::vault_endpoint::Model {
+        id: uuid::Uuid::new_v4(),
+        name: "MainServ".to_owned(),
+        target_url: format!("{}/direct/ip_vault/", mock_server.uri()),
+        api_key: "remote-key".to_owned(),
+        signing_secret: sealed_secret,
+        description: None,
+        owner_key_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let http = simply_ip_sync::client::build_http_client().expect("http client");
+    let records = simply_ip_sync::client::get_ips_delta(&http, &cipher, &endpoint, "delta-group", None, true)
+        .await
+        .expect("get_ips_delta succeeds");
+    assert!(records.is_empty());
+}
+
+/// Same regression, on the push side (`post_batch` / `join_endpoint`'s other call site). Not yet
+/// manifesting in the reported bug (no push had been attempted against the affected endpoint), but
+/// equally broken before this fix — same `base.join("/api/records/batch")` foot-gun.
+#[tokio::test]
+async fn outbound_post_batch_preserves_a_reverse_proxy_subpath_in_target_url() {
+    let mock_server = MockServer::start().await;
+    let shared_secret = "outbound-subpath-batch-secret";
+
+    Mock::given(method("POST"))
+        .and(path("/direct/ip_vault/api/records/batch"))
+        .and(header("X-API-Key", "remote-key"))
+        .respond_with(move |req: &wiremock::Request| {
+            let sig_header = req.headers.get("X-Signature-256").expect("signature header present").to_str().expect("utf8");
+            let ts_header = req.headers.get("X-Timestamp").expect("timestamp header present").to_str().expect("utf8");
+            let target = "/direct/ip_vault/api/records/batch";
+            let digest = simply_ip_sync::crypto::verify_signature(shared_secret, "POST", target, ts_header, &req.body, sig_header);
+            assert!(digest.is_some(), "remote side must be able to verify the outbound signature, including the subpath");
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1
+            }))
+        })
+        .mount(&mock_server)
+        .await;
+
+    let cipher = simply_ip_sync::crypto::SecretCipher::Plaintext;
+    let sealed_secret = cipher.seal(shared_secret).expect("seal");
+    let endpoint = simply_ip_sync::entities::vault_endpoint::Model {
+        id: uuid::Uuid::new_v4(),
+        name: "MainServ".to_owned(),
+        target_url: format!("{}/direct/ip_vault/", mock_server.uri()),
+        api_key: "remote-key".to_owned(),
+        signing_secret: sealed_secret,
+        description: None,
+        owner_key_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let http = simply_ip_sync::client::build_http_client().expect("http client");
+    let records = vec![simply_ip_sync::client::BatchRecordInput {
+        target_address: "1.2.3.4".to_owned(),
+        cause: None,
+        is_deleted: None,
+        created_at: None,
+        updated_at: None,
+        last_seen_at: None,
+        deleted_at: None,
+    }];
+    let result = simply_ip_sync::client::post_batch(&http, &cipher, &endpoint, "test-group", &records, simply_ip_sync::client::BatchMode::Upsert)
+        .await
+        .expect("post_batch succeeds");
+    assert_eq!(result.created, 1);
+}
+
 /// A tamper test on a large body must flip a byte in the *middle* of the payload, not just
 /// truncate or prefix it — a signature scheme covering only a prefix (e.g. a buggy streaming-HMAC
 /// implementation that stops reading early) would still catch a truncated/prepended tamper but

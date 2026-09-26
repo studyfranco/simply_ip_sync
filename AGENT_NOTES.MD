@@ -1868,3 +1868,88 @@ works correctly.
 - `./scripts/test_e2e.sh`: 213/213, unchanged.
 - `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
 - No leftover chromium, `simply_ip_sync`, or `strip_proxy.py` processes after cleanup.
+
+## Session 19 (2026-09-26): outbound `Url::join` silently dropped a reverse-proxy subpath from `target_url` — clean 500s on every sync against a subpath-mounted vault
+
+User's Sync Logs tab showed repeated failures: `VAULT_SYNC` against a vault endpoint named
+`MainServ` (`target_url: https://patris.tomidejetsu.ovh/direct/ip_vault/`) failing with `delta
+fetch from 'MainServ' failed: vault endpoint returned 500: Internal Server Error`, while a second
+endpoint (`Seedbox`, `target_url: http://simply_ip_vault:3000/`, a bare Docker-hostname address
+with no subpath) had no reported failures. This is the outbound mirror of Sessions 16/18 (this
+service acting as the *client*, calling out to a `simply_ip_vault` instance that itself sits behind
+a reverse-proxy subpath) — but a different bug class from either of those, not a signature
+mismatch.
+
+### Root cause
+
+`src/client.rs`'s two outbound call sites built the request URL with `base.join("/api/ips")` /
+`base.join("/api/records/batch")` (a **leading-slash** argument). Per RFC 3986 §5.3, a reference
+beginning with `/` is an absolute-path reference: `Url::join` replaces the base's *entire* path,
+regardless of whether the base path ends in a trailing slash — this is not the commonly-cited
+"file vs directory" trailing-slash gotcha, it's simpler and more total. So for `MainServ`, the
+actual outbound request went to `https://patris.tomidejetsu.ovh/api/ips` — the `/direct/ip_vault`
+subpath silently and completely dropped, landing at the domain root instead of the vault's actual
+location. For `Seedbox` the base path was already `/`, so the join was a no-op in effect, which is
+exactly why only the subpath-mounted endpoint failed.
+
+The outbound HMAC signing itself was not the bug: `target` is derived from the already-joined
+(already-wrong) `url.path()`, so the signature always matched whatever URL was actually sent — the
+client's `CANONICAL_V1` construction is internally consistent, it just signed the wrong path
+because the URL builder had handed it the wrong path. This is why the symptom was a `500`, not a
+`401`: the malformed request never reached `simply_ip_vault`'s own auth middleware at all — it hit
+whatever unrelated service/vhost/default backend sits at `patris.tomidejetsu.ovh`'s domain root,
+which erred rather than the vault ever seeing (and cleanly rejecting or accepting) a signed
+request.
+
+Confirmed via a scratch `#[cfg(test)]` compiled against the crate's actual `reqwest::Url` (added,
+run, reverted immediately — `git status` confirmed clean before the real fix):
+```
+trailing-slash base + join("/api/ips")                   = https://patris.tomidejetsu.ovh/api/ips
+no-trailing-slash base + join("/api/ips")                = https://patris.tomidejetsu.ovh/api/ips
+trailing-slash base + join("api/ips") [no leading slash] = https://patris.tomidejetsu.ovh/direct/ip_vault/api/ips
+```
+
+`tests/security_tests.rs`'s two pre-existing outbound tests
+(`outbound_post_batch_signs_correctly`, `outbound_get_ips_delta_signs_correctly_with_since_and_include_deleted`)
+both use `wiremock`'s bare-root `mock_server.uri()` as `target_url` — base path `/`, so the bug is
+invisible by coincidence. Neither test constructs an endpoint with a non-trivial path component.
+
+### Fix (`src/client.rs`)
+
+Added `join_endpoint(base: &Url, path: &str) -> Result<Url, ClientError>`: trims `base`'s trailing
+slash(es) and appends `path` (e.g. `/api/ips`) by plain string concatenation, then re-parses. This
+sidesteps `Url::join`'s RFC 3986 merge semantics entirely rather than trying to satisfy them (e.g.
+by normalizing `target_url` to always end in `/` and joining a relative, non-leading-slash
+segment) — string concatenation matches the operator's actual mental model ("`target_url` is a
+prefix, append the endpoint path to it") and has no leading-slash or trailing-slash foot-gun to get
+subtly wrong again later. Both call sites (`post_batch_once`, `get_ips_page`) now go through it;
+`requestBase`-style dual-path concerns from the WebUI sessions don't apply here since there is only
+one "base" in the outbound direction — the operator-supplied `target_url` itself.
+
+### Verification
+
+- Read `src/client.rs` directly to confirm both call sites and the signing code's dependency on the
+  already-joined URL (not independently re-derived), rather than relying solely on the delegated
+  investigation that first located the bug.
+- Added two new regression tests in `tests/security_tests.rs`:
+  `outbound_get_ips_delta_preserves_a_reverse_proxy_subpath_in_target_url` and
+  `outbound_post_batch_preserves_a_reverse_proxy_subpath_in_target_url` — both configure
+  `target_url` as `{mock_server.uri()}/direct/ip_vault/` and assert the mock only matches (and the
+  signed target only verifies) against the full `/direct/ip_vault/api/...` path, reproducing the
+  exact production shape from the bug report.
+- **Mutation-tested, not merely written:** temporarily reverted both call sites back to
+  `base.join("/api/...")`, re-ran the two new tests, confirmed both failed with `RemoteError {
+  status: 404, ... }` (the mock's subpath-scoped route correctly did not match the root-only
+  request the bug produces), then restored the real fix and confirmed all 14 `security_tests` pass
+  again.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: all test binaries green, 0 failed (`security_tests` now 14, up from 12).
+- `./scripts/test_e2e.sh`: 213/213, unchanged.
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
+
+**Not done:** did not attempt to reproduce the exact production 500 against the real
+`patris.tomidejetsu.ovh` host (out of scope/inappropriate — that's the user's own infrastructure,
+and the root cause was conclusively established from the client-side code and a controlled mock
+without needing to touch it). Did not add SSRF/target-validation hardening to `join_endpoint` —
+`vault_endpoints` are Master-granted, admin-configured targets (see `client.rs`'s existing
+module-level doc comment), not arbitrary user input, so that threat model is unchanged by this fix.
