@@ -995,6 +995,20 @@ with open(out_path, "w") as f:
 PYEOF
     check_local "$([[ -s "$EXTRA_FEED" ]] && echo yes || echo no)" "yes" "generated a $FULL_REPLACE_TOTAL-line synthetic feed fixture, now servable at EXTRA_MOCK's /feed.txt"
 
+    # Dry-run this exact feed through /api/sources/test-fetch before creating the real source below
+    # -- the same order an operator would actually use the WebUI's "Test Fetch" button in.
+    api_call POST "/api/sources/test-fetch" "$MASTER_KEY" \
+        "{\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\",\"parser_type\":\"REGEX_LINE\"}"
+    check "200" "test-fetch dry-run against the same feed the real source below will use"
+    check_jq ".status" "SUCCESS" "test-fetch reports SUCCESS for the same feed"
+    check_jq ".total_extracted" "$FULL_REPLACE_TOTAL" "test-fetch's total_extracted matches the feed's true record count, not just the truncated sample"
+    check_jq ".truncated" "true" "a $FULL_REPLACE_TOTAL-record feed exceeds the sample cap"
+    check_jq ".sample | length" "50" "the sample itself is capped, unlike total_extracted"
+
+    api_call GET "/api/sources" "$MASTER_KEY"
+    check_jq "[.[] | select(.name == \"full-replace-e2e-source\")] | length" "0" \
+        "test-fetch persisted nothing -- the real source below does not exist yet"
+
     api_call POST "/api/sources" "$MASTER_KEY" \
         "{\"name\":\"full-replace-e2e-source\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"full-replace-dst\",\"mode\":\"full_replace\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
     check "200" "create a full_replace external source ($FULL_REPLACE_TOTAL records => 3 chunks of 5000/5000/2000)"

@@ -69,6 +69,7 @@ pub fn create_app(state: AppState) -> Router {
             get(api::get_vault_endpoint).patch(api::update_vault_endpoint).delete(api::delete_vault_endpoint),
         )
         .route("/sources", get(api::list_external_sources).post(api::create_external_source))
+        .route("/sources/test-fetch", post(api::test_fetch_external_source))
         .route(
             "/sources/{id}",
             get(api::get_external_source).patch(api::update_external_source).delete(api::delete_external_source),

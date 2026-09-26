@@ -243,6 +243,7 @@ Resource model: `external_sources` (+ `external_source_vault_targets` junction).
 | `PATCH /api/sources/{id}` | RBAC R2 (`can_manage_keys` + `can_manage=true` on this source). | `UpdateExternalSourcePayload`, all fields optional | `200` `ExternalSourceResponse` (updated). Same `parser_type`/`mode`/`cron_schedule` validation as creation, applied only to fields actually present. Re-syncs the live scheduler entry. |
 | `DELETE /api/sources/{id}` | RBAC §3 (Master or owner only). | — | `204 No Content`. `404` on a lost TOCTOU race. Removes the live scheduler entry. |
 | `POST /api/sources/{id}/trigger` | `can_sync` on this source, or Master (`guard_can_sync`). | — | `200` `{"status": "SUCCESS"\|"FAILED"\|"PARTIAL", "items_processed": int, "chunks_sent": int, "duration_ms": int, "error_message": string\|null}`. `409` if a run for this source (cron or manual) is already in progress (`try_start_job` concurrency guard — refuses to overlap rather than racing two executions). |
+| `POST /api/sources/test-fetch` | `can_manage_sources` or Master (`guard_resource_creation`) — the same right creation itself requires, not a per-resource permission (there is no resource yet). | `TestFetchPayload`: `{"source_url": string, "parser_type": "REGEX_LINE"\|"JSON_PATH", "parser_config_json": string\|null}` | `200` `{"status": "SUCCESS"\|"FAILED"\|"PARTIAL", "total_extracted": int, "sample": string[], "truncated": bool, "duration_ms": int, "error": string\|null}`. `400` only if `parser_type` itself is invalid — a feed/network failure is reported as `status: "FAILED"` with `error` set, not an HTTP error, since that is exactly the information this endpoint exists to surface. `sample` is capped at 50 entries (`truncated: true` beyond that; `total_extracted` is always the true count). Runs the same `jobs::external_ingestion::fetch_and_parse` pipeline a real scheduled run uses — same retry policy, same decompression-bomb ceiling, same custom-header/User-Agent handling — but never pushes to any vault, and writes neither a `sync_logs` nor an `audit_logs` row (read-only; works against values that have never been saved, unlike every other `/api/sources/*` route, which is the point — it exists to be tried before `POST /api/sources` itself). |
 
 ### Response Schema — `ExternalSourceResponse`
 
@@ -455,6 +456,7 @@ audit entry.
 | DELETE | `/api/vaults/{id}` | §3 | `delete_vault_endpoint` |
 | GET | `/api/sources` | scoped | `list_external_sources` |
 | POST | `/api/sources` | `can_manage_sources`/Master | `create_external_source` |
+| POST | `/api/sources/test-fetch` | `can_manage_sources`/Master | `test_fetch_external_source` |
 | GET | `/api/sources/{id}` | scoped | `get_external_source` |
 | PATCH | `/api/sources/{id}` | R2 | `update_external_source` |
 | DELETE | `/api/sources/{id}` | §3 | `delete_external_source` |

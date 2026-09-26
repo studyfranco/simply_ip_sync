@@ -67,17 +67,26 @@ body {
 
 /* ─── Layout ────────────────────────────────────────────── */
 
+/* 1800px + fluid padding, matching `simply_hook_executor`'s wider layout (the other two peers,
+   `simply_ip_vault`/`simply_ip_exporter`, use a narrower fixed 1280px — 1800px was picked here
+   since this dashboard's own tables (Sync Logs, Audit Logs, External Sources) run wide with many
+   columns, the same shape hook_executor's own tables have, and both projects were cramped at
+   1280px on anything wider than a small laptop screen). `clamp()` scales the side gutter smoothly
+   with viewport width instead of jumping at a single breakpoint — 1rem on a phone, up to 4rem on
+   a wide desktop, 3vw in between. */
 .container {
-    max-width: 1280px;
+    max-width: 1800px;
+    width: 100%;
     margin: 0 auto;
-    padding: 2rem;
+    padding: 2rem clamp(1rem, 3vw, 4rem);
 }
 
 /* Header and tabs travel together as one unit, matching the peers' `#top-bar`. */
 .top-bar {
-    max-width: 1280px;
+    max-width: 1800px;
+    width: 100%;
     margin: 0 auto;
-    padding: 2rem 2rem 0;
+    padding: 2rem clamp(1rem, 3vw, 4rem) 0;
 }
 
 /* ─── Auth / Login Screen ────────────────────────────────── */
@@ -430,6 +439,44 @@ textarea.input-field {
     line-height: 1.5;
 }
 
+/* A short inline JSON/code sample inside a `.field-hint` (e.g. the JSON_PATH mapping example). */
+.code-example {
+    margin: 0.4rem 0;
+    padding: 0.5rem 0.7rem;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* "Test Fetch" preview panel (External Sources form): a status badge, a summary line, and a
+   scrollable sample list of extracted addresses. */
+.test-fetch-result {
+    margin-top: 0.6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.test-fetch-sample {
+    list-style: none;
+    margin: 0;
+    padding: 0.5rem 0.7rem;
+    max-height: 12rem;
+    overflow-y: auto;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.78rem;
+}
+
+.test-fetch-sample li {
+    padding: 0.15rem 0;
+}
+
 .checkbox-container {
     display: flex;
     align-items: center;
@@ -767,6 +814,17 @@ textarea.input-field {
     }
 
     .header {
-        align-items: flex-start;
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    /* Matches `simply_hook_executor`'s mobile polish: action buttons stack full-width instead of
+       staying side by side and shrinking illegibly on a narrow screen. */
+    .form-actions {
+        flex-direction: column;
+    }
+
+    .form-actions .btn {
+        width: 100%;
     }
 }

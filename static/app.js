@@ -498,6 +498,40 @@ function splitParserConfig(raw) {
   return { headerRows, userAgent: user_agent || "", rest: restKeys.length ? JSON.stringify(rest, null, 2) : "" };
 }
 
+/// Rebuilds the merged `parser_config_json` value the form would submit, from the header editor's
+/// rows, the User-Agent field, and the raw "Parser Config JSON" textarea (parser-specific keys
+/// only). Shared by the submit handler and the "Test Fetch" button, so a preview always reflects
+/// exactly what `Create`/`Save` would actually send — a second, independently-maintained
+/// implementation of this merge is exactly how a test tool ends up testing something subtly
+/// different from what gets saved. Returns `null` (after toasting the parse error) when the raw
+/// textarea's hand-edited JSON doesn't parse.
+function buildMergedParserConfig(rows, userAgentValue, restConfigRaw) {
+  const headers = {};
+  for (const { name, value } of rows) {
+    const key = name.trim();
+    if (key) headers[key] = value;
+  }
+  const trimmedUserAgent = (userAgentValue || "").trim();
+
+  let restConfig;
+  try {
+    restConfig = restConfigRaw ? JSON.parse(restConfigRaw) : {};
+  } catch {
+    toast("Parser Config JSON is not valid JSON", "error");
+    return null;
+  }
+  const merged = { ...restConfig };
+  if (Object.keys(headers).length) merged.headers = headers;
+  if (trimmedUserAgent) merged.user_agent = trimmedUserAgent;
+  return merged;
+}
+
+const JSON_PATH_EXAMPLE_HINT = `Maps a JSON feed to IP addresses. Example, for a feed shaped like
+<code>{"data": [{"ipAddress": "1.2.3.4"}, ...]}</code> (e.g. AbuseIPDB's blacklist endpoint):
+<pre class="code-example">{"array_path": "data", "ip_field": "ipAddress"}</pre>
+Omit <code>array_path</code> if the feed body is itself a bare top-level array. Add
+<code>"jsonl": true</code> for newline-delimited JSON (one object per line, no enclosing array).`;
+
 function showSourceForm(existing, vaults) {
   const slot = document.getElementById("source-form-slot");
   const vaultOptions = vaults.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join("");
@@ -508,7 +542,7 @@ function showSourceForm(existing, vaults) {
       <label class="form-group"><span>Name</span><input class="input-field" name="name" required value="${escapeHtml(existing?.name || "")}"></label>
       <label class="form-group"><span>Source URL</span><input class="input-field" name="source_url" required value="${escapeHtml(existing?.source_url || "")}"></label>
       <label class="form-group"><span>Parser Type
-        </span><select class="select-field" name="parser_type">
+        </span><select class="select-field" name="parser_type" id="source-parser-type">
           <option value="REGEX_LINE" ${existing?.parser_type === "REGEX_LINE" ? "selected" : ""}>REGEX_LINE</option>
           <option value="JSON_PATH" ${existing?.parser_type === "JSON_PATH" ? "selected" : ""}>JSON_PATH</option>
         </select>
@@ -529,7 +563,16 @@ function showSourceForm(existing, vaults) {
         <button type="button" id="source-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
         <small class="field-hint">Sent verbatim on every fetch of this source. Rows with an empty name are ignored.</small>
       </div>
-      <label class="form-group form-group-grow"><span>Parser Config JSON (parser-specific settings only — e.g. <code>array_path</code>/<code>ip_field</code> for JSON_PATH; headers and User-Agent are configured above)</span><textarea class="input-field" name="parser_config_json">${escapeHtml(rest)}</textarea></label>
+      <div class="form-group form-group-grow" id="source-parser-config-group">
+        <label>Parser Config JSON (parser-specific settings only — headers and User-Agent are configured above)</label>
+        <textarea class="input-field" name="parser_config_json">${escapeHtml(rest)}</textarea>
+        <small class="field-hint">${JSON_PATH_EXAMPLE_HINT}</small>
+      </div>
+      <div class="form-group form-group-grow">
+        <button type="button" id="source-test-fetch" class="btn btn-secondary btn-sm">Test Fetch</button>
+        <small class="field-hint">Fetches and parses the URL above with the current settings — nothing is saved, and no target vault is contacted.</small>
+        <div id="source-test-result"></div>
+      </div>
       <label class="form-group form-group-grow"><span>Target Vaults (select one or more)
         </span><select class="select-field" name="targets" multiple size="4">${vaultOptions}</select>
       </label>
@@ -538,6 +581,16 @@ function showSourceForm(existing, vaults) {
         <button type="button" class="btn btn-cancel" id="source-form-cancel">Cancel</button>
       </div>
     </form>`;
+
+  // The parser-config box (and its JSON_PATH example) only means anything for JSON_PATH --
+  // REGEX_LINE's parser (`src/parsers/regex_line.rs`) ignores its `config` argument entirely, so
+  // showing an editable JSON box for it would be pure confusion, not a smaller feature.
+  function syncParserConfigVisibility() {
+    const isJsonPath = document.getElementById("source-parser-type").value === "JSON_PATH";
+    document.getElementById("source-parser-config-group").style.display = isJsonPath ? "" : "none";
+  }
+  document.getElementById("source-parser-type").addEventListener("change", syncParserConfigVisibility);
+  syncParserConfigVisibility();
 
   if (existing) {
     const selected = new Set((existing.targets || []).map((t) => t.vault_endpoint_id));
@@ -586,6 +639,47 @@ function showSourceForm(existing, vaults) {
   });
   renderSourceHeaderRows();
 
+  document.getElementById("source-test-fetch").addEventListener("click", async () => {
+    const resultBox = document.getElementById("source-test-result");
+    const sourceUrl = document.querySelector('#source-form [name="source_url"]').value.trim();
+    const parserType = document.getElementById("source-parser-type").value;
+    if (!sourceUrl) {
+      toast("Enter a Source URL first", "error");
+      return;
+    }
+    const restConfigRaw = document.querySelector('#source-form [name="parser_config_json"]').value;
+    const userAgentValue = document.querySelector('#source-form [name="user_agent"]').value;
+    const mergedConfig = buildMergedParserConfig(rows, userAgentValue, restConfigRaw);
+    if (mergedConfig === null) return; // buildMergedParserConfig already toasted the parse error.
+
+    const btn = document.getElementById("source-test-fetch");
+    btn.disabled = true;
+    btn.textContent = "Testing…";
+    resultBox.innerHTML = "";
+    try {
+      const result = await client.post("/api/sources/test-fetch", {
+        source_url: sourceUrl,
+        parser_type: parserType,
+        parser_config_json: Object.keys(mergedConfig).length ? JSON.stringify(mergedConfig) : null,
+      });
+      const sampleHtml = result.sample.length
+        ? `<ul class="test-fetch-sample">${result.sample.map((ip) => `<li class="font-mono">${escapeHtml(ip)}</li>`).join("")}</ul>`
+        : "";
+      resultBox.innerHTML = `
+        <div class="test-fetch-result">
+          ${statusBadge(result.status)}
+          <span class="text-muted text-sm">${result.total_extracted} address(es) extracted in ${result.duration_ms}ms${result.truncated ? ` (showing first ${result.sample.length})` : ""}</span>
+          ${result.error ? `<div class="message error">${escapeHtml(result.error)}</div>` : ""}
+          ${sampleHtml}
+        </div>`;
+    } catch (err) {
+      resultBox.innerHTML = `<div class="message error">${escapeHtml(err.message)}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Test Fetch";
+    }
+  });
+
   document.getElementById("source-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
   document.getElementById("source-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -594,26 +688,8 @@ function showSourceForm(existing, vaults) {
       vault_endpoint_id: o.value,
     }));
 
-    // Rows with a blank name are dropped rather than rejected -- an empty row is what "+ Add
-    // Header" produces, and adding one then changing your mind shouldn't block submission. Later
-    // rows win on a duplicate name.
-    const headers = {};
-    for (const { name, value } of rows) {
-      const key = name.trim();
-      if (key) headers[key] = value;
-    }
-    const userAgentValue = fd.get("user_agent")?.trim();
-
-    let restConfig;
-    try {
-      restConfig = fd.get("parser_config_json") ? JSON.parse(fd.get("parser_config_json")) : {};
-    } catch {
-      toast("Parser Config JSON is not valid JSON", "error");
-      return;
-    }
-    const mergedConfig = { ...restConfig };
-    if (Object.keys(headers).length) mergedConfig.headers = headers;
-    if (userAgentValue) mergedConfig.user_agent = userAgentValue;
+    const mergedConfig = buildMergedParserConfig(rows, fd.get("user_agent"), fd.get("parser_config_json"));
+    if (mergedConfig === null) return; // buildMergedParserConfig already toasted the parse error.
 
     const payload = {
       name: fd.get("name"),

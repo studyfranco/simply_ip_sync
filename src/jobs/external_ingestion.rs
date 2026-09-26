@@ -54,16 +54,29 @@ pub async fn run(state: &AppState, source_id: Uuid) -> Result<JobSummary, AppErr
     Ok(summary)
 }
 
-async fn execute(
-    state: &AppState,
-    source: &external_source::Model,
-    targets: &[(external_source_vault_target::Model, Option<vault_endpoint::Model>)],
-) -> JobSummary {
-    let start = std::time::Instant::now();
-
-    let fetch_options = FetchOptions::from_config(source.parser_config_json.as_deref());
+/// Fetches `source_url` (with `parser_config_json`'s `headers`/`user_agent`, if any, applied —
+/// see [`FetchOptions`]) and runs it through the `parser_type` parser, returning the raw
+/// (non-deduplicated) extracted IP/CIDR strings. This is the entire "does this feed actually work"
+/// question — fetch, decompress, parse — with no push to any vault, which is exactly the subset
+/// [`execute`] and the WebUI's "Test Fetch" preview (`api::test_fetch_external_source`) both need;
+/// factored out once so there is exactly one implementation of the fetch/decompress/parse pipeline,
+/// not two that could quietly drift apart (one always exercised by real scheduled runs, one only by
+/// a manual preview button — the classic way a "test tool" ends up testing something subtly
+/// different from what production actually does).
+///
+/// Errors are returned as a formatted `String` rather than a typed error, matching how every caller
+/// already needs to render them: `execute` folds it straight into `JobSummary::error_message`, and
+/// the test-fetch endpoint into its own response's `error` field — there is no case where either
+/// caller needs to branch on *which* stage failed, only report that it did.
+pub(crate) async fn fetch_and_parse(
+    http: &reqwest::Client,
+    source_url: &str,
+    parser_type: &str,
+    parser_config_json: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let fetch_options = FetchOptions::from_config(parser_config_json);
     let build_request = |http: &reqwest::Client| {
-        let mut request = http.get(&source.source_url);
+        let mut request = http.get(source_url);
         if let Some(user_agent) = &fetch_options.user_agent {
             request = request.header(reqwest::header::USER_AGENT, user_agent);
         }
@@ -75,41 +88,24 @@ async fn execute(
 
     // Transient upstream errors (429/502/503/504) are retried with backoff — the same policy
     // `client.rs` applies to vault calls, extended here since an external feed host is just as
-    // likely to be rate-limiting or briefly overloaded. A non-transient error status fails the job
+    // likely to be rate-limiting or briefly overloaded. A non-transient error status fails
     // immediately, same as before.
     let max_retries = crate::config::outbound_max_retries();
     let mut attempt: u32 = 0;
     let response = loop {
-        match build_request(&state.http).send().await {
+        match build_request(http).send().await {
             Ok(r) if r.status().is_success() => break r,
             Ok(r) if crate::retry::is_transient_status(r.status().as_u16()) && attempt < max_retries => {
                 attempt += 1;
                 let delay = crate::retry::backoff_with_jitter(attempt);
                 tracing::warn!(
-                    "fetching '{}' returned {}; retrying in {delay:?} (attempt {attempt}/{max_retries})",
-                    source.source_url,
+                    "fetching '{source_url}' returned {}; retrying in {delay:?} (attempt {attempt}/{max_retries})",
                     r.status()
                 );
                 tokio::time::sleep(delay).await;
             }
-            Ok(r) => {
-                return JobSummary {
-                    status: "FAILED",
-                    items_processed: 0,
-                    chunks_sent: 0,
-                    duration_ms: start.elapsed().as_millis() as i32,
-                    error_message: Some(format!("fetch returned status {}", r.status())),
-                };
-            }
-            Err(e) => {
-                return JobSummary {
-                    status: "FAILED",
-                    items_processed: 0,
-                    chunks_sent: 0,
-                    duration_ms: start.elapsed().as_millis() as i32,
-                    error_message: Some(format!("fetch failed: {e}")),
-                };
-            }
+            Ok(r) => return Err(format!("fetch returned status {}", r.status())),
+            Err(e) => return Err(format!("fetch failed: {e}")),
         }
     };
     // Streamed with a running byte-count cap, not `response.bytes()` — see
@@ -117,59 +113,44 @@ async fn execute(
     // fully decompressed (and buffered) an arbitrarily large `Content-Encoding` payload by the
     // time anything got a chance to check its length.
     let max_decompressed_bytes = crate::config::max_decompressed_bytes();
-    let body = match super::decompress::read_capped_body(response, max_decompressed_bytes).await {
-        Ok(b) => b,
-        Err(e) => {
-            return JobSummary {
-                status: "FAILED",
-                items_processed: 0,
-                chunks_sent: 0,
-                duration_ms: start.elapsed().as_millis() as i32,
-                error_message: Some(format!("failed to read response body: {e}")),
-            };
-        }
-    };
+    let body = super::decompress::read_capped_body(response, max_decompressed_bytes)
+        .await
+        .map_err(|e| format!("failed to read response body: {e}"))?;
 
     // Transparent to every parser type: a feed distributed as a `.zip` (e.g. StopForumSpam's
     // downloads) is decompressed here, before any parser ever sees it. Same byte ceiling applied
     // again — independently — since a ZIP archive's internal members can expand far beyond the
     // (already-capped) compressed archive bytes that got us here.
-    let body = match super::decompress::decompress_if_zip(&body, max_decompressed_bytes) {
-        Ok(b) => b,
-        Err(e) => {
-            return JobSummary {
-                status: "FAILED",
-                items_processed: 0,
-                chunks_sent: 0,
-                duration_ms: start.elapsed().as_millis() as i32,
-                error_message: Some(e.to_string()),
-            };
-        }
-    };
+    let body =
+        super::decompress::decompress_if_zip(&body, max_decompressed_bytes).map_err(|e| e.to_string())?;
 
-    let effective_config = source.parser_config_json.clone();
+    let parser = parsers::for_type(parser_type).map_err(|e| e.to_string())?;
+    parser.parse(&body, parser_config_json).map_err(|e| e.to_string())
+}
 
-    let parser = match parsers::for_type(&source.parser_type) {
-        Ok(p) => p,
-        Err(e) => {
+async fn execute(
+    state: &AppState,
+    source: &external_source::Model,
+    targets: &[(external_source_vault_target::Model, Option<vault_endpoint::Model>)],
+) -> JobSummary {
+    let start = std::time::Instant::now();
+
+    let raw_records = match fetch_and_parse(
+        &state.http,
+        &source.source_url,
+        &source.parser_type,
+        source.parser_config_json.as_deref(),
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(error_message) => {
             return JobSummary {
                 status: "FAILED",
                 items_processed: 0,
                 chunks_sent: 0,
                 duration_ms: start.elapsed().as_millis() as i32,
-                error_message: Some(e.to_string()),
-            };
-        }
-    };
-    let raw_records = match parser.parse(&body, effective_config.as_deref()) {
-        Ok(r) => r,
-        Err(e) => {
-            return JobSummary {
-                status: "FAILED",
-                items_processed: 0,
-                chunks_sent: 0,
-                duration_ms: start.elapsed().as_millis() as i32,
-                error_message: Some(e.to_string()),
+                error_message: Some(error_message),
             };
         }
     };

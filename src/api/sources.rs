@@ -403,3 +403,89 @@ pub async fn trigger_external_source(
         "error_message": summary.error_message,
     })))
 }
+
+/// `POST /api/sources/test-fetch` request: the same fields a create/update payload would carry for
+/// the fetch+parse pipeline, and nothing else — no `id`, no target vaults, no cron schedule. This
+/// is deliberately usable against values that have never been saved (the WebUI's "Test Fetch"
+/// button in the New/Edit Source form calls it with whatever is currently typed, before `Create`
+/// or `Save` is even clicked).
+#[derive(Debug, Deserialize)]
+pub struct TestFetchPayload {
+    /// HTTP/HTTPS feed URL to fetch.
+    pub source_url: String,
+    /// Parser algorithm: `"REGEX_LINE"` or `"JSON_PATH"`.
+    pub parser_type: String,
+    /// Parser configuration JSON (parser-specific keys, plus the generic `headers`/`user_agent`
+    /// `FetchOptions` reads — the same blob a real source's `parser_config_json` would hold).
+    #[serde(default)]
+    pub parser_config_json: Option<String>,
+}
+
+/// Cap on how many extracted addresses the response actually carries. A feed can legitimately
+/// contain hundreds of thousands of entries; the WebUI's whole purpose here is "does this
+/// config work and does it look right", not a full preview of the result set, so returning
+/// everything would make the request slow to transfer and the response unusable to actually read.
+const TEST_FETCH_SAMPLE_LIMIT: usize = 50;
+
+/// `POST /api/sources/test-fetch`. Requires `can_manage_sources`, or Master — the same right
+/// needed to actually create a source, since this exists to be tried before that point. Read-only:
+/// runs the exact fetch→decompress→parse pipeline a real scheduled run would
+/// (`jobs::external_ingestion::fetch_and_parse`, so there is exactly one implementation of that
+/// pipeline for this to accidentally test something different from), but never pushes to any
+/// vault and never persists anything, so it writes no `sync_logs` row and no `audit_logs` row —
+/// nothing mutated, nothing to audit.
+///
+/// Mirrors `trigger_external_source`'s response shape (`200` with a `status`/`error_message`
+/// pair) rather than mapping a feed/network failure to an HTTP error status: "the remote feed is
+/// unreachable" or "the parser config doesn't match this body" is exactly the information this
+/// endpoint exists to surface, not a malformed-request condition on the caller's part. A `400` is
+/// reserved for `parser_type` itself being invalid, since that is a caller mistake the fetch never
+/// gets a chance to attempt.
+pub async fn test_fetch_external_source(
+    State(state): State<AppState>,
+    axum::Extension(caller): axum::Extension<api_key::Model>,
+    StrictJson(payload): StrictJson<TestFetchPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    guard_resource_creation(&caller, caller.can_manage_sources)?;
+    if payload.parser_type != "REGEX_LINE" && payload.parser_type != "JSON_PATH" {
+        return Err(AppError::InvalidInput("parser_type must be REGEX_LINE or JSON_PATH".to_owned()));
+    }
+
+    let start = std::time::Instant::now();
+    let result = crate::jobs::external_ingestion::fetch_and_parse(
+        &state.http,
+        &payload.source_url,
+        &payload.parser_type,
+        payload.parser_config_json.as_deref(),
+    )
+    .await;
+    let duration_ms = start.elapsed().as_millis() as i32;
+
+    let (status, total_extracted, sample, error) = match result {
+        Ok(records) => {
+            let mut seen = std::collections::HashSet::new();
+            let deduped: Vec<String> = records.into_iter().filter(|r| seen.insert(r.clone())).collect();
+            if deduped.is_empty() {
+                // Same "zero is not trustworthy" reasoning as `execute`'s own status derivation: a
+                // syntactically clean fetch+parse that found nothing is far more often a
+                // misconfigured selector/regex or a captive-portal page than a feed that is
+                // genuinely, momentarily empty.
+                ("PARTIAL", 0, Vec::new(), None)
+            } else {
+                let total = deduped.len();
+                let sample: Vec<String> = deduped.into_iter().take(TEST_FETCH_SAMPLE_LIMIT).collect();
+                ("SUCCESS", total, sample, None)
+            }
+        }
+        Err(e) => ("FAILED", 0, Vec::new(), Some(e)),
+    };
+
+    Ok(Json(serde_json::json!({
+        "status": status,
+        "total_extracted": total_extracted,
+        "sample": sample,
+        "truncated": total_extracted > TEST_FETCH_SAMPLE_LIMIT,
+        "duration_ms": duration_ms,
+        "error": error,
+    })))
+}

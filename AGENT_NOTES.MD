@@ -2134,3 +2134,133 @@ merge/split logic specifically (same limitation as Session 17: this is runtime J
 render→fill→submit→reopen cycle, which the existing static-shape checks can't express without a real
 JS runtime or browser in CI). Did not touch `REGEX_LINE`'s own parser-specific config surface (it
 has none today — no equivalent gap existed there to close).
+
+## Session 22 (2026-09-26): JSON_PATH mapping example + conditional visibility, a "Test Fetch" dry-run tool, and a wider/more responsive layout
+
+Three requests bundled in one session, following the same "mandatory documents" structured-task
+convention as earlier sessions: (1) the External Sources form gave no hint what JSON keys
+`parser_config_json` actually expects for `JSON_PATH`, and showed that box even for `REGEX_LINE`,
+which ignores it entirely; (2) no way to check whether a feed URL + parser config actually works
+before committing to `Create`/`Save`; (3) the dashboard felt cramped ("not half of the screen") on
+a wide monitor. Read `AGENT.MD`/`RBAC_MODEL.md`/`SCHEMA.MD` fresh before starting, per their own
+mandate, and compared against `example/` per `AGENT.MD`'s Peer Repository Synchronization section
+(no `git pull` needed this session — normal feature-implementation use of `example/` as a pattern
+reference, not a comparison/audit artifact, per that section's own carve-out).
+
+### 1. Conditional Parser Config JSON + mapping example
+
+Confirmed directly (`src/parsers/regex_line.rs::parse`'s `_config: Option<&str>` parameter is
+unused) that the Parser Config JSON box has zero effect for `REGEX_LINE` — so hiding it entirely
+for that parser type isn't a smaller feature, it's removing a box that was never doing anything.
+`showSourceForm` (`static/app.js`) now toggles `#source-parser-config-group`'s visibility on the
+Parser Type `<select>`'s `change` event (and once on initial render, so editing an existing
+`JSON_PATH` source starts visible). For `JSON_PATH`, the group's hint text carries a worked
+example (`{"array_path": "data", "ip_field": "ipAddress"}`) plus the `jsonl`/bare-array variants
+from `src/parsers/json_path.rs`'s own module doc.
+
+**The example was verified against the real feed, not just the parser's doc comment.** The user
+provided a live AbuseIPDB API key and a one-time fetch window; `curl`'d
+`GET /api/v2/blacklist?ipVersion=4` once, confirmed the actual response shape
+(`{"meta": {...}, "data": [{"ipAddress": "...", "countryCode": ..., "abuseConfidenceScore": ...,
+"lastReportedAt": ...}]}`) matches `array_path: "data"`/`ip_field: "ipAddress"` exactly, then saved
+a trimmed 5-entry slice as a `serde_json::json!` literal fixture in the new test file (§2 below) —
+per `AGENT.MD`'s testing standard, the live endpoint itself is never hit from an automated test,
+only from this one-time, human-directed verification pass. The user separately uploaded a second
+real fixture, AbuseIPDB's IPv6 blacklist (`ipVersion=6`), used the same way for a second, IPv6-
+specific test — real `::`-compressed addresses have their own normalization edge cases a purely
+synthetic fixture could accidentally not exercise.
+
+### 2. "Test Fetch" dry-run tool
+
+New endpoint `POST /api/sources/test-fetch` (`src/api/sources.rs::test_fetch_external_source`,
+guarded by `guard_resource_creation(&caller, caller.can_manage_sources)` — the same right creating
+a source itself requires, since this exists to be tried *before* that point). Takes
+`{source_url, parser_type, parser_config_json}` with no `id` — deliberately usable against values
+that have never been saved, which is the entire point of a "test before you save" button.
+
+**Refactored rather than duplicated the fetch pipeline.** `src/jobs/external_ingestion.rs`'s
+`execute()` had its fetch→retry→decompress→parse logic inline; extracted it into
+`pub(crate) async fn fetch_and_parse(http, source_url, parser_type, parser_config_json) ->
+Result<Vec<String>, String>`, so there is exactly one implementation of "does this feed actually
+work" — both the real scheduled job and the WebUI's preview button call it, rather than risking a
+second, independently-drifting copy that tests something subtly different from what production
+actually does (the classic failure mode a "test tool" invites). `execute()` now just calls it and
+keeps its own dedupe/chunk/push logic unchanged; confirmed behavior-preserving by re-running all 12
+pre-existing `external_ingestion_tests.rs` tests unmodified before writing anything new.
+
+Response mirrors `trigger_external_source`'s existing convention (`200` with a `status` field,
+`SUCCESS`/`PARTIAL`/`FAILED`) rather than mapping a feed/network failure to an HTTP error status —
+"the remote feed is broken" is exactly the information this endpoint exists to surface, not a
+caller mistake. A `400` is reserved for `parser_type` itself being invalid, the one thing that's
+genuinely a bad request. `sample` is capped at 50 entries (`TEST_FETCH_SAMPLE_LIMIT`) with
+`truncated`/`total_extracted` disambiguating "small feed" from "large feed, partial preview" — a
+feed can legitimately have hundreds of thousands of entries, and the tool's job is "does this work
+and look right," not a full data dump. Writes neither a `sync_logs` row (not a real execution) nor
+an `audit_logs` row (nothing mutated — `AGENT.MD` §6 only requires audit entries for mutating
+actions) — read-only end to end.
+
+`static/app.js`: `buildMergedParserConfig(rows, userAgentValue, restConfigRaw)` extracted as a
+shared helper between the submit handler and the new "Test Fetch" button's click handler, so a
+preview always reflects exactly what `Create`/`Save` would actually send — the same
+never-drift-apart reasoning as the backend refactor, applied to the client side of the same
+feature. The result panel reuses `statusBadge()` (already used by the Sync Logs table for this
+exact `SUCCESS`/`PARTIAL`/`FAILED` vocabulary) rather than inventing new badge classes.
+
+### 3. Wider, more responsive layout
+
+Compared `.container`/`.top-bar` across all three peers: `simply_ip_vault`/`simply_ip_exporter`
+both use a fixed `max-width: 1280px` (matching this project's prior value), while
+`simply_hook_executor` uses `max-width: 1800px` with `width: 100%` and fluid
+`clamp(1rem, 3vw, 4rem)` side padding instead of a flat `2rem`. Adopted hook_executor's approach
+specifically (not the other two) since this dashboard's own tables (Sync Logs, Audit Logs,
+External Sources) run about as wide/column-heavy as hook_executor's own, and both were visibly
+cramped at 1280px on anything wider than a small laptop. Also added `simply_hook_executor`'s mobile
+polish this project's 768px breakpoint lacked: `.header` stacks to a column and `.form-actions`
+buttons go full-width on a narrow screen, instead of only adjusting padding. Left
+`simply_hook_executor`'s own 1100px `.grid-layout` breakpoint alone — that's specific to a
+two-column dashboard split this project's page structure doesn't have, not a generic
+responsiveness primitive to port. `.table-container` (`overflow-x: auto`, already present) and
+`.header`'s `flex-wrap: wrap` were already adequate and untouched.
+
+### Verification
+
+- Live browser test (headless Chromium, injected into the real served `static/index.html`, backed
+  up/restored via `git checkout --`, confirmed clean after): logged in, opened New Source, verified
+  the Parser Config JSON group starts hidden (`REGEX_LINE` default), becomes visible with the
+  example text present on switching to `JSON_PATH`, and hides again switching back (not a one-way
+  toggle) — then filled a real `source_url` pointing at a local feed server and clicked Test Fetch,
+  confirming the result panel showed a `SUCCESS` badge and all three real extracted addresses (two
+  IPv4, one IPv6, one comment line correctly skipped). Zero JS errors throughout.
+- `cargo test --test source_test_fetch_tests`: 11/11 new tests — RBAC (with/without
+  `can_manage_sources`), invalid `parser_type` → `400`, a working `REGEX_LINE` feed, two working
+  `JSON_PATH` feeds (the real AbuseIPDB IPv4 and IPv6 fixtures, §1 above), a configured custom
+  header actually reaching the mock feed, an unreachable feed reporting `FAILED` (not an HTTP
+  error), a zero-entry feed reporting `PARTIAL`, sample truncation at the 50-entry cap with the
+  true `total_extracted` still reported, and confirmation that neither an `external_sources` row
+  nor an `audit_logs` row is ever created.
+- `cargo test --test external_ingestion_tests`: all 12 pre-existing tests still pass unmodified —
+  confirms the `fetch_and_parse` extraction is behavior-preserving.
+- `cargo test --test source_hygiene`: 11/11 — one first-pass failure (a `<label id="...">` used
+  only for `aria-labelledby`, the hygiene test's "every injected id must be queried via
+  `getElementById`" rule flagging it as dead markup) fixed by simply not giving that label an id.
+- `./scripts/test_e2e.sh`: added a `POST /api/sources/test-fetch` smoke check in section 7h,
+  reusing the 12,000-record synthetic feed already generated there — confirms `status: SUCCESS`,
+  `total_extracted: 12000` (the *true* count, not the capped sample), `truncated: true`,
+  `sample` capped at 50, and that no `external_sources` row named `full-replace-e2e-source` exists
+  yet at that point (test-fetch ran first, before the real source below is created) — all against
+  the real compiled binary over a real socket. **219/219** (up from 213).
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean throughout.
+- `cargo test`: all 18 test binaries green, 0 failed.
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
+- Updated `API_REFERENCE.md` (new route in both the per-endpoint table and the route-index table,
+  per `AGENT.MD`'s "must be regenerated whenever a route... changes" mandate) alongside
+  `FILE_MAP.MD`.
+- No leftover chromium/`simply_ip_sync`/local feed-server processes after cleanup.
+
+**Not done:** did not add SSRF/private-IP-range validation to `test_fetch_external_source` beyond
+what `client.rs`'s existing module doc already establishes as this project's threat model —
+`external_sources.source_url` is already admin-configured (`can_manage_sources`-gated) input with
+no such blocklist today, and a preview endpoint gated by the identical right doesn't change that
+model, only when in the workflow the same fetch can happen. Did not add a Rust-side regression test
+for the parser-type-conditional visibility or the mapping example's exact wording — same JS-runtime
+limitation noted in Sessions 17/21, mitigated here by the live-Chromium verification instead.
