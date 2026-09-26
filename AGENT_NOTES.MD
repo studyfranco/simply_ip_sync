@@ -1953,3 +1953,96 @@ and the root cause was conclusively established from the client-side code and a 
 without needing to touch it). Did not add SSRF/target-validation hardening to `join_endpoint` —
 `vault_endpoints` are Master-granted, admin-configured targets (see `client.rs`'s existing
 module-level doc comment), not arbitrary user input, so that threat model is unchanged by this fix.
+
+## Session 20 (2026-09-26): dependency bump (`zip` 2→8, `croner` 3→4, `oxc_*` 0.145→0.146) + a second outbound signing bug surfaced once Session 19's fix let requests actually reach the remote vault
+
+Requested: bump the crates flagged in a Docker build log as having newer versions available
+(`crypto-common`, `matchit`, `oxc_allocator`/`oxc_parser`/`oxc_span`, `zip`). `Cargo.lock` is
+`.gitignore`d in this repo (every build re-resolves fresh against `Cargo.toml`'s constraints), so
+`crypto-common`/`matchit` (transitive, not in `Cargo.toml`) have nothing to durably bump — only the
+three direct dependencies matter.
+
+- **`croner` 3 → 4**: compiled clean, `src/scheduler.rs`'s 5 unit tests (parsing/normalization)
+  pass unchanged. No API changes hit by this codebase's usage.
+- **`zip` 2 → 8** (a six-major-version jump): compiled clean, all 8 `jobs::decompress` unit tests
+  pass unchanged — the `FileOptions<'_, ()>`/`ZipWriter`/`ZipArchive` surface this codebase uses
+  evidently didn't change across those majors.
+- **`oxc_allocator`/`oxc_parser`/`oxc_span`: capped at 0.146, not 0.151.0 (the "available" version
+  from the build log).** 0.147.0 onward requires `rustc 1.96.0`; this dev environment's system
+  `rustc` (Debian package, no `rustup`, no newer candidate via `apt-cache policy`) is `1.95.0`. The
+  Docker build log that prompted this session showed `Locking ... to latest Rust 1.98.1 compatible
+  versions` — the container's toolchain is newer than this local dev environment's — so `0.151.0`
+  would likely build fine in Docker, but could not be verified against the 5 quality gates locally.
+  Capped at the newest version this environment can actually compile and test (`0.146.0`, confirmed
+  via binary search: 0.146 builds, 0.147/0.148/0.150 all report the same `rustc 1.96.0` requirement).
+  **Flagging for the user:** closing this last gap requires upgrading this dev environment's `rustc`
+  to 1.96+ (matching what the Docker image already uses) — not something to do silently as a side
+  effect of a dependency bump.
+
+### A second, distinct bug found while re-verifying — this dependency bump did not cause it
+
+While re-running the 5 gates, the user pasted a fresh production log line:
+`simply_ip_vault::middleware: Rejected request: invalid X-Signature-256 for key e25fec81 on GET
+/api/ips?group_name=MainServ_Ban&include_deleted=true&limit=5000&offset=0`. This is *progress* from
+Session 19's bug (the request now actually reaches the real vault's own middleware — previously it
+went to the wrong domain root entirely and never got this far), but a new, distinct failure: a
+signature mismatch, not a routing/URL-construction one.
+
+**Root cause:** `post_batch_once`/`get_ips_page` signed `target = url.path()` — the path of the
+*fully joined* request URL, which (correctly, per Session 19) includes `target_url`'s own
+reverse-proxy subpath (e.g. `/direct/ip_vault/api/ips`). But `simply_ip_vault`'s own router (like
+this service's own, per `src/lib.rs`'s `.nest("/api", ...)` at the router root — confirmed by
+reading `example/simply_ip_vault/src/lib.rs`/`middleware.rs` directly) has no subpath awareness of
+its own: the *only* deployment shape that can work at all is one where the reverse proxy strips
+that subpath before forwarding, since an unstripped request would 404 at the vault's own routing
+before ever reaching `signed_target`/auth. The pasted log line proves this directly — the vault's
+own log recorded the path it verified against as the bare `/api/ips?group_name=MainServ_Ban&...`,
+no `/direct/ip_vault` prefix, exactly matching the query-parameter append order in `get_ips_page`
+(`group_name`, `include_deleted`, `limit`, `offset`, then `since` if present). So the client signed
+`/direct/ip_vault/api/ips?...` while the vault verified against `/api/ips?...` — different byte
+strings, therefore a "genuine" HMAC mismatch, even though both sides implement `CANONICAL_V1`
+correctly and neither side has a bug in the cryptography itself.
+
+Unlike the WebUI's `signingBase` (Session 18), this needs no operator-facing override field: since
+the "proxy forwards the subpath through untouched" deployment shape is architecturally impossible
+for any correctly-nested `simply_ip_vault` instance (confirmed above, mirroring the same conclusion
+Session 18 reached for this service's *own* inbound routing), the signed target must
+*unconditionally* be the bare endpoint path — there is no real-world working configuration where
+signing `target_url`'s own subpath would ever be correct.
+
+### Fix (`src/client.rs`)
+
+Both call sites now sign a `const` literal path (`RECORDS_BATCH_PATH = "/api/records/batch"`,
+`IPS_PATH = "/api/ips"`) instead of reading `url.path()` back off the already-joined URL.
+`join_endpoint`'s doc comment gained a note that its return value is for sending only, never
+signing — the two concerns (where to send vs. what to sign) are handled by genuinely different
+values now, not just different call sites reading the same one.
+
+Updated the two Session 19 regression tests (`outbound_get_ips_delta_preserves_a_reverse_proxy_subpath_in_target_url`,
+`outbound_post_batch_preserves_a_reverse_proxy_subpath_in_target_url`) — their mock route matcher
+correctly kept asserting the request lands on the full subpath-prefixed path (that part of Session
+19's fix was right), but their signature-verification assertion had encoded the *wrong* expectation
+(that the signed target should include the subpath) and needed updating to match the newly-confirmed
+correct behavior.
+
+### Verification
+
+- Read `example/simply_ip_vault/src/lib.rs` and `middleware.rs` directly to confirm its router
+  architecture mirrors this service's own before concluding the "forward-through" deployment shape
+  is unreachable — not assumed from Session 19's investigation alone.
+- **Mutation-tested, not merely written:** temporarily reverted both call sites back to
+  `target = url.path()...`, re-ran the two updated regression tests, confirmed both failed (the
+  mock handler's own `assert!` panicked inside the response closure, surfaced by `reqwest` as an
+  `IncompleteMessage` error on the client side — the expected shape for a panic mid-response in a
+  `wiremock` handler), then restored the real fix and confirmed all 14 `security_tests` pass again.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: all test binaries green, 0 failed (`security_tests` still 14 — same tests corrected
+  in place, not added to).
+- `./scripts/test_e2e.sh`: 213/213, unchanged.
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
+
+**Not done:** did not add an operator-facing override for the outbound signing base (unlike the
+WebUI's `login-api-base`) — per the architecture finding above, there is no real deployment shape
+that would need one; adding one would be speculative surface area for a case that cannot occur.
+Did not upgrade this dev environment's `rustc` to unblock the `oxc_*` 0.151.0 bump — flagged above
+for the user to decide, not done silently.

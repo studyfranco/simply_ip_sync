@@ -202,6 +202,10 @@ fn signed_headers(
 /// reached `simply_ip_vault` at all). Plain string concatenation after trimming `base`'s trailing
 /// slash(es) has no such foot-gun and matches the mental model operators actually have: `target_url`
 /// is a prefix, and this appends to it.
+///
+/// **The URL this returns is for sending only — never for signing.** `endpoint_path` (the literal
+/// argument passed in, e.g. `/api/ips`) is what must be signed instead; see the comment at each
+/// call site.
 fn join_endpoint(base: &Url, path: &str) -> Result<Url, ClientError> {
     let trimmed = base.as_str().trim_end_matches('/');
     Url::parse(&format!("{trimmed}{path}")).map_err(|e| ClientError::InvalidUrl(e.to_string()))
@@ -218,8 +222,18 @@ async fn post_batch_once(
     mode: BatchMode,
 ) -> Result<BatchRecordsResponse, ClientError> {
     let base = Url::parse(&endpoint.target_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
-    let url = join_endpoint(&base, "/api/records/batch")?;
-    let target = url.path().to_owned();
+    // `target_url` may carry its own reverse-proxy subpath (e.g. `https://host/direct/ip_vault/`),
+    // which `simply_ip_vault`'s own router has no awareness of: it mounts everything under a
+    // literal `.nest("/api", ...)` at its own root, so the *only* deployment that can work at all
+    // is one where the proxy strips that subpath before forwarding -- an unstripped request would
+    // 404 there before signature verification ever runs. Consequently `signed_target` on the
+    // receiving side sees the bare `/api/records/batch`, never the subpath -- signing `url.path()`
+    // (which includes `target_url`'s own subpath) produced a signature the remote vault could never
+    // verify, rejected as "invalid X-Signature-256" even once the URL itself pointed at the right
+    // place. Sign the literal endpoint path instead of reading it back off the constructed URL.
+    const RECORDS_BATCH_PATH: &str = "/api/records/batch";
+    let url = join_endpoint(&base, RECORDS_BATCH_PATH)?;
+    let target = RECORDS_BATCH_PATH.to_owned();
 
     #[derive(Serialize)]
     struct Payload<'a> {
@@ -364,7 +378,13 @@ async fn get_ips_page(
     include_deleted: bool,
     offset: u64,
 ) -> Result<Vec<IpRecordResponse>, ClientError> {
-    let mut url = join_endpoint(base, "/api/ips")?;
+    // See post_batch_once's comment on RECORDS_BATCH_PATH: `target_url`'s own reverse-proxy
+    // subpath, if any, must be sent to (it's part of `url`, via `join_endpoint`) but never signed
+    // -- the remote `simply_ip_vault`'s `signed_target` sees only the bare path its own router
+    // matched on, `/api/ips`, regardless of what subpath the public-facing `target_url` uses to
+    // reach it.
+    const IPS_PATH: &str = "/api/ips";
+    let mut url = join_endpoint(base, IPS_PATH)?;
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("group_name", group_name);
@@ -376,8 +396,8 @@ async fn get_ips_page(
         }
     }
     let target = match url.query() {
-        Some(q) => format!("{}?{q}", url.path()),
-        None => url.path().to_owned(),
+        Some(q) => format!("{IPS_PATH}?{q}"),
+        None => IPS_PATH.to_owned(),
     };
 
     // Signed fresh on every call — see post_batch_once's doc comment for why a retried request

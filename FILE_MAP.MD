@@ -181,7 +181,12 @@ trimming `base`'s trailing slash(es), **not** `base.join(path)`: a leading-slash
 `Url::join` is an RFC 3986 §5.3 absolute-path reference and silently discards `base`'s entire path,
 which previously dropped a reverse-proxy subpath (`target_url: https://host/direct/ip_vault/`)
 from every outbound request, landing at the domain root instead — see AGENT_NOTES.MD Session 19
-and `tests/security_tests.rs`'s `*_preserves_a_reverse_proxy_subpath_in_target_url` tests.
+and `tests/security_tests.rs`'s `*_preserves_a_reverse_proxy_subpath_in_target_url` tests. The
+**signed** target is a separate, bare literal (`RECORDS_BATCH_PATH`/`IPS_PATH`), never `url.path()`
+from the joined URL: `target_url`'s own subpath belongs in the request (so it reaches the proxy)
+but must never be signed, since a correctly-nested remote `simply_ip_vault` can only be reached
+at all if its proxy strips that subpath before forwarding — the vault's own `signed_target` then
+verifies against the bare path. See AGENT_NOTES.MD Session 20.
 
 ### `src/scheduler.rs` — in-process cron scheduler
 

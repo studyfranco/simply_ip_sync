@@ -325,30 +325,44 @@ async fn outbound_get_ips_delta_signs_correctly_with_since_and_include_deleted()
 }
 
 /// Regression test: a `target_url` configured behind a reverse-proxy subpath (a real production
-/// shape, e.g. `https://host/direct/ip_vault/`) must keep that subpath on every outbound request.
-/// `client::join_endpoint` replaced a `base.join("/api/ips")` call — a leading-slash argument to
-/// `Url::join` is an RFC 3986 §5.3 absolute-path reference, which silently discards the entirety
-/// of `base`'s own path — so the prior code dropped `/direct/ip_vault` and sent every delta fetch
-/// to the bare domain root instead. That surfaced in production as a clean `500` from whatever
-/// unrelated service happened to sit at the domain root, while the real vault never saw the
-/// request at all. Both existing outbound tests above use a bare-root mock URL, so neither would
-/// have caught this; this test deliberately configures `target_url` with a non-trivial path.
+/// shape, e.g. `https://host/direct/ip_vault/`) must (1) keep that subpath in the actual request
+/// URL, and (2) sign only the *bare* endpoint path, `/api/ips`, never the subpath. Both were real,
+/// separate bugs, found in sequence against the same production endpoint:
+///
+/// - `client::join_endpoint` replaced a `base.join("/api/ips")` call — a leading-slash argument to
+///   `Url::join` is an RFC 3986 §5.3 absolute-path reference, which silently discards the entirety
+///   of `base`'s own path — so the prior code dropped `/direct/ip_vault` and sent every delta
+///   fetch to the bare domain root instead. That surfaced as a clean `500` from whatever unrelated
+///   service happened to sit at the domain root, while the real vault never saw the request at
+///   all.
+/// - Once that was fixed, the request reached the real vault, which then rejected it with `401
+///   invalid X-Signature-256`: the vault's own router mounts everything under a literal
+///   `.nest("/api", ...)` at its root (same architecture as this service — see
+///   `simply_ip_vault::middleware::signed_target`'s doc comment), so the *only* deployment shape
+///   that can work at all is one where the reverse proxy strips the subpath before forwarding —
+///   confirmed directly from the vault's own log line, which recorded the request path it actually
+///   verified against as the bare `/api/ips`, no `/direct/ip_vault` prefix. Signing `url.path()`
+///   (which includes `target_url`'s own subpath, since that subpath is part of the real request
+///   URL) produced a signature the remote vault could never verify.
+///
+/// Both existing outbound tests above use a bare-root mock URL, so neither would have caught
+/// either bug; this test deliberately configures `target_url` with a non-trivial path.
 #[tokio::test]
 async fn outbound_get_ips_delta_preserves_a_reverse_proxy_subpath_in_target_url() {
     let mock_server = MockServer::start().await;
     let shared_secret = "outbound-subpath-test-secret";
 
     Mock::given(method("GET"))
+        // The request itself must still carry the subpath -- this is where the proxy expects it.
         .and(path("/direct/ip_vault/api/ips"))
         .respond_with(move |req: &wiremock::Request| {
             let sig_header = req.headers.get("X-Signature-256").expect("signature header present").to_str().expect("utf8");
             let ts_header = req.headers.get("X-Timestamp").expect("timestamp header present").to_str().expect("utf8");
-            let target = format!("{}?{}", req.url.path(), req.url.query().expect("query string present"));
-            // The signed target must carry the subpath too -- a signature computed only over
-            // "/api/ips" would fail verification against the actual (subpath-prefixed) request.
-            assert!(target.starts_with("/direct/ip_vault/api/ips"), "signed target must include the subpath, got {target}");
+            // But the SIGNED target must be the bare endpoint path -- matching what a real vault's
+            // own router (stripped-prefix, the only working config) actually verifies against.
+            let target = format!("/api/ips?{}", req.url.query().expect("query string present"));
             let digest = simply_ip_sync::crypto::verify_signature(shared_secret, "GET", &target, ts_header, b"", sig_header);
-            assert!(digest.is_some(), "remote side must be able to verify the outbound signature");
+            assert!(digest.is_some(), "remote side must be able to verify the outbound signature against the bare path");
             ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new())
         })
         .mount(&mock_server)
@@ -376,21 +390,25 @@ async fn outbound_get_ips_delta_preserves_a_reverse_proxy_subpath_in_target_url(
 
 /// Same regression, on the push side (`post_batch` / `join_endpoint`'s other call site). Not yet
 /// manifesting in the reported bug (no push had been attempted against the affected endpoint), but
-/// equally broken before this fix — same `base.join("/api/records/batch")` foot-gun.
+/// equally broken before this fix — same `base.join("/api/records/batch")` foot-gun, and the same
+/// subsequent bare-path signing requirement once that first bug was fixed.
 #[tokio::test]
 async fn outbound_post_batch_preserves_a_reverse_proxy_subpath_in_target_url() {
     let mock_server = MockServer::start().await;
     let shared_secret = "outbound-subpath-batch-secret";
 
     Mock::given(method("POST"))
+        // The request itself must still carry the subpath -- this is where the proxy expects it.
         .and(path("/direct/ip_vault/api/records/batch"))
         .and(header("X-API-Key", "remote-key"))
         .respond_with(move |req: &wiremock::Request| {
             let sig_header = req.headers.get("X-Signature-256").expect("signature header present").to_str().expect("utf8");
             let ts_header = req.headers.get("X-Timestamp").expect("timestamp header present").to_str().expect("utf8");
-            let target = "/direct/ip_vault/api/records/batch";
+            // But the SIGNED target must be the bare endpoint path -- matching what a real vault's
+            // own router (stripped-prefix, the only working config) actually verifies against.
+            let target = "/api/records/batch";
             let digest = simply_ip_sync::crypto::verify_signature(shared_secret, "POST", target, ts_header, &req.body, sig_header);
-            assert!(digest.is_some(), "remote side must be able to verify the outbound signature, including the subpath");
+            assert!(digest.is_some(), "remote side must be able to verify the outbound signature against the bare path");
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1
             }))
