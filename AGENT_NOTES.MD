@@ -2046,3 +2046,91 @@ WebUI's `login-api-base`) — per the architecture finding above, there is no re
 that would need one; adding one would be speculative surface area for a case that cannot occur.
 Did not upgrade this dev environment's `rustc` to unblock the `oxc_*` 0.151.0 bump — flagged above
 for the user to decide, not done silently.
+
+## Session 21 (2026-09-26): structured "Custom Headers" editor for External Sources, replacing hand-written JSON — inspired by `simply_ip_vault`'s webhook config page
+
+User wanted to add an AbuseIPDB blacklist feed (`GET .../api/v2/blacklist?ipVersion=4`, auth via a
+`Key: <token>` header) as an `external_sources` row, and asked where the API key goes. The answer at
+the time was correct but ugly: hand-type `{"array_path": "data", "ip_field": "ipAddress", "headers":
+{"Key": "..."}}` directly into the raw "Parser Config JSON" textarea (`src/jobs/external_ingestion.rs`'s
+`FetchOptions::from_config` already reads a generic `headers`/`user_agent` pair off that same JSON
+blob, independent of whatever parser-specific keys the chosen parser needs — this was already fully
+supported server-side, just with no UI for it). The user then asked for a real UI, pointing at
+`simply_ip_vault`'s Webhook Configs page's "Custom Headers" key/value editor (`+ Add Header`, one row
+per header, a remove button per row) as the model to follow, plus asked generally "where put the api
+key auth method" / "how show the page when you want add" — i.e. design the equivalent affordance for
+External Sources, not just hardcode this one feed.
+
+### Design
+
+No schema or server-side change needed at all — `parser_config_json` already accepts `headers`
+alongside parser-specific keys; the gap was purely that the WebUI made you write raw JSON for it.
+Ported `simply_ip_vault`'s key/value editor pattern (`renderHeaderRows`/`addHeaderRow`/`headerMap`,
+`static/app.js` ~2437-2495 there) into `showSourceForm` (`static/app.js`), adapted from its
+class-based `this.state.webhookHeaders` to this file's plain-function style: `rows` is a local array
+closed over by the form's own render/submit closures, not module or class state — matches how
+`existing`/`vaults` are already threaded through this same function.
+
+`splitParserConfig(raw)` (new) separates a source's existing `parser_config_json` into the two
+generic keys the ingestion job reads (`headers`, `user_agent`) — each gets its own UI field — and
+whatever's left (parser-specific: `array_path`/`ip_field`/`jsonl` for JSON_PATH, etc.), which still
+goes in the raw "Parser Config JSON" textarea, now relabeled to say so explicitly. This is the piece
+`simply_ip_vault`'s form doesn't need an equivalent of: its webhook config has no comparable
+"whatever this specific feed/handler needs" residual field, since a webhook has a fixed, fully-typed
+shape (`SCHEMA.MD`-defined columns), while an external source's `parser_config_json` is *itself* a
+free-form blob keyed by `parser_type` — the header/user-agent editor had to be layered on top of an
+existing untyped field rather than being the field's only content. On submit, the raw textarea is
+parsed, the header-editor's rows and the (also new) "User-Agent" text field are merged back in as
+`headers`/`user_agent` keys, and the whole thing is re-stringified into one `parser_config_json`
+value — the wire format and server code are completely unchanged, only how the WebUI builds that one
+string changed. Malformed hand-edited JSON in the raw textarea is caught at submit time with a toast
+rather than silently discarded or sent broken.
+
+Did not adopt `simply_ip_vault`'s full "Auth Mode" dropdown (`CANONICAL_V1`/`HMAC_ONLY`/`API_KEY_ONLY`/`NONE`)
+— that machinery exists there for *outbound webhook dispatch* authenticating itself to a receiver
+that might itself be another `simply_ip_vault`/hook-executor instance (hence HMAC signing options).
+External Sources here are the opposite direction: this service is a plain HTTP *client* pulling from
+a third-party feed (AbuseIPDB, Spamhaus, FireHOL...), which only ever needs a bearer-style header or
+none — there's no signing scheme to choose between. Bringing over the header editor alone (not the
+whole auth-mode complex) matches what this feature actually needs.
+
+Ported the CSS this depends on byte-for-byte from `simply_ip_vault/static/style.css`
+(`.kv-editor`/`.kv-row`/`.kv-remove`/`.kv-empty` — this repo had none of it) rather than reinventing
+equivalent rules, keeping the same "shared design system" convention already established for this
+repo's `:root` tokens (see `FILE_MAP.MD`'s note on `style.css`).
+
+One test friction: `tests/source_hygiene.rs`'s `dynamically_injected_form_ids_are_queried_with_the_exact_same_spelling`
+failed on a first pass — the new `<label id="source-headers-label">` used purely for
+`aria-labelledby` (mirroring `simply_ip_vault`'s own pattern exactly) is never looked up via
+`getElementById`, which this repo's hygiene test treats as dead markup regardless of the id's actual
+(accessibility-only) purpose. Fixed by dropping the id and using a static `aria-label="Custom
+headers"` on the group `<div>` instead — same accessibility outcome, no id to be "dead."
+
+### Verification
+
+- Live browser test (not just the static hygiene suite): launched a fresh server instance, injected
+  a login + form-fill + submit + re-open-for-edit script directly into the real, served
+  `static/index.html` (backed up via `git diff`/restored via `git checkout --`, confirmed clean
+  after), driven by headless Chromium. Filled the exact AbuseIPDB scenario from the user's own
+  request (`array_path: data`, `ip_field: ipAddress`, one header `Key: <value>`), submitted, then
+  independently re-fetched the created source via `GET /api/sources` to inspect what was actually
+  persisted (not just what the form displayed) — confirmed `parser_config_json` came back as
+  `{"array_path":"data","ip_field":"ipAddress","headers":{"Key":"test-api-key-value"}}`. Reopened the
+  same row for edit and confirmed the raw textarea now shows only `{"array_path":"data",
+  "ip_field":"ipAddress"}` (headers correctly split back out) and the header editor re-populates the
+  row (`name: "Key"`, `value: "test-api-key-value"`) — a full, verified round trip, zero JS errors.
+  (Hit one environment snag first: launched the throwaway server from the scratch working directory
+  rather than the project root, so `ServeDir::new("static")` — a path relative to the process's own
+  cwd, per `src/lib.rs:93` — 404'd on everything; re-launched from the project root and it worked.)
+- `cargo test --test source_hygiene`: 11/11.
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: all test binaries green, 0 failed.
+- `./scripts/test_e2e.sh`: 213/213, unchanged (no Rust/API surface touched this session).
+- `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
+- No leftover chromium/`simply_ip_sync` processes after cleanup.
+
+**Not done:** did not add a `tests/source_hygiene.rs` regression test asserting the header-editor's
+merge/split logic specifically (same limitation as Session 17: this is runtime JS behaviour across a
+render→fill→submit→reopen cycle, which the existing static-shape checks can't express without a real
+JS runtime or browser in CI). Did not touch `REGEX_LINE`'s own parser-specific config surface (it
+has none today — no equivalent gap existed there to close).

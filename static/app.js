@@ -470,9 +470,39 @@ function sourceRow(s) {
   </tr>`;
 }
 
+/// Splits a source's `parser_config_json` into the two well-known generic keys the ingestion job
+/// itself reads (`headers`, `user_agent` — see `src/jobs/external_ingestion.rs`'s `FetchOptions`)
+/// and whatever's left, which is parser-specific (`array_path`/`ip_field`/`jsonl` for JSON_PATH,
+/// etc.). The generic keys get their own editor UI (see below); the rest still goes in the raw
+/// "Parser Config JSON" textarea, since there's no reasonable structured UI for "whatever fields
+/// this parser happens to need" in general. Tolerates missing/malformed JSON by treating the whole
+/// thing as "no headers, no user agent, raw text unchanged" — the raw textarea remains the source
+/// of truth for an existing value that fails to parse, rather than silently discarding it.
+function splitParserConfig(raw) {
+  if (!raw) return { headerRows: [], userAgent: "", rest: "" };
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { headerRows: [], userAgent: "", rest: raw };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { headerRows: [], userAgent: "", rest: raw };
+  }
+  const { headers, user_agent, ...rest } = parsed;
+  const headerRows =
+    headers && typeof headers === "object" && !Array.isArray(headers)
+      ? Object.entries(headers).map(([name, value]) => ({ name, value: String(value) }))
+      : [];
+  const restKeys = Object.keys(rest);
+  return { headerRows, userAgent: user_agent || "", rest: restKeys.length ? JSON.stringify(rest, null, 2) : "" };
+}
+
 function showSourceForm(existing, vaults) {
   const slot = document.getElementById("source-form-slot");
   const vaultOptions = vaults.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join("");
+  const { headerRows, userAgent, rest } = splitParserConfig(existing?.parser_config_json);
+
   slot.innerHTML = `
     <form class="form-grid" id="source-form">
       <label class="form-group"><span>Name</span><input class="input-field" name="name" required value="${escapeHtml(existing?.name || "")}"></label>
@@ -491,7 +521,15 @@ function showSourceForm(existing, vaults) {
           <option value="false" ${existing?.is_active === false ? "selected" : ""}>false</option>
         </select>
       </label>
-      <label class="form-group form-group-grow"><span>Parser Config JSON</span><textarea class="input-field" name="parser_config_json">${escapeHtml(existing?.parser_config_json || "")}</textarea></label>
+      <label class="form-group"><span>User-Agent (optional)</span><input class="input-field" name="user_agent" value="${escapeHtml(userAgent)}"></label>
+      <div class="form-group form-group-grow">
+        <label>Custom Headers (e.g. an API key some feeds require)</label>
+        <!-- Rows are built by JS (renderSourceHeaderRows). -->
+        <div id="source-headers-list" class="kv-editor" role="group" aria-label="Custom headers"></div>
+        <button type="button" id="source-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
+        <small class="field-hint">Sent verbatim on every fetch of this source. Rows with an empty name are ignored.</small>
+      </div>
+      <label class="form-group form-group-grow"><span>Parser Config JSON (parser-specific settings only — e.g. <code>array_path</code>/<code>ip_field</code> for JSON_PATH; headers and User-Agent are configured above)</span><textarea class="input-field" name="parser_config_json">${escapeHtml(rest)}</textarea></label>
       <label class="form-group form-group-grow"><span>Target Vaults (select one or more)
         </span><select class="select-field" name="targets" multiple size="4">${vaultOptions}</select>
       </label>
@@ -508,6 +546,46 @@ function showSourceForm(existing, vaults) {
     });
   }
 
+  // Key/value editor for custom headers. State lives in `rows`, not the DOM, so re-rendering after
+  // an add/remove never loses whatever the user had half-typed in another row — matching the
+  // pattern `simply_ip_vault`'s webhook custom-headers editor uses for the same reason.
+  const rows = headerRows.length ? headerRows : [];
+  function renderSourceHeaderRows() {
+    const list = document.getElementById("source-headers-list");
+    if (rows.length === 0) {
+      list.innerHTML = '<p class="kv-empty">No custom headers.</p>';
+      return;
+    }
+    list.innerHTML = rows
+      .map(
+        (row, i) => `
+      <div class="kv-row" data-index="${i}">
+        <input type="text" class="input-field font-mono kv-name" placeholder="Header-Name" value="${escapeHtml(row.name)}" autocomplete="off" aria-label="Header name">
+        <input type="text" class="input-field font-mono kv-value" placeholder="value" value="${escapeHtml(row.value)}" autocomplete="off" aria-label="Header value">
+        <button type="button" class="kv-remove" data-index="${i}" title="Remove this header" aria-label="Remove header">&times;</button>
+      </div>`
+      )
+      .join("");
+    list.querySelectorAll(".kv-row").forEach((rowEl) => {
+      const i = Number(rowEl.dataset.index);
+      rowEl.querySelector(".kv-name").addEventListener("input", (ev) => (rows[i].name = ev.target.value));
+      rowEl.querySelector(".kv-value").addEventListener("input", (ev) => (rows[i].value = ev.target.value));
+    });
+    list.querySelectorAll(".kv-remove").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        rows.splice(Number(btn.dataset.index), 1);
+        renderSourceHeaderRows();
+      });
+    });
+  }
+  document.getElementById("source-headers-add").addEventListener("click", () => {
+    rows.push({ name: "", value: "" });
+    renderSourceHeaderRows();
+    const inputs = document.querySelectorAll("#source-headers-list .kv-name");
+    inputs[inputs.length - 1]?.focus();
+  });
+  renderSourceHeaderRows();
+
   document.getElementById("source-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
   document.getElementById("source-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -515,6 +593,28 @@ function showSourceForm(existing, vaults) {
     const targets = Array.from(e.target.querySelector('select[name="targets"]').selectedOptions).map((o) => ({
       vault_endpoint_id: o.value,
     }));
+
+    // Rows with a blank name are dropped rather than rejected -- an empty row is what "+ Add
+    // Header" produces, and adding one then changing your mind shouldn't block submission. Later
+    // rows win on a duplicate name.
+    const headers = {};
+    for (const { name, value } of rows) {
+      const key = name.trim();
+      if (key) headers[key] = value;
+    }
+    const userAgentValue = fd.get("user_agent")?.trim();
+
+    let restConfig;
+    try {
+      restConfig = fd.get("parser_config_json") ? JSON.parse(fd.get("parser_config_json")) : {};
+    } catch {
+      toast("Parser Config JSON is not valid JSON", "error");
+      return;
+    }
+    const mergedConfig = { ...restConfig };
+    if (Object.keys(headers).length) mergedConfig.headers = headers;
+    if (userAgentValue) mergedConfig.user_agent = userAgentValue;
+
     const payload = {
       name: fd.get("name"),
       source_url: fd.get("source_url"),
@@ -522,7 +622,7 @@ function showSourceForm(existing, vaults) {
       cron_schedule: fd.get("cron_schedule"),
       target_group_name: fd.get("target_group_name"),
       is_active: fd.get("is_active") === "true",
-      parser_config_json: fd.get("parser_config_json") || null,
+      parser_config_json: Object.keys(mergedConfig).length ? JSON.stringify(mergedConfig) : null,
       targets,
     };
     try {
