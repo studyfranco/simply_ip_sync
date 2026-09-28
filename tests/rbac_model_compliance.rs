@@ -14,7 +14,7 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ConnectionTrait, DbErr, Set};
 use serde_json::json;
-use simply_ip_sync::entities::{api_key_sync_permission, external_source};
+use simply_ip_sync::entities::{api_key_sync_permission, destination_group, external_source};
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -29,26 +29,44 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     to_body(bytes)
 }
 
+/// Inserts a `destination_groups` row (the RBAC-bearing, triggerable resource these tests exercise
+/// permissions against) with one child feed pointed at `source_url`, and returns the *group's* id
+/// — permissions, `/trigger`, and ownership all resolve to the group, never to the feed
+/// underneath it. Named `insert_source` for continuity with every call site below; what changed is
+/// which table backs "the external-ingestion resource under test", not the tests' own intent.
 async fn insert_source(conn: &sea_orm::DatabaseConnection, source_url: &str, owner_key_id: Uuid) -> Uuid {
-    let id = Uuid::new_v4();
+    let group_id = Uuid::new_v4();
     let now = Utc::now();
-    let model = external_source::ActiveModel {
-        id: Set(id),
-        name: Set(format!("source-{id}")),
-        source_url: Set(source_url.to_owned()),
-        parser_type: Set("REGEX_LINE".to_owned()),
-        parser_config_json: Set(None),
-        cron_schedule: Set("0 0 * * *".to_owned()),
+    let group = destination_group::ActiveModel {
+        id: Set(group_id),
+        name: Set(format!("group-{group_id}")),
         target_group_name: Set("group".to_owned()),
+        cron_schedule: Set("0 0 * * *".to_owned()),
         mode: Set("upsert".to_owned()),
         is_active: Set(true),
+        skip_bogon_filtering: Set(false),
         last_run_at: Set(None),
         owner_key_id: Set(Some(owner_key_id)),
         created_at: Set(now),
         updated_at: Set(now),
     };
-    model.insert(conn).await.expect("insert source");
-    id
+    group.insert(conn).await.expect("insert destination group");
+
+    let feed = external_source::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        destination_group_id: Set(group_id),
+        name: Set(format!("feed-{group_id}")),
+        source_url: Set(source_url.to_owned()),
+        parser_type: Set("REGEX_LINE".to_owned()),
+        parser_config_json: Set(None),
+        max_age_days: Set(None),
+        skip_bogon_filtering: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    feed.insert(conn).await.expect("insert feed");
+
+    group_id
 }
 
 async fn grant_permission(
@@ -62,7 +80,7 @@ async fn grant_permission(
     api_key_sync_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(api_key_id),
-        resource_type: Set("external_source".to_owned()),
+        resource_type: Set("destination_group".to_owned()),
         resource_id: Set(resource_id),
         can_sync: Set(can_sync),
         can_manage: Set(can_manage),
@@ -91,7 +109,7 @@ async fn r1_cannot_grant_can_sync_without_holding_it_yourself() {
     grant_permission(&conn, granter.id, source_id, false, true, false).await;
 
     let app = simply_ip_sync::create_app(state);
-    let payload = json!({ "resource_type": "external_source", "resource_id": source_id, "can_sync": true });
+    let payload = json!({ "resource_type": "destination_group", "resource_id": source_id, "can_sync": true });
     let req = common::signed_request(&granter, "PUT", &format!("/api/keys/{}/permissions", grantee.id), Some(payload));
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "R1: cannot grant can_sync without holding it yourself on the resource");
@@ -111,7 +129,7 @@ async fn r2_manage_requires_both_the_global_flag_and_the_per_resource_row() {
     // Half A: global can_manage_keys=true, but no permission row on the resource at all.
     let global_only = common::insert_key(&conn, "GlobalOnly", false, true, false, false, Some(master.id)).await;
     let app = simply_ip_sync::create_app(state.clone());
-    let payload = json!({ "resource_type": "external_source", "resource_id": source_id, "can_view_logs": true });
+    let payload = json!({ "resource_type": "destination_group", "resource_id": source_id, "can_view_logs": true });
     let req = common::signed_request(&global_only, "PUT", &format!("/api/keys/{}/permissions", grantee.id), Some(payload.clone()));
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "R2: can_manage_keys alone, with no per-resource can_manage row, must not suffice");
@@ -178,7 +196,7 @@ async fn r5_manage_may_propagate_sideways_between_parents() {
     grant_permission(&conn, parent_a.id, source_id, false, true, false).await;
 
     let app = simply_ip_sync::create_app(state);
-    let payload = json!({ "resource_type": "external_source", "resource_id": source_id, "can_manage": true });
+    let payload = json!({ "resource_type": "destination_group", "resource_id": source_id, "can_manage": true });
     let req = common::signed_request(&parent_a, "PUT", &format!("/api/keys/{}/permissions", parent_b.id), Some(payload));
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK, "R5: manage rights may propagate sideways between two Parent-tier keys");
@@ -199,7 +217,7 @@ async fn r6_revocation_requires_only_manage_not_the_verb_itself() {
     api_key_sync_permission::ActiveModel {
         id: Set(grantee_permission_id),
         api_key_id: Set(grantee.id),
-        resource_type: Set("external_source".to_owned()),
+        resource_type: Set("destination_group".to_owned()),
         resource_id: Set(source_id),
         can_sync: Set(true),
         can_manage: Set(false),
@@ -235,7 +253,7 @@ async fn r7_granting_succeeds_only_when_r1_and_r2_both_hold() {
     grant_permission(&conn, granter.id, source_id, true, true, false).await;
 
     let app = simply_ip_sync::create_app(state);
-    let payload = json!({ "resource_type": "external_source", "resource_id": source_id, "can_sync": true });
+    let payload = json!({ "resource_type": "destination_group", "resource_id": source_id, "can_sync": true });
     let req = common::signed_request(&granter, "PUT", &format!("/api/keys/{}/permissions", grantee.id), Some(payload));
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK, "R7: granting succeeds once both R1 and R2 hold simultaneously");
@@ -260,11 +278,11 @@ async fn s3_resource_lifecycle_delete_requires_owner_or_master() {
     grant_permission(&conn, other_parent.id, source_id, true, true, true).await;
 
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&other_parent, "DELETE", &format!("/api/sources/{source_id}"), None);
+    let req = common::signed_request(&other_parent, "DELETE", &format!("/api/destination-groups/{source_id}"), None);
     let resp = app.clone().oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "§3: manage rights alone do not confer lifecycle authority");
 
-    let req_owner = common::signed_request(&owner, "DELETE", &format!("/api/sources/{source_id}"), None);
+    let req_owner = common::signed_request(&owner, "DELETE", &format!("/api/destination-groups/{source_id}"), None);
     let resp_owner = app.oneshot(req_owner).await.expect("response");
     assert_eq!(resp_owner.status(), StatusCode::NO_CONTENT, "the owner may always delete their own resource");
 }
@@ -414,7 +432,7 @@ async fn s7_mandatory_indexes_exist() {
         ("api_keys", "idx-api_keys-parent_key_id"),
         ("api_keys", "idx-api_keys-prefix"),
         ("vault_endpoints", "idx-vault_endpoints-owner_key_id"),
-        ("external_sources", "idx-external_sources-owner_key_id"),
+        ("destination_groups", "idx-destination_groups-owner_key_id"),
         ("vault_sync_tasks", "idx-vault_sync_tasks-owner_key_id"),
         ("api_key_sync_permissions", "idx-api_key_sync_permissions-unique"),
         ("sync_logs", "idx-sync_logs-job_type_job_id"),
@@ -463,7 +481,7 @@ async fn trigger_without_can_sync_is_forbidden() {
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
 
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&daughter, "POST", &format!("/api/sources/{source_id}/trigger"), None);
+    let req = common::signed_request(&daughter, "POST", &format!("/api/destination-groups/{source_id}/trigger"), None);
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
@@ -476,18 +494,20 @@ async fn trigger_with_granted_can_sync_succeeds() {
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/feed.txt"))
-        // A genuinely non-empty body: a comment-only feed would parse to zero entries and report
-        // PARTIAL (see jobs::external_ingestion's zero-items handling), which would make this
-        // test's final assertion ambiguous between "the RBAC gate worked" (what it actually
-        // checks) and "the trigger reported SUCCESS" (a fact about feed content, not permissions).
-        .respond_with(ResponseTemplate::new(200).set_body_string("# comment\n203.0.113.5\n"))
+        // A genuinely non-empty body of a real, non-bogon address: a comment-only feed would parse
+        // to zero entries and report PARTIAL (see jobs::external_ingestion's zero-items handling),
+        // and a documentation-range address like 203.0.113.0/24 (TEST-NET-3) would be stripped by
+        // the default bogon filter for the same reason -- either would make this test's final
+        // assertion ambiguous between "the RBAC gate worked" (what it actually checks) and "the
+        // trigger reported SUCCESS" (a fact about feed content, not permissions).
+        .respond_with(ResponseTemplate::new(200).set_body_string("# comment\n8.8.8.8\n"))
         .mount(&feed_mock)
         .await;
     let source_id = insert_source(&conn, &format!("{}/feed.txt", feed_mock.uri()), master.id).await;
     grant_permission(&conn, daughter.id, source_id, true, false, true).await;
 
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&daughter, "POST", &format!("/api/sources/{source_id}/trigger"), None);
+    let req = common::signed_request(&daughter, "POST", &format!("/api/destination-groups/{source_id}/trigger"), None);
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
@@ -517,7 +537,7 @@ fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestam
 
 /// Two genuinely concurrent `DELETE` requests for the same resource, fired via `tokio::join!`
 /// against the same shared-state router rather than sequentially — proves the
-/// find-then-delete sequence in `delete_external_source` doesn't let both requests observe the row
+/// find-then-delete sequence in `delete_destination_group` doesn't let both requests observe the row
 /// as present and both report success. `simply_ip_sync`'s SQLite pool is pinned to a single
 /// connection (`db::SQLITE_MAX_CONNECTIONS`), which serializes the two requests' actual queries
 /// regardless — this test proves the *outcome* end to end (exactly one `204`, exactly one `404`)
@@ -531,7 +551,7 @@ async fn concurrent_deletes_of_the_same_resource_do_not_both_succeed() {
     let now = Utc::now().timestamp();
     // Distinct timestamps (not distinct in any way that matters to the property under test — see
     // this helper's doc comment) so both requests carry distinct, individually-valid signatures.
-    let target = format!("/api/sources/{source_id}");
+    let target = format!("/api/destination-groups/{source_id}");
     let req_a = signed_request_at(&master, "DELETE", &target, now);
     let req_b = signed_request_at(&master, "DELETE", &target, now + 1);
 

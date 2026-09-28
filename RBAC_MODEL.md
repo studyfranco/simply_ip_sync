@@ -10,8 +10,8 @@ governance rules, same §3–§7 guarantees), restated here with this service's 
 
 | Generic term | `simply_ip_sync` |
 | :--- | :--- |
-| **Managed resource** (shared, permission rows) | External Source, Inter-Vault Sync Task, Vault Endpoint |
-| **Resource-creation rights** | `can_manage_sources` (External Source), `can_manage_vaults` (Vault Endpoint **and** Sync Task) |
+| **Managed resource** (shared, permission rows) | Destination Group, Inter-Vault Sync Task, Vault Endpoint |
+| **Resource-creation rights** | `can_manage_sources` (Destination Group), `can_manage_vaults` (Vault Endpoint **and** Sync Task) |
 | **Per-resource permission table** | `api_key_sync_permissions` |
 | **Operational verb** | `can_sync` — permission to invoke a resource's `/trigger` endpoint |
 | **Per-resource management verb** | `can_manage` — the R2 conjunction's per-resource half |
@@ -24,8 +24,15 @@ sync tasks. A sync task is fundamentally a vault-to-vault topology object (`sour
 `vault_sync_task_targets`, both foreign keys into `vault_endpoints`), so it is gated by the same
 right that gates registering the vault endpoints it connects.
 
+**Feeds carry no RBAC of their own.** A Destination Group's 1-to-N child feeds (`external_sources`
+rows) have no `owner_key_id` and no `api_key_sync_permissions` rows naming them directly — every
+feed-management guard resolves to its *owning group's* permission row (`RESOURCE_DESTINATION_GROUP
+= "destination_group"`), since a group's feeds are always scheduled, fetched, and pushed together
+as one execution. Managing a feed is exactly "managing the group's configuration" (R2), not a
+separate authorization surface.
+
 There is no separate "creator-private entity" category in this service — every managed resource
-(`external_sources`, `vault_sync_tasks`, `vault_endpoints`) carries `owner_key_id` directly and is
+(`destination_groups`, `vault_sync_tasks`, `vault_endpoints`) carries `owner_key_id` directly and is
 governed uniformly by §3 below.
 
 ---
@@ -71,7 +78,8 @@ endpoint are separate powers.
 
 ## 3. Resource Lifecycle & Ownership
 
-- Every `external_sources`, `vault_sync_tasks`, and `vault_endpoints` row carries `owner_key_id`.
+- Every `destination_groups`, `vault_sync_tasks`, and `vault_endpoints` row carries `owner_key_id`
+  (individual feeds — `external_sources` rows — do not; see the Terminology section above).
 - Resource lifecycle actions — deleting or renaming the entity itself — are restricted exclusively
   to Master and the designated `owner_key_id`. Holding `can_manage` (R2) confers no lifecycle
   authority: a parent that merely manages a resource's configuration must not be able to delete it.
@@ -84,7 +92,7 @@ endpoint are separate powers.
 
 - **Master:** full visibility over all keys, resources, and configuration.
 - **Own subtree:** a parent sees itself and its direct daughter keys.
-- **Shared resources:** a key sees a resource (in `GET /api/sources`, `/api/vaults`,
+- **Shared resources:** a key sees a resource (in `GET /api/destination-groups`, `/api/vaults`,
   `/api/sync-tasks`) if it is Master, the resource's owner, or holds any permission row on it.
 - **Oracle discipline.** A resource outside the caller's visibility scope returns `404`, identical
   to a genuinely nonexistent id.
@@ -118,8 +126,10 @@ endpoint are separate powers.
 - Deleting a key cascades recursively through its entire daughter subtree
   (`api/keys.rs::collect_subtree`).
 - **Data is never destroyed implicitly.** Before any key deletion, the service walks the full
-  subtree being deleted and collects every `vault_endpoint`/`external_source`/`vault_sync_task`
-  owned by any key in it (`api/keys.rs::owned_resource_inventory`).
+  subtree being deleted and collects every `vault_endpoint`/`destination_group`/`vault_sync_task`
+  owned by any key in it (`api/keys.rs::owned_resource_inventory`) — a destination group's own
+  cascade delete (§5) already takes its child feeds with it, so listing feeds separately here would
+  double-count the same underlying loss.
 - If that inventory is non-empty, deletion is refused with a `409` carrying the structured
   inventory (type/id/name/owner). The caller must reassign or delete each listed resource first,
   then resubmit the deletion.

@@ -1,7 +1,7 @@
 //! Request-body validation that must reject before touching the database: malformed
-//! `cron_schedule` strings on `POST /api/sources` and `POST /api/sync-tasks`.
+//! `cron_schedule` strings on `POST /api/destination-groups` and `POST /api/sync-tasks`.
 //!
-//! A source or task that can never be scheduled is not a degraded source or task — it is silent
+//! A group or task that can never be scheduled is not a degraded group or task — it is silent
 //! data corruption that surfaces only when nobody notices a cron tick that never fires. These
 //! tests assert the `400` happens *and* that nothing was persisted, so a future change that moves
 //! the validation after the insert (rejecting the HTTP response but leaving the row behind) would
@@ -12,7 +12,7 @@ mod common;
 use axum::http::StatusCode;
 use sea_orm::EntityTrait;
 use serde_json::json;
-use simply_ip_sync::entities::{external_source, vault_sync_task};
+use simply_ip_sync::entities::{destination_group, vault_sync_task};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -40,18 +40,17 @@ async fn insert_vault_for_task(conn: &sea_orm::DatabaseConnection) -> Uuid {
 }
 
 #[tokio::test]
-async fn invalid_cron_on_source_creation_is_rejected_with_400_and_not_persisted() {
+async fn invalid_cron_on_destination_group_creation_is_rejected_with_400_and_not_persisted() {
     let (conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
 
     for bad_cron in ["invalid_cron", "* * *", "", "99 99 99 * *"] {
         let payload = json!({
-            "name": format!("source-{bad_cron}-{}", Uuid::new_v4()),
-            "source_url": "http://127.0.0.1:1/feed.txt",
+            "name": format!("group-{bad_cron}-{}", Uuid::new_v4()),
             "cron_schedule": bad_cron,
             "target_group_name": "group",
         });
-        let req = common::signed_request(&master, "POST", "/api/sources", Some(payload));
+        let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
         let resp = app.clone().oneshot(req).await.expect("response");
         assert_eq!(
             resp.status(),
@@ -60,23 +59,22 @@ async fn invalid_cron_on_source_creation_is_rejected_with_400_and_not_persisted(
         );
     }
 
-    let count = external_source::Entity::find().all(&conn).await.expect("query sources").len();
-    assert_eq!(count, 0, "no source may be persisted when cron validation rejects the request");
+    let count = destination_group::Entity::find().all(&conn).await.expect("query groups").len();
+    assert_eq!(count, 0, "no destination group may be persisted when cron validation rejects the request");
 }
 
 #[tokio::test]
-async fn valid_cron_on_source_creation_is_accepted() {
+async fn valid_cron_on_destination_group_creation_is_accepted() {
     let (_conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
 
     for good_cron in ["0 0 * * *", "*/15 * * * *", "0 */5 * * * *"] {
         let payload = json!({
-            "name": format!("source-{}", Uuid::new_v4()),
-            "source_url": "http://127.0.0.1:1/feed.txt",
+            "name": format!("group-{}", Uuid::new_v4()),
             "cron_schedule": good_cron,
             "target_group_name": "group",
         });
-        let req = common::signed_request(&master, "POST", "/api/sources", Some(payload));
+        let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
         let resp = app.clone().oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK, "cron_schedule '{good_cron}' should be accepted");
     }
@@ -110,17 +108,16 @@ async fn invalid_cron_on_sync_task_creation_is_rejected_with_400_and_not_persist
 }
 
 #[tokio::test]
-async fn invalid_cron_on_source_update_is_rejected_without_mutating_existing_row() {
+async fn invalid_cron_on_destination_group_update_is_rejected_without_mutating_existing_row() {
     let (conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
 
     let create_payload = json!({
-        "name": "existing-source",
-        "source_url": "http://127.0.0.1:1/feed.txt",
+        "name": "existing-group",
         "cron_schedule": "0 0 * * *",
         "target_group_name": "group",
     });
-    let create_req = common::signed_request(&master, "POST", "/api/sources", Some(create_payload));
+    let create_req = common::signed_request(&master, "POST", "/api/destination-groups", Some(create_payload));
     let create_resp = app.clone().oneshot(create_req).await.expect("response");
     assert_eq!(create_resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(create_resp.into_body(), usize::MAX).await.expect("body");
@@ -128,11 +125,11 @@ async fn invalid_cron_on_source_update_is_rejected_without_mutating_existing_row
     let id = created["id"].as_str().expect("id field");
 
     let update_payload = json!({ "cron_schedule": "not a cron" });
-    let update_req = common::signed_request(&master, "PATCH", &format!("/api/sources/{id}"), Some(update_payload));
+    let update_req = common::signed_request(&master, "PATCH", &format!("/api/destination-groups/{id}"), Some(update_payload));
     let update_resp = app.oneshot(update_req).await.expect("response");
     assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
 
-    let stored = external_source::Entity::find_by_id(Uuid::parse_str(id).unwrap())
+    let stored = destination_group::Entity::find_by_id(Uuid::parse_str(id).unwrap())
         .one(&conn)
         .await
         .expect("query")
@@ -141,46 +138,44 @@ async fn invalid_cron_on_source_update_is_rejected_without_mutating_existing_row
 }
 
 /// `mode` must be one of the two values `client::BatchMode::parse` recognizes — a typo here would
-/// otherwise silently fall back to upsert deep inside the job (see `external_ingestion::run`'s
+/// otherwise silently fall back to upsert deep inside the job (see `external_ingestion::execute`'s
 /// `BatchMode::parse(...).unwrap_or_else(...)` warning path) instead of being caught at the door.
 #[tokio::test]
-async fn invalid_mode_on_source_creation_is_rejected_with_400_and_not_persisted() {
+async fn invalid_mode_on_destination_group_creation_is_rejected_with_400_and_not_persisted() {
     let (conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
 
     for bad_mode in ["replace", "FULL_REPLACE", "upsert ", ""] {
         let payload = json!({
-            "name": format!("source-{}", Uuid::new_v4()),
-            "source_url": "http://127.0.0.1:1/feed.txt",
+            "name": format!("group-{}", Uuid::new_v4()),
             "cron_schedule": "0 0 * * *",
             "target_group_name": "group",
             "mode": bad_mode,
         });
-        let req = common::signed_request(&master, "POST", "/api/sources", Some(payload));
+        let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
         let resp = app.clone().oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "mode '{bad_mode}' must be rejected with 400");
     }
 
-    let count = external_source::Entity::find().all(&conn).await.expect("query sources").len();
-    assert_eq!(count, 0, "no source may be persisted when mode validation rejects the request");
+    let count = destination_group::Entity::find().all(&conn).await.expect("query groups").len();
+    assert_eq!(count, 0, "no destination group may be persisted when mode validation rejects the request");
 }
 
 /// Both recognized `mode` values must be accepted, and a request that omits `mode` entirely must
 /// default to `"upsert"` rather than requiring every caller to specify it.
 #[tokio::test]
-async fn valid_mode_on_source_creation_is_accepted_and_omission_defaults_to_upsert() {
+async fn valid_mode_on_destination_group_creation_is_accepted_and_omission_defaults_to_upsert() {
     let (_conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
 
     for good_mode in ["upsert", "full_replace"] {
         let payload = json!({
-            "name": format!("source-{}", Uuid::new_v4()),
-            "source_url": "http://127.0.0.1:1/feed.txt",
+            "name": format!("group-{}", Uuid::new_v4()),
             "cron_schedule": "0 0 * * *",
             "target_group_name": "group",
             "mode": good_mode,
         });
-        let req = common::signed_request(&master, "POST", "/api/sources", Some(payload));
+        let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
         let resp = app.clone().oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK, "mode '{good_mode}' should be accepted");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
@@ -189,12 +184,11 @@ async fn valid_mode_on_source_creation_is_accepted_and_omission_defaults_to_upse
     }
 
     let payload = json!({
-        "name": format!("source-{}", Uuid::new_v4()),
-        "source_url": "http://127.0.0.1:1/feed.txt",
+        "name": format!("group-{}", Uuid::new_v4()),
         "cron_schedule": "0 0 * * *",
         "target_group_name": "group",
     });
-    let req = common::signed_request(&master, "POST", "/api/sources", Some(payload));
+    let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
     let resp = app.clone().oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
@@ -203,20 +197,19 @@ async fn valid_mode_on_source_creation_is_accepted_and_omission_defaults_to_upse
 }
 
 /// An update that tries to set an invalid `mode` must be rejected without mutating the existing
-/// row — mirrors `invalid_cron_on_source_update_is_rejected_without_mutating_existing_row` above.
+/// row — mirrors `invalid_cron_on_destination_group_update_is_rejected_without_mutating_existing_row` above.
 #[tokio::test]
-async fn invalid_mode_on_source_update_is_rejected_without_mutating_existing_row() {
+async fn invalid_mode_on_destination_group_update_is_rejected_without_mutating_existing_row() {
     let (conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
 
     let create_payload = json!({
-        "name": "existing-source-mode",
-        "source_url": "http://127.0.0.1:1/feed.txt",
+        "name": "existing-group-mode",
         "cron_schedule": "0 0 * * *",
         "target_group_name": "group",
         "mode": "upsert",
     });
-    let create_req = common::signed_request(&master, "POST", "/api/sources", Some(create_payload));
+    let create_req = common::signed_request(&master, "POST", "/api/destination-groups", Some(create_payload));
     let create_resp = app.clone().oneshot(create_req).await.expect("response");
     assert_eq!(create_resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(create_resp.into_body(), usize::MAX).await.expect("body");
@@ -224,11 +217,11 @@ async fn invalid_mode_on_source_update_is_rejected_without_mutating_existing_row
     let id = created["id"].as_str().expect("id field");
 
     let update_payload = json!({ "mode": "not_a_real_mode" });
-    let update_req = common::signed_request(&master, "PATCH", &format!("/api/sources/{id}"), Some(update_payload));
+    let update_req = common::signed_request(&master, "PATCH", &format!("/api/destination-groups/{id}"), Some(update_payload));
     let update_resp = app.oneshot(update_req).await.expect("response");
     assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
 
-    let stored = external_source::Entity::find_by_id(Uuid::parse_str(id).unwrap())
+    let stored = destination_group::Entity::find_by_id(Uuid::parse_str(id).unwrap())
         .one(&conn)
         .await
         .expect("query")
@@ -261,7 +254,7 @@ async fn oversized_inbound_body_is_rejected_cleanly_before_signature_verificatio
     // and mask the property this test actually wants to exercise.
     let mut req = axum::http::Request::builder()
         .method("POST")
-        .uri("/api/sources")
+        .uri("/api/destination-groups")
         .header("X-API-Key", master.plaintext_key.clone())
         .header("X-Timestamp", chrono::Utc::now().timestamp().to_string())
         .header("X-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
@@ -298,7 +291,7 @@ async fn a_declared_content_length_over_the_limit_is_rejected_without_reading_th
     let declared_len = simply_ip_sync::config::DEFAULT_MAX_BODY_MIB * 1024 * 1024 + 1024;
     let mut req = axum::http::Request::builder()
         .method("POST")
-        .uri("/api/sources")
+        .uri("/api/destination-groups")
         .header("X-API-Key", master.plaintext_key.clone())
         .header("X-Timestamp", chrono::Utc::now().timestamp().to_string())
         .header("X-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
@@ -327,13 +320,18 @@ async fn malformed_json_body_with_a_valid_signature_returns_the_standard_error_e
 
     let malformed_body = br#"{"name": "x", invalid}"#;
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let signature =
-        simply_ip_sync::crypto::compute_signature(&master.signing_secret, "POST", "/api/sources", &timestamp, malformed_body)
-            .expect("sign");
+    let signature = simply_ip_sync::crypto::compute_signature(
+        &master.signing_secret,
+        "POST",
+        "/api/destination-groups",
+        &timestamp,
+        malformed_body,
+    )
+    .expect("sign");
 
     let mut req = axum::http::Request::builder()
         .method("POST")
-        .uri("/api/sources")
+        .uri("/api/destination-groups")
         .header("X-API-Key", master.plaintext_key.clone())
         .header("X-Timestamp", timestamp)
         .header("X-Signature-256", signature)

@@ -6,8 +6,9 @@
 pub mod api_key;
 pub mod api_key_sync_permission;
 pub mod audit_log;
+pub mod destination_group;
+pub mod destination_group_vault_target;
 pub mod external_source;
-pub mod external_source_vault_target;
 pub mod prelude;
 pub mod sync_log;
 pub mod vault_endpoint;

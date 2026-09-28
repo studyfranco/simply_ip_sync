@@ -477,14 +477,14 @@ check "401" "a malformed (non-numeric) X-Timestamp is rejected, not a 500"
 log_section "4. Cron expression validation"
 
 for bad_cron in "invalid_cron" "* * *" "99 99 99 * *"; do
-    api_call POST "/api/sources" "$MASTER_KEY" \
-        "{\"name\":\"bad-cron-source-$RANDOM\",\"source_url\":\"http://127.0.0.1:1/feed.txt\",\"cron_schedule\":\"$bad_cron\",\"target_group_name\":\"g\"}"
-    check "400" "POST /api/sources with cron_schedule '$bad_cron' is rejected with 400"
+    api_call POST "/api/destination-groups" "$MASTER_KEY" \
+        "{\"name\":\"bad-cron-group-$RANDOM\",\"cron_schedule\":\"$bad_cron\",\"target_group_name\":\"g\"}"
+    check "400" "POST /api/destination-groups with cron_schedule '$bad_cron' is rejected with 400"
 done
 
-api_call GET "/api/sources" "$MASTER_KEY"
-check "200" "listing sources still works after the rejected attempts"
-check_jq "length" "0" "none of the invalid-cron sources were persisted"
+api_call GET "/api/destination-groups" "$MASTER_KEY"
+check "200" "listing destination groups still works after the rejected attempts"
+check_jq "length" "0" "none of the invalid-cron destination groups were persisted"
 
 # A vault endpoint is needed as source_vault_id before sync-task cron validation can be checked in
 # isolation from a foreign-key failure.
@@ -502,11 +502,11 @@ done
 api_call GET "/api/sync-tasks" "$MASTER_KEY"
 check_jq "length" "0" "none of the invalid-cron sync tasks were persisted"
 
-api_call POST "/api/sources" "$MASTER_KEY" \
-    '{"name":"valid-cron-source","source_url":"http://127.0.0.1:1/feed.txt","cron_schedule":"0 0 * * *","target_group_name":"g"}'
+api_call POST "/api/destination-groups" "$MASTER_KEY" \
+    '{"name":"valid-cron-group","cron_schedule":"0 0 * * *","target_group_name":"g"}'
 check "200" "a syntactically valid 5-field cron_schedule is accepted"
-api_call DELETE "/api/sources/$(echo "$RESP_BODY" | jq -r '.id')" "$MASTER_KEY"
-check "204" "clean up the valid-cron scratch source"
+api_call DELETE "/api/destination-groups/$(echo "$RESP_BODY" | jq -r '.id')" "$MASTER_KEY"
+check "204" "clean up the valid-cron scratch group"
 
 # ── 5. Multi-vault sync: mock ip_vault servers ──────────────────────────────
 log_section "5. Multi-vault sync — mock ip_vault servers"
@@ -726,8 +726,11 @@ if [[ "$MULTI_VAULT_AVAILABLE" -eq 1 ]]; then
     check "200" "register mock target vault 2"
     TARGET2_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
+    # skip_bogon_filtering:true -- the mock source's fixture delta uses TEST-NET-2 (198.51.100.0/24)
+    # addresses (RFC 5737 documentation range), which the new pre-push bogon sanitizer would
+    # otherwise strip entirely; this section is testing multi-vault fan-out, not bogon filtering.
     api_call POST "/api/sync-tasks" "$MASTER_KEY" \
-        "{\"name\":\"multi-vault-e2e-task\",\"source_vault_id\":\"$SOURCE_VAULT_ID\",\"source_group_name\":\"src-group\",\"target_group_name\":\"dst-group\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$TARGET1_VAULT_ID\"},{\"vault_endpoint_id\":\"$TARGET2_VAULT_ID\"}]}"
+        "{\"name\":\"multi-vault-e2e-task\",\"source_vault_id\":\"$SOURCE_VAULT_ID\",\"source_group_name\":\"src-group\",\"target_group_name\":\"dst-group\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"skip_bogon_filtering\":true,\"targets\":[{\"vault_endpoint_id\":\"$TARGET1_VAULT_ID\"},{\"vault_endpoint_id\":\"$TARGET2_VAULT_ID\"}]}"
     check "200" "create a sync task fanning out to both target vaults"
     SYNC_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
     check_jq ".targets | length" "2" "the created task carries both configured targets"
@@ -792,8 +795,9 @@ if [[ "$MULTI_VAULT_AVAILABLE" -eq 1 ]]; then
 
     log_section "7a. Target group name override"
 
+    # skip_bogon_filtering:true -- same TEST-NET-2 fixture data as the multi-vault task above.
     api_call POST "/api/sync-tasks" "$MASTER_KEY" \
-        "{\"name\":\"override-e2e-task\",\"source_vault_id\":\"$SOURCE_VAULT_ID\",\"source_group_name\":\"src-group\",\"target_group_name\":\"DEFAULT_E2E_GROUP\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$TARGET1_VAULT_ID\",\"target_group_name\":\"OVERRIDDEN_E2E_GROUP\"}]}"
+        "{\"name\":\"override-e2e-task\",\"source_vault_id\":\"$SOURCE_VAULT_ID\",\"source_group_name\":\"src-group\",\"target_group_name\":\"DEFAULT_E2E_GROUP\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"skip_bogon_filtering\":true,\"targets\":[{\"vault_endpoint_id\":\"$TARGET1_VAULT_ID\",\"target_group_name\":\"OVERRIDDEN_E2E_GROUP\"}]}"
     check "200" "create a sync task with a per-target group_name override"
     OVERRIDE_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
     check_jq ".targets[0].target_group_name" "OVERRIDDEN_E2E_GROUP" "the created task reports the override back"
@@ -912,8 +916,11 @@ PYEOF
     check "200" "register the resilience target vault (reused across 7e/7f/7g/7h)"
     RESILIENCE_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
+    # skip_bogon_filtering:true -- the synthetic pagination delta uses 10.0.0.0/8 (RFC 1918
+    # private) addresses, which the bogon sanitizer would otherwise strip; this section is testing
+    # pagination/chunking counts, not bogon filtering.
     api_call POST "/api/sync-tasks" "$MASTER_KEY" \
-        "{\"name\":\"pagination-e2e-task\",\"source_vault_id\":\"$PAGINATION_SOURCE_VAULT_ID\",\"source_group_name\":\"pagination-group\",\"target_group_name\":\"pagination-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
+        "{\"name\":\"pagination-e2e-task\",\"source_vault_id\":\"$PAGINATION_SOURCE_VAULT_ID\",\"source_group_name\":\"pagination-group\",\"target_group_name\":\"pagination-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"skip_bogon_filtering\":true,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
     check "200" "create a sync task pulling the $PAGINATION_TOTAL-record delta"
     PAGINATION_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
@@ -932,8 +939,9 @@ PYEOF
 
     log_section "7f. Outbound retry & exponential backoff (Task 2)"
 
+    # skip_bogon_filtering:true -- same TEST-NET-2 fixture data as the multi-vault task above.
     api_call POST "/api/sync-tasks" "$MASTER_KEY" \
-        "{\"name\":\"retry-e2e-task\",\"source_vault_id\":\"$SOURCE_VAULT_ID\",\"source_group_name\":\"src-group\",\"target_group_name\":\"retry-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
+        "{\"name\":\"retry-e2e-task\",\"source_vault_id\":\"$SOURCE_VAULT_ID\",\"source_group_name\":\"src-group\",\"target_group_name\":\"retry-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"skip_bogon_filtering\":true,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
     check "200" "create a sync task targeting the resilience mock"
     RETRY_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
@@ -1005,18 +1013,25 @@ PYEOF
     check_jq ".truncated" "true" "a $FULL_REPLACE_TOTAL-record feed exceeds the sample cap"
     check_jq ".sample | length" "50" "the sample itself is capped, unlike total_extracted"
 
-    api_call GET "/api/sources" "$MASTER_KEY"
-    check_jq "[.[] | select(.name == \"full-replace-e2e-source\")] | length" "0" \
-        "test-fetch persisted nothing -- the real source below does not exist yet"
+    api_call GET "/api/destination-groups" "$MASTER_KEY"
+    check_jq "[.[] | select(.name == \"full-replace-e2e-group\")] | length" "0" \
+        "test-fetch persisted nothing -- the real destination group below does not exist yet"
 
-    api_call POST "/api/sources" "$MASTER_KEY" \
-        "{\"name\":\"full-replace-e2e-source\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"full-replace-dst\",\"mode\":\"full_replace\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
-    check "200" "create a full_replace external source ($FULL_REPLACE_TOTAL records => 3 chunks of 5000/5000/2000)"
-    FULL_REPLACE_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
-    check_jq ".mode" "full_replace" "the created source reports mode=full_replace"
+    # skip_bogon_filtering:true -- the synthetic feed fixture uses 10.0.0.0/8 (RFC 1918 private)
+    # addresses, which the bogon sanitizer would otherwise strip; this section is testing
+    # full_replace multi-chunk delivery, not bogon filtering.
+    api_call POST "/api/destination-groups" "$MASTER_KEY" \
+        "{\"name\":\"full-replace-e2e-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"full-replace-dst\",\"mode\":\"full_replace\",\"is_active\":false,\"skip_bogon_filtering\":true,\"targets\":[{\"vault_endpoint_id\":\"$RESILIENCE_VAULT_ID\"}]}"
+    check "200" "create a full_replace destination group ($FULL_REPLACE_TOTAL records => 3 chunks of 5000/5000/2000)"
+    FULL_REPLACE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    check_jq ".mode" "full_replace" "the created group reports mode=full_replace"
+
+    api_call POST "/api/destination-groups/$FULL_REPLACE_GROUP_ID/feeds" "$MASTER_KEY" \
+        "{\"name\":\"full-replace-e2e-feed\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\"}"
+    check "200" "add a feed pointed at the synthetic feed fixture to the full_replace group"
 
     RESILIENCE_HITS_BEFORE=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
-    api_call POST "/api/sources/$FULL_REPLACE_SOURCE_ID/trigger" "$MASTER_KEY"
+    api_call POST "/api/destination-groups/$FULL_REPLACE_GROUP_ID/trigger" "$MASTER_KEY"
     check "200" "trigger the full_replace ingestion"
     check_jq ".status" "SUCCESS" "the full_replace multi-chunk ingestion succeeds"
     check_jq ".items_processed" "$FULL_REPLACE_TOTAL" "all $FULL_REPLACE_TOTAL records were parsed and pushed"
@@ -1033,8 +1048,8 @@ PYEOF
     CHUNK_TOTAL=$(tail -n 3 "$RESILIENCE_LOG" | jq -s '[.[] | .body | fromjson | .records | length] | add')
     check_local "$CHUNK_TOTAL" "$FULL_REPLACE_TOTAL" "the 3 chunks together carry all $FULL_REPLACE_TOTAL records — none lost mid-stream"
 
-    api_call DELETE "/api/sources/$FULL_REPLACE_SOURCE_ID" "$MASTER_KEY"
-    check "204" "clean up the full_replace source"
+    api_call DELETE "/api/destination-groups/$FULL_REPLACE_GROUP_ID" "$MASTER_KEY"
+    check "204" "clean up the full_replace group (cascades to its feed)"
 
     log_section "7i. Zip bomb / oversized decompressed archive rejection (Task 1)"
 
@@ -1060,12 +1075,16 @@ PYEOF
     check "200" "register a target vault for the zip-bomb source"
     ZIPBOMB_TARGET_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/sources" "$MASTER_KEY" \
-        "{\"name\":\"zipbomb-e2e-source\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"zipbomb-dst\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$ZIPBOMB_TARGET_VAULT_ID\"}]}"
-    check "200" "register a source pointed at the oversized zip fixture"
-    ZIPBOMB_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    api_call POST "/api/destination-groups" "$MASTER_KEY" \
+        "{\"name\":\"zipbomb-e2e-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"zipbomb-dst\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$ZIPBOMB_TARGET_VAULT_ID\"}]}"
+    check "200" "create a destination group for the oversized zip fixture"
+    ZIPBOMB_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/sources/$ZIPBOMB_SOURCE_ID/trigger" "$MASTER_KEY"
+    api_call POST "/api/destination-groups/$ZIPBOMB_GROUP_ID/feeds" "$MASTER_KEY" \
+        "{\"name\":\"zipbomb-e2e-feed\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\"}"
+    check "200" "register a feed pointed at the oversized zip fixture"
+
+    api_call POST "/api/destination-groups/$ZIPBOMB_GROUP_ID/trigger" "$MASTER_KEY"
     check "200" "triggering ingestion of the zip bomb does not crash the daemon (no 500)"
     check_jq ".status" "FAILED" "a decompressed member exceeding MAX_DECOMPRESSED_BYTES must fail the job, not silently truncate or OOM"
     check_jq ".items_processed" "0" "no records are processed once the decompression-bomb guard trips"
@@ -1073,8 +1092,8 @@ PYEOF
     check_local "$(echo "$ERROR_MSG" | grep -qi "decompress" && echo yes || echo no)" "yes" \
         "the error message explains this is the decompression guard, not an opaque failure (got: $ERROR_MSG)"
 
-    api_call DELETE "/api/sources/$ZIPBOMB_SOURCE_ID" "$MASTER_KEY"
-    check "204" "clean up the zip-bomb source"
+    api_call DELETE "/api/destination-groups/$ZIPBOMB_GROUP_ID" "$MASTER_KEY"
+    check "204" "clean up the zip-bomb group (cascades to its feed)"
     api_call DELETE "/api/vaults/$ZIPBOMB_TARGET_VAULT_ID" "$MASTER_KEY"
     check "204" "clean up the zip-bomb target vault"
 
@@ -1095,8 +1114,9 @@ PYEOF
     check "200" "register the bad (fails after chunk 1) target vault"
     MIDFAIL_BAD_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
+    # skip_bogon_filtering:true -- reuses the 10.0.0.0/8 pagination-group delta.
     api_call POST "/api/sync-tasks" "$MASTER_KEY" \
-        "{\"name\":\"midfail-e2e-task\",\"source_vault_id\":\"$MIDFAIL_SOURCE_VAULT_ID\",\"source_group_name\":\"pagination-group\",\"target_group_name\":\"midfail-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$TARGET1_VAULT_ID\"},{\"vault_endpoint_id\":\"$MIDFAIL_BAD_VAULT_ID\"}]}"
+        "{\"name\":\"midfail-e2e-task\",\"source_vault_id\":\"$MIDFAIL_SOURCE_VAULT_ID\",\"source_group_name\":\"pagination-group\",\"target_group_name\":\"midfail-dst\",\"cron_schedule\":\"0 0 * * *\",\"is_active\":false,\"skip_bogon_filtering\":true,\"targets\":[{\"vault_endpoint_id\":\"$TARGET1_VAULT_ID\"},{\"vault_endpoint_id\":\"$MIDFAIL_BAD_VAULT_ID\"}]}"
     check "200" "create a sync task fanning out to a good target and a target that fails after chunk 1"
     MIDFAIL_TASK_ID=$(echo "$RESP_BODY" | jq -r '.id')
     check_jq ".last_sync_at" "null" "a freshly created task has no last_sync_at yet"
@@ -1141,13 +1161,21 @@ PYEOF
     check "200" "register a target vault for the non-UTF-8 feed source"
     NONUTF8_TARGET_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/sources" "$MASTER_KEY" \
-        "{\"name\":\"nonutf8-e2e-source\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"nonutf8-dst\",\"is_active\":false,\"targets\":[{\"vault_endpoint_id\":\"$NONUTF8_TARGET_VAULT_ID\"}]}"
-    check "200" "register a source pointed at the Latin-1/raw-binary feed fixture"
-    NONUTF8_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    # skip_bogon_filtering:true -- the valid IPs in this fixture are TEST-NET-3 (203.0.113.0/24)
+    # and IPv6 documentation-range (2001:db8::/32) addresses, both of which the bogon sanitizer
+    # would otherwise strip; this section is testing non-UTF-8 body resilience, not bogon
+    # filtering.
+    api_call POST "/api/destination-groups" "$MASTER_KEY" \
+        "{\"name\":\"nonutf8-e2e-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"nonutf8-dst\",\"is_active\":false,\"skip_bogon_filtering\":true,\"targets\":[{\"vault_endpoint_id\":\"$NONUTF8_TARGET_VAULT_ID\"}]}"
+    check "200" "create a destination group for the non-UTF-8/raw-binary feed fixture"
+    NONUTF8_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/destination-groups/$NONUTF8_GROUP_ID/feeds" "$MASTER_KEY" \
+        "{\"name\":\"nonutf8-e2e-feed\",\"source_url\":\"http://127.0.0.1:$EXTRA_PORT/feed.txt\"}"
+    check "200" "register a feed pointed at the Latin-1/raw-binary feed fixture"
 
     RESILIENCE_HITS_BEFORE=$(wc -l < "$RESILIENCE_LOG" | tr -d ' ')
-    api_call POST "/api/sources/$NONUTF8_SOURCE_ID/trigger" "$MASTER_KEY"
+    api_call POST "/api/destination-groups/$NONUTF8_GROUP_ID/trigger" "$MASTER_KEY"
     check "200" "triggering ingestion of the non-UTF-8 feed does not crash the daemon (no 500)"
     check_jq ".status" "SUCCESS" "a feed with non-UTF-8 bytes elsewhere in the body must still succeed on the valid IPs it contains"
     check_jq ".items_processed" "2" "both valid IPs must survive lossy decoding despite the Latin-1 bytes around them"
@@ -1157,8 +1185,8 @@ PYEOF
     PUSHED_ADDRESSES=$(tail -n 1 "$RESILIENCE_LOG" | jq -r '.body | fromjson | .records | map(.target_address) | join(",")')
     check_local "$PUSHED_ADDRESSES" "203.0.113.77,2001:db8::77" "exactly the two valid IPs were extracted and pushed, none of the Latin-1 noise"
 
-    api_call DELETE "/api/sources/$NONUTF8_SOURCE_ID" "$MASTER_KEY"
-    check "204" "clean up the non-UTF-8 source"
+    api_call DELETE "/api/destination-groups/$NONUTF8_GROUP_ID" "$MASTER_KEY"
+    check "204" "clean up the non-UTF-8 group (cascades to its feed)"
     api_call DELETE "/api/vaults/$NONUTF8_TARGET_VAULT_ID" "$MASTER_KEY"
     check "204" "clean up the non-UTF-8 target vault"
 
@@ -1191,12 +1219,16 @@ if [[ "$NETWORK_REACHABLE" -eq 1 ]]; then
     )
     for name in "${!LIVE_FEEDS[@]}"; do
         url="${LIVE_FEEDS[$name]}"
-        api_call POST "/api/sources" "$MASTER_KEY" \
-            "{\"name\":\"$name\",\"source_url\":\"$url\",\"parser_type\":\"REGEX_LINE\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"live\",\"is_active\":false}"
-        check "200" "register live source '$name'"
-        SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+        api_call POST "/api/destination-groups" "$MASTER_KEY" \
+            "{\"name\":\"$name-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"live\",\"is_active\":false}"
+        check "200" "register destination group for live source '$name'"
+        GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-        api_call POST "/api/sources/$SOURCE_ID/trigger" "$MASTER_KEY"
+        api_call POST "/api/destination-groups/$GROUP_ID/feeds" "$MASTER_KEY" \
+            "{\"name\":\"$name\",\"source_url\":\"$url\",\"parser_type\":\"REGEX_LINE\"}"
+        check "200" "register live feed '$name'"
+
+        api_call POST "/api/destination-groups/$GROUP_ID/trigger" "$MASTER_KEY"
         check "200" "trigger ingestion of live feed '$name'"
         check_jq ".status" "SUCCESS" "'$name' ingestion reports SUCCESS"
         ITEMS=$(echo "$RESP_BODY" | jq -r '.items_processed')
@@ -1208,8 +1240,8 @@ if [[ "$NETWORK_REACHABLE" -eq 1 ]]; then
             echo -e "$(ts)   ${RED}✗ FAIL${RESET} '$name' yielded '$ITEMS' entries, expected > 0" >&2
         fi
 
-        api_call DELETE "/api/sources/$SOURCE_ID" "$MASTER_KEY"
-        check "204" "clean up live source '$name'"
+        api_call DELETE "/api/destination-groups/$GROUP_ID" "$MASTER_KEY"
+        check "204" "clean up live destination group '$name'"
     done
 else
     skip "live feed ingestion checks (network unreachable)"
@@ -1255,28 +1287,36 @@ if [[ "$PYTHON3_AVAILABLE" -eq 1 ]] && command -v zip >/dev/null 2>&1; then
         FIXTURE_BASE="http://127.0.0.1:$FIXTURE_PORT"
         log "Local fixture server up on $FIXTURE_BASE, serving $FIXTURE_DIR"
 
-        api_call POST "/api/sources" "$MASTER_KEY" \
-            "{\"name\":\"fixture-sfs-ipv6-zip\",\"source_url\":\"$FIXTURE_BASE/listed_ip_30_ipv6.zip\",\"parser_type\":\"REGEX_LINE\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false}"
-        check "200" "register the StopForumSpam-shaped ZIP fixture source"
-        ZIP_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
-        api_call POST "/api/sources/$ZIP_SOURCE_ID/trigger" "$MASTER_KEY"
+        api_call POST "/api/destination-groups" "$MASTER_KEY" \
+            "{\"name\":\"fixture-sfs-ipv6-zip-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false}"
+        check "200" "create destination group for the StopForumSpam-shaped ZIP fixture"
+        ZIP_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+        api_call POST "/api/destination-groups/$ZIP_GROUP_ID/feeds" "$MASTER_KEY" \
+            "{\"name\":\"fixture-sfs-ipv6-zip\",\"source_url\":\"$FIXTURE_BASE/listed_ip_30_ipv6.zip\",\"parser_type\":\"REGEX_LINE\"}"
+        check "200" "register the StopForumSpam-shaped ZIP fixture feed"
+        api_call POST "/api/destination-groups/$ZIP_GROUP_ID/trigger" "$MASTER_KEY"
         check "200" "trigger ingestion of the ZIP fixture"
         check_jq ".status" "SUCCESS" "ZIP fixture ingestion reports SUCCESS (the ingestion pipeline decompressed it)"
         check_jq ".items_processed" "${#SFS_ADDRESSES[@]}" "all ${#SFS_ADDRESSES[@]} IPv6 addresses inside the zip were extracted"
-        api_call DELETE "/api/sources/$ZIP_SOURCE_ID" "$MASTER_KEY"
-        check "204" "clean up the ZIP fixture source"
+        api_call DELETE "/api/destination-groups/$ZIP_GROUP_ID" "$MASTER_KEY"
+        check "204" "clean up the ZIP fixture group (cascades to its feed)"
 
-        api_call POST "/api/sources" "$MASTER_KEY" \
-            "{\"name\":\"fixture-spamhaus-drop-v6\",\"source_url\":\"$FIXTURE_BASE/drop_v6.json\",\"parser_type\":\"JSON_PATH\",\"parser_config_json\":\"{\\\"jsonl\\\":true,\\\"ip_field\\\":\\\"cidr\\\"}\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false}"
-        check "200" "register the Spamhaus-shaped JSONL fixture source"
-        JSONL_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
-        api_call POST "/api/sources/$JSONL_SOURCE_ID/trigger" "$MASTER_KEY"
+        # parser_config_json now uses the $.-prefixed target_address selector (the old ip_field key
+        # was removed) -- the fixture's per-line shape is {"cidr": "...", "sblid": "...", "rir": "..."}.
+        api_call POST "/api/destination-groups" "$MASTER_KEY" \
+            "{\"name\":\"fixture-spamhaus-drop-v6-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false}"
+        check "200" "create destination group for the Spamhaus-shaped JSONL fixture"
+        JSONL_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+        api_call POST "/api/destination-groups/$JSONL_GROUP_ID/feeds" "$MASTER_KEY" \
+            "{\"name\":\"fixture-spamhaus-drop-v6\",\"source_url\":\"$FIXTURE_BASE/drop_v6.json\",\"parser_type\":\"JSON_PATH\",\"parser_config_json\":\"{\\\"jsonl\\\":true,\\\"target_address\\\":\\\"\$.cidr\\\"}\"}"
+        check "200" "register the Spamhaus-shaped JSONL fixture feed"
+        api_call POST "/api/destination-groups/$JSONL_GROUP_ID/trigger" "$MASTER_KEY"
         check "200" "trigger ingestion of the JSONL fixture"
         check_jq ".status" "SUCCESS" "JSONL fixture ingestion reports SUCCESS"
         check_jq ".items_processed" "${#SPAMHAUS_CIDRS[@]}" \
             "all ${#SPAMHAUS_CIDRS[@]} CIDRs extracted, metadata footer line correctly skipped"
-        api_call DELETE "/api/sources/$JSONL_SOURCE_ID" "$MASTER_KEY"
-        check "204" "clean up the JSONL fixture source"
+        api_call DELETE "/api/destination-groups/$JSONL_GROUP_ID" "$MASTER_KEY"
+        check "204" "clean up the JSONL fixture group (cascades to its feed)"
 
         # Task 4: a feed host returning 200 OK with an HTML block/error page instead of its real
         # content — the same shape as a Cloudflare challenge, WAF block, or captive-portal redirect.
@@ -1293,20 +1333,23 @@ if [[ "$PYTHON3_AVAILABLE" -eq 1 ]] && command -v zip >/dev/null 2>&1; then
 </body>
 </html>
 HTMLEOF
-        api_call POST "/api/sources" "$MASTER_KEY" \
-            "{\"name\":\"fixture-html-masquerade\",\"source_url\":\"$FIXTURE_BASE/html_masquerade.txt\",\"parser_type\":\"REGEX_LINE\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false}"
-        check "200" "register a source pointed at an HTML block-page fixture (200 OK, no real feed content)"
-        HTML_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
-        api_call POST "/api/sources/$HTML_SOURCE_ID/trigger" "$MASTER_KEY"
+        api_call POST "/api/destination-groups" "$MASTER_KEY" \
+            "{\"name\":\"fixture-html-masquerade-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false}"
+        check "200" "create destination group for an HTML block-page fixture (200 OK, no real feed content)"
+        HTML_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+        api_call POST "/api/destination-groups/$HTML_GROUP_ID/feeds" "$MASTER_KEY" \
+            "{\"name\":\"fixture-html-masquerade\",\"source_url\":\"$FIXTURE_BASE/html_masquerade.txt\",\"parser_type\":\"REGEX_LINE\"}"
+        check "200" "register a feed pointed at the HTML block-page fixture"
+        api_call POST "/api/destination-groups/$HTML_GROUP_ID/trigger" "$MASTER_KEY"
         check "200" "triggering ingestion of the HTML masquerade does not crash the daemon (no 500)"
         check_jq ".status" "PARTIAL" "an HTML body yielding zero parseable entries is flagged PARTIAL, not silently SUCCESS"
         check_jq ".items_processed" "0" "zero IP-shaped tokens are extracted from the HTML block page"
 
-        api_call GET "/api/sync-logs?job_id=$HTML_SOURCE_ID" "$MASTER_KEY"
+        api_call GET "/api/sync-logs?job_id=$HTML_GROUP_ID" "$MASTER_KEY"
         check_jq ".[0].status" "PARTIAL" "sync_logs records the PARTIAL outcome for the HTML masquerade"
 
-        api_call DELETE "/api/sources/$HTML_SOURCE_ID" "$MASTER_KEY"
-        check "204" "clean up the HTML masquerade fixture source"
+        api_call DELETE "/api/destination-groups/$HTML_GROUP_ID" "$MASTER_KEY"
+        check "204" "clean up the HTML masquerade fixture group (cascades to its feed)"
     else
         warn "Local fixture file server failed to start; skipping fixture ingestion checks."
     fi
@@ -1319,22 +1362,27 @@ fi
 # ── 10. Additional hardening & edge cases ────────────────────────────────────
 log_section "10. Additional hardening & edge cases"
 
-raw_call POST "/api/sources" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $(date +%s)" \
+raw_call POST "/api/destination-groups" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $(date +%s)" \
     -H "X-Signature-256: sha256=deadbeef" -H "Content-Type: application/json" --data-binary '{not valid json'
 check "401" "malformed JSON body with an (unverifiable, since body is now unparseable) signature is still rejected at auth, before ever reaching JSON parsing"
 
 next_timestamp
 BAD_JSON_TS="$SIGNED_TS"
 BAD_JSON_BODY='{"name": "x", invalid}'
-BAD_JSON_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/sources" "$BAD_JSON_TS" "$BAD_JSON_BODY")
-raw_call POST "/api/sources" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $BAD_JSON_TS" \
+BAD_JSON_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/destination-groups" "$BAD_JSON_TS" "$BAD_JSON_BODY")
+raw_call POST "/api/destination-groups" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $BAD_JSON_TS" \
     -H "X-Signature-256: $BAD_JSON_SIG" -H "Content-Type: application/json" --data-binary "$BAD_JSON_BODY"
 check "400" "syntactically invalid JSON with a *valid* signature is 400, not 500"
 
-api_call POST "/api/sources" "$MASTER_KEY" '{"name":"bad-parser-type","source_url":"http://x","cron_schedule":"0 0 * * *","target_group_name":"g","parser_type":"XML"}'
+api_call POST "/api/destination-groups" "$MASTER_KEY" '{"name":"bad-parser-type-group","cron_schedule":"0 0 * * *","target_group_name":"g"}'
+check "200" "create a scratch destination group for the bad-parser-type feed check"
+BAD_PARSER_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call POST "/api/destination-groups/$BAD_PARSER_GROUP_ID/feeds" "$MASTER_KEY" '{"name":"bad-parser-type","source_url":"http://x","parser_type":"XML"}'
 check "400" "an unknown parser_type is rejected with 400"
+api_call DELETE "/api/destination-groups/$BAD_PARSER_GROUP_ID" "$MASTER_KEY"
+check "204" "clean up the bad-parser-type scratch group"
 
-api_call POST "/api/sources" "$MASTER_KEY" '{"name":"unknown-field-source","source_url":"http://x","cron_schedule":"0 0 * * *","target_group_name":"g","totally_unexpected_field":true}'
+api_call POST "/api/destination-groups" "$MASTER_KEY" '{"name":"unknown-field-group","cron_schedule":"0 0 * * *","target_group_name":"g","totally_unexpected_field":true}'
 check "400" "a payload carrying an unexpected field is rejected (deny_unknown_fields), not silently ignored"
 
 raw_call GET "/api/this-route-does-not-exist"
@@ -1347,8 +1395,8 @@ DAUGHTER_SECRET=$(echo "$RESP_BODY" | jq -r '.plaintext_signing_secret')
 DAUGHTER_ID=$(echo "$RESP_BODY" | jq -r '.key.id')
 register_key_secret "$DAUGHTER_KEY" "$DAUGHTER_SECRET"
 
-api_call POST "/api/sources" "$DAUGHTER_KEY" '{"name":"daughter-attempt","source_url":"http://x","cron_schedule":"0 0 * * *","target_group_name":"g"}'
-check "403" "a daughter key without can_manage_sources cannot create an external source"
+api_call POST "/api/destination-groups" "$DAUGHTER_KEY" '{"name":"daughter-attempt","cron_schedule":"0 0 * * *","target_group_name":"g"}'
+check "403" "a daughter key without can_manage_sources cannot create a destination group"
 
 api_call POST "/api/keys" "$DAUGHTER_KEY" '{"name":"privilege-escalation-attempt","can_manage_sources":true}'
 check "403" "a non-master key cannot grant can_manage_sources to a new key it creates (RBAC R4)"
@@ -1409,7 +1457,7 @@ check_local "$OUT_OF_SCOPE_BODY" "$RESP_BODY" "an out-of-scope vault and a nonex
 OVERSIZED_BODY_FILE="$WORK_DIR/oversized_body"
 head -c 11000000 /dev/zero | tr '\0' 'a' > "$OVERSIZED_BODY_FILE"
 next_timestamp
-raw_call POST "/api/sources" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SIGNED_TS" \
+raw_call POST "/api/destination-groups" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SIGNED_TS" \
     -H "X-Signature-256: sha256=0000000000000000000000000000000000000000000000000000000000000000" \
     -H "Content-Type: application/json" --data-binary "@$OVERSIZED_BODY_FILE"
 check "413" "a body over MAX_BODY_SIZE_MIB (10 MiB default) is rejected cleanly (413) rather than a 500 or a hang"

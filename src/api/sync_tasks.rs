@@ -40,6 +40,10 @@ pub struct VaultSyncTaskResponse {
     pub mode: String,
     /// Whether automatic scheduling is enabled.
     pub is_active: bool,
+    /// When `false` (the default), the delta fetched from the source vault is sanitized
+    /// (loopback/private/link-local/other reserved ranges stripped) before push. `true` bypasses
+    /// that stripping for a task deliberately replicating internal/lab address space.
+    pub skip_bogon_filtering: bool,
     /// Key holding lifecycle authority over this task.
     pub owner_key_id: Option<Uuid>,
     /// Configured target vaults.
@@ -75,6 +79,7 @@ fn to_response(m: vault_sync_task::Model, targets: Vec<TargetSpec>) -> VaultSync
         last_sync_at: m.last_sync_at,
         mode: m.mode,
         is_active: m.is_active,
+        skip_bogon_filtering: m.skip_bogon_filtering,
         owner_key_id: m.owner_key_id,
         targets,
         created_at: m.created_at,
@@ -99,6 +104,10 @@ pub struct CreateVaultSyncTaskPayload {
     /// Whether automatic scheduling is enabled. Defaults to `true`.
     #[serde(default = "default_true")]
     pub is_active: bool,
+    /// When `false` (the default), the delta is sanitized (bogon/private/link-local stripped)
+    /// before push. `true` bypasses that stripping.
+    #[serde(default)]
+    pub skip_bogon_filtering: bool,
     /// Target vault endpoints to replicate delta records to.
     #[serde(default)]
     pub targets: Vec<TargetSpec>,
@@ -130,6 +139,9 @@ pub struct UpdateVaultSyncTaskPayload {
     /// New active flag.
     #[serde(default)]
     pub is_active: Option<bool>,
+    /// New bogon-filtering-bypass flag.
+    #[serde(default)]
+    pub skip_bogon_filtering: Option<bool>,
     /// Replaces the full set of target vaults, when present.
     #[serde(default)]
     pub targets: Option<Vec<TargetSpec>>,
@@ -197,6 +209,7 @@ pub async fn create_vault_sync_task(
         last_sync_at: Set(None),
         mode: Set("upsert".to_owned()),
         is_active: Set(payload.is_active),
+        skip_bogon_filtering: Set(payload.skip_bogon_filtering),
         owner_key_id: Set(Some(caller.id)),
         created_at: Set(now),
         updated_at: Set(now),
@@ -263,6 +276,9 @@ pub async fn update_vault_sync_task(
     }
     if let Some(is_active) = payload.is_active {
         active.is_active = Set(is_active);
+    }
+    if let Some(skip_bogon_filtering) = payload.skip_bogon_filtering {
+        active.skip_bogon_filtering = Set(skip_bogon_filtering);
     }
     active.updated_at = Set(Utc::now());
     let updated = active.update(&txn).await?;

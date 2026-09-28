@@ -16,13 +16,25 @@ pub enum ParseError {
     MalformedBody(String),
 }
 
-/// A pluggable algorithm turning a raw fetched feed body into a list of normalized IP/CIDR
-/// strings.
+/// One extracted entry: a normalized IP/CIDR address, plus an optional "last seen" timestamp when
+/// the feed and parser configuration can supply one (`JSON_PATH`'s optional `last_seen_at`
+/// selector; `REGEX_LINE` never has a natural timestamp source and always returns `None`).
+/// `jobs::external_ingestion` uses the timestamp, when present, together with a feed's own
+/// `max_age_days` column to discard stale entries before they're aggregated across a group's
+/// feeds — see that module and `parsers::json_path`'s doc comment for the full mechanism.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRecord {
+    /// Normalized IP address or CIDR subnet.
+    pub address: String,
+    /// When known, the timestamp this feed reported the address as last seen/active.
+    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A pluggable algorithm turning a raw fetched feed body into a list of extracted records.
 pub trait FeedParser {
     /// Parses `raw`, using `config` (the source's `parser_config_json`, if any) to steer
-    /// extraction. Returns normalized IP/CIDR strings; duplicates are not required to be removed
-    /// by the parser (callers deduplicate).
-    fn parse(&self, raw: &[u8], config: Option<&str>) -> Result<Vec<String>, ParseError>;
+    /// extraction. Duplicates are not required to be removed by the parser (callers deduplicate).
+    fn parse(&self, raw: &[u8], config: Option<&str>) -> Result<Vec<ParsedRecord>, ParseError>;
 }
 
 /// Normalizes a bare IP address or CIDR subnet to a canonical string form (`/32`/`/128` singles

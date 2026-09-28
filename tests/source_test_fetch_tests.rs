@@ -113,8 +113,9 @@ async fn a_working_regex_line_feed_reports_success_with_the_extracted_sample() {
     assert_eq!(body["truncated"], false);
 }
 
-/// `JSON_PATH` with `array_path`/`ip_field` is exercised end-to-end here too, not just
-/// `REGEX_LINE` — this is exactly the AbuseIPDB-shaped config the WebUI's help text points at.
+/// `JSON_PATH` with `array_path`/`target_address` (`$.`-prefixed) is exercised end-to-end here
+/// too, not just `REGEX_LINE` — this is exactly the AbuseIPDB-shaped config the WebUI's help text
+/// points at.
 /// The fixture body below is a trimmed, real response from AbuseIPDB's own
 /// `GET /api/v2/blacklist?ipVersion=4` (fetched once during development, per the live shape's own
 /// one-request-per-key-refresh rate limit — never hit that endpoint from an automated test, per
@@ -148,7 +149,7 @@ async fn a_working_json_path_feed_with_array_path_and_ip_field_reports_success()
         json!({
             "source_url": format!("{}/blacklist", feed_mock.uri()),
             "parser_type": "JSON_PATH",
-            "parser_config_json": "{\"array_path\":\"data\",\"ip_field\":\"ipAddress\"}",
+            "parser_config_json": "{\"array_path\":\"data\",\"target_address\":\"$.ipAddress\"}",
         }),
     )
     .await;
@@ -189,7 +190,7 @@ async fn a_working_json_path_feed_with_real_ipv6_addresses_reports_success() {
         json!({
             "source_url": format!("{}/blacklist6", feed_mock.uri()),
             "parser_type": "JSON_PATH",
-            "parser_config_json": "{\"array_path\":\"data\",\"ip_field\":\"ipAddress\"}",
+            "parser_config_json": "{\"array_path\":\"data\",\"target_address\":\"$.ipAddress\"}",
         }),
     )
     .await;

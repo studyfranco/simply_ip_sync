@@ -311,26 +311,83 @@ function showLoginError(message) {
 // their own prior setting rather than a blank field that silently means the same thing.
 document.getElementById("login-api-base").value = localStorage.getItem("simply_ip_sync_api_base") || "";
 
-document.getElementById("login-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
+/// Task 6: credential persistence across a page reload. Deliberately `sessionStorage`, not
+/// `localStorage` — the ask was "a reload shouldn't force re-entry", not "persist indefinitely
+/// across browser restarts"; `sessionStorage` clears the moment the tab/browser closes, matching
+/// `simply_ip_exporter`'s own precedent in this ecosystem for the identical tradeoff, while
+/// `localStorage` would widen the XSS blast radius for no benefit the actual request asked for.
+const SESSION_STORAGE_KEY_PREFIX = "simply_ip_sync_session_";
+
+function saveSessionCredentials(apiKey, signingSecret) {
+  try {
+    sessionStorage.setItem(SESSION_STORAGE_KEY_PREFIX + "api_key", apiKey);
+    sessionStorage.setItem(SESSION_STORAGE_KEY_PREFIX + "signing_secret", signingSecret);
+  } catch {
+    // Private-browsing/blocked storage: login already succeeded via the in-memory client, so this
+    // only means the *next* reload will ask again — not a reason to fail the login itself.
+  }
+}
+
+function loadSessionCredentials() {
+  try {
+    const apiKey = sessionStorage.getItem(SESSION_STORAGE_KEY_PREFIX + "api_key");
+    const signingSecret = sessionStorage.getItem(SESSION_STORAGE_KEY_PREFIX + "signing_secret");
+    return apiKey && signingSecret ? { apiKey, signingSecret } : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearSessionCredentials() {
+  try {
+    sessionStorage.removeItem(SESSION_STORAGE_KEY_PREFIX + "api_key");
+    sessionStorage.removeItem(SESSION_STORAGE_KEY_PREFIX + "signing_secret");
+  } catch {
+    // Nothing to clean up if storage was never writable in the first place.
+  }
+}
+
+async function attemptSignIn(apiKey, signingSecret) {
   document.getElementById("login-error").classList.add("hidden");
-  const apiKey = document.getElementById("login-api-key").value.trim();
-  const signingSecret = document.getElementById("login-signing-secret").value.trim();
   const candidate = new SyncClient(apiKey, signingSecret);
   candidate.setApiBaseOverride(document.getElementById("login-api-base").value);
+  me = await candidate.get("/api/auth/me");
+  client = candidate;
+  saveSessionCredentials(apiKey, signingSecret);
+  invalidateVaultsCache();
+  document.getElementById("login-screen").classList.add("hidden");
+  document.getElementById("dashboard-container").classList.remove("hidden");
+  renderIdentity();
+  setupTabs();
+  await loadTab("sources");
+}
+
+document.getElementById("login-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const apiKey = document.getElementById("login-api-key").value.trim();
+  const signingSecret = document.getElementById("login-signing-secret").value.trim();
   try {
-    me = await candidate.get("/api/auth/me");
-    client = candidate;
-    invalidateVaultsCache();
-    document.getElementById("login-screen").classList.add("hidden");
-    document.getElementById("dashboard-container").classList.remove("hidden");
-    renderIdentity();
-    setupTabs();
-    await loadTab("sources");
+    await attemptSignIn(apiKey, signingSecret);
   } catch (err) {
     showLoginError("Sign-in failed: " + err.message);
   }
 });
+
+// Task 6: restore a saved session on page load. A stale/revoked credential surfaces as an
+// ordinary sign-in failure (shown inline, same as a manual attempt) rather than silently clearing
+// the saved session out from under the operator — they may just be offline for a moment, and a
+// second reload should retry rather than force re-typing the key.
+(async function restoreSessionOnLoad() {
+  const saved = loadSessionCredentials();
+  if (!saved) return;
+  document.getElementById("login-api-key").value = saved.apiKey;
+  document.getElementById("login-signing-secret").value = saved.signingSecret;
+  try {
+    await attemptSignIn(saved.apiKey, saved.signingSecret);
+  } catch (err) {
+    showLoginError("Saved session could not be restored: " + err.message);
+  }
+})();
 
 /// The caller's RBAC tier, per `RBAC_MODEL.md` §1: Master (unique), Parent (`can_manage_keys`), or
 /// Daughter (neither). Shown as a header chip so a missing tab is self-explanatory.
@@ -390,12 +447,14 @@ function setupTabs() {
   });
 
   document.getElementById("btn-logout").addEventListener("click", () => {
-    // Credentials only ever lived in this closure, so dropping them is the whole logout: nothing
-    // was written to storage that could outlive the tab. The vaults cache goes with it too — a
+    // Logout doubles as "Clear Saved Session" (Task 6) -- there is no meaningful difference
+    // between "sign out" and "forget this credential" for this app, so one button does both
+    // rather than adding a second, redundant control. The vaults cache goes with it too — a
     // different key logging in next has no business inheriting what the previous one could see.
     client = null;
     me = null;
     invalidateVaultsCache();
+    clearSessionCredentials();
     document.getElementById("login-form").reset();
     document.getElementById("dashboard-container").classList.add("hidden");
     document.getElementById("login-screen").classList.remove("hidden");
@@ -421,58 +480,191 @@ async function loadTab(tab) {
 
 async function renderSources() {
   const panel = document.getElementById("tab-sources");
-  const sources = await client.get("/api/sources");
+  const groups = await client.get("/api/destination-groups");
   const vaults = await getVaultsCached();
   panel.innerHTML = `
     <section class="card">
-      <div class="list-header"><h2>External Sources</h2>
-        ${me.is_master || me.can_manage_sources ? '<button class="btn btn-primary" id="new-source-btn">+ New Source</button>' : ""}
+      <div class="list-header"><h2>Destination Groups</h2>
+        ${me.is_master || me.can_manage_sources ? '<button class="btn btn-primary" id="new-group-btn">+ New Destination Group</button>' : ""}
       </div>
-      <div id="source-form-slot"></div>
+      <div id="group-form-slot"></div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Name</th><th>URL</th><th>Parser</th><th>Schedule</th><th>Group</th><th>Active</th><th>Last Run</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Target Group</th><th>Schedule</th><th>Mode</th><th>Active</th><th>Bogon Filter</th><th>Last Run</th><th></th></tr></thead>
         <tbody>
-          ${sources.length ? sources.map(sourceRow).join("") : '<tr><td colspan="8" class="empty-state">No sources yet.</td></tr>'}
+          ${groups.length ? groups.map(groupRow).join("") : '<tr><td colspan="8" class="empty-state">No destination groups yet.</td></tr>'}
         </tbody>
       </table>
       </div>
     </section>`;
 
-  if (document.getElementById("new-source-btn")) {
-    document.getElementById("new-source-btn").addEventListener("click", () => showSourceForm(null, vaults));
+  if (document.getElementById("new-group-btn")) {
+    document.getElementById("new-group-btn").addEventListener("click", () => showGroupForm(null, vaults));
   }
-  panel.querySelectorAll("[data-edit-source]").forEach((btn) =>
-    btn.addEventListener("click", () => showSourceForm(sources.find((s) => s.id === btn.dataset.editSource), vaults))
+  panel.querySelectorAll("[data-edit-group]").forEach((btn) =>
+    btn.addEventListener("click", () => showGroupForm(groups.find((g) => g.id === btn.dataset.editGroup), vaults))
   );
-  panel.querySelectorAll("[data-delete-source]").forEach((btn) =>
-    btn.addEventListener("click", () => deleteResource("/api/sources/" + btn.dataset.deleteSource, "sources"))
+  panel.querySelectorAll("[data-delete-group]").forEach((btn) =>
+    btn.addEventListener("click", () => deleteResource("/api/destination-groups/" + btn.dataset.deleteGroup, "sources"))
   );
-  panel.querySelectorAll("[data-trigger-source]").forEach((btn) =>
-    btn.addEventListener("click", () => triggerResource("/api/sources/" + btn.dataset.triggerSource + "/trigger"))
+  panel.querySelectorAll("[data-trigger-group]").forEach((btn) =>
+    btn.addEventListener("click", () => triggerResource("/api/destination-groups/" + btn.dataset.triggerGroup + "/trigger"))
+  );
+  panel.querySelectorAll("[data-manage-feeds]").forEach((btn) =>
+    btn.addEventListener("click", () => renderFeedsView(groups.find((g) => g.id === btn.dataset.manageFeeds), vaults))
   );
 }
 
-function sourceRow(s) {
+function groupRow(g) {
   return `<tr>
-    <td>${escapeHtml(s.name)}</td>
-    <td class="font-mono">${escapeHtml(s.source_url)}</td>
-    <td>${escapeHtml(s.parser_type)}</td>
-    <td class="font-mono">${escapeHtml(s.cron_schedule)}</td>
-    <td>${escapeHtml(s.target_group_name)}</td>
-    <td>${s.is_active ? "yes" : "no"}</td>
-    <td>${escapeHtml(s.last_run_at || "never")}</td>
+    <td>${escapeHtml(g.name)}</td>
+    <td>${escapeHtml(g.target_group_name)}</td>
+    <td class="font-mono">${escapeHtml(g.cron_schedule)}</td>
+    <td>${escapeHtml(g.mode)}</td>
+    <td>${g.is_active ? "yes" : "no"}</td>
+    <td>${g.skip_bogon_filtering ? "bypassed" : "filtered"}</td>
+    <td>${escapeHtml(g.last_run_at || "never")}</td>
     <td class="row-actions">
-      <button class="btn btn-sm" data-trigger-source="${s.id}">Trigger</button>
-      <button class="btn btn-sm" data-edit-source="${s.id}">Edit</button>
-      <button class="btn btn-sm btn-danger" data-delete-source="${s.id}">Delete</button>
+      <button class="btn btn-sm" data-manage-feeds="${g.id}">Feeds (${g.feeds.length})</button>
+      <button class="btn btn-sm" data-trigger-group="${g.id}">Trigger</button>
+      <button class="btn btn-sm" data-edit-group="${g.id}">Edit</button>
+      <button class="btn btn-sm btn-danger" data-delete-group="${g.id}">Delete</button>
+    </td>
+  </tr>`;
+}
+
+function showGroupForm(existing, vaults) {
+  const slot = document.getElementById("group-form-slot");
+  const vaultOptions = vaults.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join("");
+  slot.innerHTML = `
+    <form class="form-grid" id="group-form">
+      <label class="form-group"><span>Name</span><input class="input-field" name="name" required value="${escapeHtml(existing?.name || "")}"></label>
+      <label class="form-group"><span>Target Group Name</span><input class="input-field" name="target_group_name" required value="${escapeHtml(existing?.target_group_name || "")}"></label>
+      <label class="form-group"><span>Cron Schedule</span><input class="input-field" name="cron_schedule" required placeholder="0 0 * * *" value="${escapeHtml(existing?.cron_schedule || "")}"></label>
+      <label class="form-group"><span>Mode
+        </span><select class="select-field" name="mode">
+          <option value="upsert" ${existing?.mode !== "full_replace" ? "selected" : ""}>upsert</option>
+          <option value="full_replace" ${existing?.mode === "full_replace" ? "selected" : ""}>full_replace</option>
+        </select>
+      </label>
+      <label class="form-group"><span>Active
+        </span><select class="select-field" name="is_active">
+          <option value="true" ${existing?.is_active !== false ? "selected" : ""}>true</option>
+          <option value="false" ${existing?.is_active === false ? "selected" : ""}>false</option>
+        </select>
+      </label>
+      <div class="form-group">
+        <label class="checkbox-container"><input type="checkbox" name="skip_bogon_filtering" ${existing?.skip_bogon_filtering ? "checked" : ""}><span>Bypass Bogon &amp; Private IP Filtering</span></label>
+        <small class="field-hint">Off by default: loopback/private/link-local/other reserved addresses are stripped from this group's aggregated feed content before push. Turn on only for a group deliberately ingesting internal/lab address space. A child feed can override this individually.</small>
+      </div>
+      <label class="form-group form-group-grow"><span>Target Vaults (select one or more)
+        </span><select class="select-field" name="targets" multiple size="4">${vaultOptions}</select>
+      </label>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create"}</button>
+        <button type="button" class="btn btn-cancel" id="group-form-cancel">Cancel</button>
+      </div>
+    </form>`;
+
+  if (existing) {
+    const selected = new Set((existing.targets || []).map((t) => t.vault_endpoint_id));
+    slot.querySelectorAll('select[name="targets"] option').forEach((opt) => {
+      if (selected.has(opt.value)) opt.selected = true;
+    });
+  }
+
+  document.getElementById("group-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
+  document.getElementById("group-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const targets = Array.from(e.target.querySelector('select[name="targets"]').selectedOptions).map((o) => ({
+      vault_endpoint_id: o.value,
+    }));
+    const payload = {
+      name: fd.get("name"),
+      target_group_name: fd.get("target_group_name"),
+      cron_schedule: fd.get("cron_schedule"),
+      mode: fd.get("mode"),
+      is_active: fd.get("is_active") === "true",
+      skip_bogon_filtering: fd.get("skip_bogon_filtering") === "on",
+      targets,
+    };
+    try {
+      if (existing) await client.patch("/api/destination-groups/" + existing.id, payload);
+      else await client.post("/api/destination-groups", payload);
+      toast("Destination group saved", "success");
+      slot.innerHTML = "";
+      await renderSources();
+    } catch (err) {
+      toast("Save failed: " + err.message, "error");
+    }
+  });
+}
+
+/* ---------------------------------------------------------------------- *
+ * Feeds — 1-to-N children of a destination group
+ * ---------------------------------------------------------------------- */
+
+async function renderFeedsView(group, vaults) {
+  const panel = document.getElementById("tab-sources");
+  panel.innerHTML = `
+    <section class="card">
+      <button type="button" class="btn btn-secondary btn-sm mb-4" id="feeds-back-btn">&larr; Back to Destination Groups</button>
+      <div class="list-header"><h2>Feeds — ${escapeHtml(group.name)}</h2>
+        ${me.is_master || me.can_manage_sources ? '<button class="btn btn-primary" id="new-feed-btn">+ New Feed</button>' : ""}
+      </div>
+      <small class="field-hint mb-4">All feeds in this group are fetched concurrently and aggregated into one deduplicated set on every run.</small>
+      <div id="feed-form-slot"></div>
+      <div class="table-container">
+        <table class="data-table">
+        <thead><tr><th>Name</th><th>URL</th><th>Parser</th><th>Max Age (days)</th><th>Bogon Filter</th><th></th></tr></thead>
+        <tbody>
+          ${group.feeds.length ? group.feeds.map(feedRow).join("") : '<tr><td colspan="6" class="empty-state">No feeds yet — this group will fetch nothing until at least one is added.</td></tr>'}
+        </tbody>
+      </table>
+      </div>
+    </section>`;
+
+  document.getElementById("feeds-back-btn").addEventListener("click", () => renderSources());
+  if (document.getElementById("new-feed-btn")) {
+    document.getElementById("new-feed-btn").addEventListener("click", () => showFeedForm(group, null, vaults));
+  }
+  panel.querySelectorAll("[data-edit-feed]").forEach((btn) =>
+    btn.addEventListener("click", () => showFeedForm(group, group.feeds.find((f) => f.id === btn.dataset.editFeed), vaults))
+  );
+  panel.querySelectorAll("[data-delete-feed]").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      if (!confirm("Delete this feed?")) return;
+      try {
+        await client.del(`/api/destination-groups/${group.id}/feeds/${btn.dataset.deleteFeed}`);
+        toast("Feed deleted", "success");
+        const refreshed = await client.get(`/api/destination-groups/${group.id}`);
+        await renderFeedsView(refreshed, vaults);
+      } catch (err) {
+        toast("Delete failed: " + err.message, "error");
+      }
+    })
+  );
+}
+
+function feedRow(f) {
+  const bogonLabel = f.skip_bogon_filtering === true ? "bypass" : f.skip_bogon_filtering === false ? "filter" : "(inherit)";
+  return `<tr>
+    <td>${escapeHtml(f.name)}</td>
+    <td class="font-mono">${escapeHtml(f.source_url)}</td>
+    <td>${escapeHtml(f.parser_type)}</td>
+    <td>${f.max_age_days ?? ""}</td>
+    <td>${escapeHtml(bogonLabel)}</td>
+    <td class="row-actions">
+      <button class="btn btn-sm" data-edit-feed="${f.id}">Edit</button>
+      <button class="btn btn-sm btn-danger" data-delete-feed="${f.id}">Delete</button>
     </td>
   </tr>`;
 }
 
 /// Splits a source's `parser_config_json` into the two well-known generic keys the ingestion job
 /// itself reads (`headers`, `user_agent` — see `src/jobs/external_ingestion.rs`'s `FetchOptions`)
-/// and whatever's left, which is parser-specific (`array_path`/`ip_field`/`jsonl` for JSON_PATH,
+/// and whatever's left, which is parser-specific (`array_path`/`target_address`/`jsonl` for JSON_PATH,
 /// etc.). The generic keys get their own editor UI (see below); the rest still goes in the raw
 /// "Parser Config JSON" textarea, since there's no reasonable structured UI for "whatever fields
 /// this parser happens to need" in general. Tolerates missing/malformed JSON by treating the whole
@@ -526,85 +718,104 @@ function buildMergedParserConfig(rows, userAgentValue, restConfigRaw) {
   return merged;
 }
 
-const JSON_PATH_EXAMPLE_HINT = `Maps a JSON feed to IP addresses. Example, for a feed shaped like
-<code>{"data": [{"ipAddress": "1.2.3.4"}, ...]}</code> (e.g. AbuseIPDB's blacklist endpoint):
-<pre class="code-example">{"array_path": "data", "ip_field": "ipAddress"}</pre>
-Omit <code>array_path</code> if the feed body is itself a bare top-level array. Add
+const JSON_PATH_EXAMPLE_HINT = `Maps a JSON feed to IP addresses using <code>$.</code>-prefixed field
+selectors into each item. Example, for a feed shaped like
+<code>{"data": [{"ipAddress": "1.2.3.4", "lastReportedAt": "2026-09-26T15:17:01Z"}, ...]}</code>
+(e.g. AbuseIPDB's blacklist endpoint):
+<pre class="code-example">{"array_path": "data", "target_address": "$.ipAddress", "last_seen_at": "$.lastReportedAt"}</pre>
+<code>target_address</code> (or its alias <code>ip</code>) is required. <code>last_seen_at</code>
+(or <code>timestamp</code>) is optional — set it together with "Max Age (Days)" below to discard
+stale entries. Omit <code>array_path</code> if the feed body is itself a bare top-level array. Add
 <code>"jsonl": true</code> for newline-delimited JSON (one object per line, no enclosing array).`;
 
-function showSourceForm(existing, vaults) {
-  const slot = document.getElementById("source-form-slot");
-  const vaultOptions = vaults.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join("");
+/// Task 4: the "Max Age (Days)" field only means anything when the parser config actually has a
+/// `last_seen_at` (or `timestamp`) selector to filter on — checked by literally parsing the
+/// textarea's current JSON on every keystroke, the same tolerant-of-garbage approach
+/// `splitParserConfig` already uses (a mid-edit, momentarily-invalid JSON string just means "no
+/// selector visible yet", not an error to surface here).
+function hasLastSeenAtSelector(rawConfigText) {
+  try {
+    const parsed = JSON.parse(rawConfigText || "{}");
+    const value = parsed.last_seen_at ?? parsed.timestamp;
+    return typeof value === "string" && value.startsWith("$.") && value.length > 2;
+  } catch {
+    return false;
+  }
+}
+
+function showFeedForm(group, existing, vaults) {
+  const slot = document.getElementById("feed-form-slot");
   const { headerRows, userAgent, rest } = splitParserConfig(existing?.parser_config_json);
+  const bogonOverride = existing?.skip_bogon_filtering; // undefined/null -> inherit, true/false -> override
 
   slot.innerHTML = `
-    <form class="form-grid" id="source-form">
+    <form class="form-grid" id="feed-form">
       <label class="form-group"><span>Name</span><input class="input-field" name="name" required value="${escapeHtml(existing?.name || "")}"></label>
       <label class="form-group"><span>Source URL</span><input class="input-field" name="source_url" required value="${escapeHtml(existing?.source_url || "")}"></label>
       <label class="form-group"><span>Parser Type
-        </span><select class="select-field" name="parser_type" id="source-parser-type">
+        </span><select class="select-field" name="parser_type" id="feed-parser-type">
           <option value="REGEX_LINE" ${existing?.parser_type === "REGEX_LINE" ? "selected" : ""}>REGEX_LINE</option>
           <option value="JSON_PATH" ${existing?.parser_type === "JSON_PATH" ? "selected" : ""}>JSON_PATH</option>
         </select>
       </label>
-      <label class="form-group"><span>Cron Schedule</span><input class="input-field" name="cron_schedule" required placeholder="0 0 * * *" value="${escapeHtml(existing?.cron_schedule || "")}"></label>
-      <label class="form-group"><span>Target Group Name</span><input class="input-field" name="target_group_name" required value="${escapeHtml(existing?.target_group_name || "")}"></label>
-      <label class="form-group"><span>Active
-        </span><select class="select-field" name="is_active">
-          <option value="true" ${existing?.is_active !== false ? "selected" : ""}>true</option>
-          <option value="false" ${existing?.is_active === false ? "selected" : ""}>false</option>
+      <label class="form-group"><span>Bogon Filtering Override
+        </span><select class="select-field" name="skip_bogon_filtering">
+          <option value="" ${bogonOverride == null ? "selected" : ""}>(inherit group setting)</option>
+          <option value="false" ${bogonOverride === false ? "selected" : ""}>Filter (strip bogons)</option>
+          <option value="true" ${bogonOverride === true ? "selected" : ""}>Bypass (allow all)</option>
         </select>
       </label>
       <label class="form-group"><span>User-Agent (optional)</span><input class="input-field" name="user_agent" value="${escapeHtml(userAgent)}"></label>
       <div class="form-group form-group-grow">
         <label>Custom Headers (e.g. an API key some feeds require)</label>
-        <!-- Rows are built by JS (renderSourceHeaderRows). -->
-        <div id="source-headers-list" class="kv-editor" role="group" aria-label="Custom headers"></div>
-        <button type="button" id="source-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
-        <small class="field-hint">Sent verbatim on every fetch of this source. Rows with an empty name are ignored.</small>
+        <!-- Rows are built by JS (renderFeedHeaderRows). -->
+        <div id="feed-headers-list" class="kv-editor" role="group" aria-label="Custom headers"></div>
+        <button type="button" id="feed-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
+        <small class="field-hint">Sent verbatim on every fetch of this feed. Rows with an empty name are ignored.</small>
       </div>
-      <div class="form-group form-group-grow" id="source-parser-config-group">
+      <div class="form-group form-group-grow" id="feed-parser-config-group">
         <label>Parser Config JSON (parser-specific settings only — headers and User-Agent are configured above)</label>
         <textarea class="input-field" name="parser_config_json">${escapeHtml(rest)}</textarea>
         <small class="field-hint">${JSON_PATH_EXAMPLE_HINT}</small>
       </div>
-      <div class="form-group form-group-grow">
-        <button type="button" id="source-test-fetch" class="btn btn-secondary btn-sm">Test Fetch</button>
-        <small class="field-hint">Fetches and parses the URL above with the current settings — nothing is saved, and no target vault is contacted.</small>
-        <div id="source-test-result"></div>
+      <div class="form-group" id="feed-max-age-group" style="display:none">
+        <label>Max Age (Days)</label>
+        <input class="input-field" type="number" min="1" step="1" name="max_age_days" value="${existing?.max_age_days ?? ""}">
+        <small class="field-hint">Discards entries whose last_seen_at is older than this many days. Only takes effect with a last_seen_at/timestamp selector configured above.</small>
       </div>
-      <label class="form-group form-group-grow"><span>Target Vaults (select one or more)
-        </span><select class="select-field" name="targets" multiple size="4">${vaultOptions}</select>
-      </label>
+      <div class="form-group form-group-grow">
+        <button type="button" id="feed-test-fetch" class="btn btn-secondary btn-sm">Test Fetch</button>
+        <small class="field-hint">Fetches and parses the URL above with the current settings — nothing is saved, and no target vault is contacted.</small>
+        <div id="feed-test-result"></div>
+      </div>
       <div class="form-actions">
         <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create"}</button>
-        <button type="button" class="btn btn-cancel" id="source-form-cancel">Cancel</button>
+        <button type="button" class="btn btn-cancel" id="feed-form-cancel">Cancel</button>
       </div>
     </form>`;
 
   // The parser-config box (and its JSON_PATH example) only means anything for JSON_PATH --
   // REGEX_LINE's parser (`src/parsers/regex_line.rs`) ignores its `config` argument entirely, so
-  // showing an editable JSON box for it would be pure confusion, not a smaller feature.
-  function syncParserConfigVisibility() {
-    const isJsonPath = document.getElementById("source-parser-type").value === "JSON_PATH";
-    document.getElementById("source-parser-config-group").style.display = isJsonPath ? "" : "none";
+  // showing an editable JSON box for it would be pure confusion, not a smaller feature. The Max
+  // Age field is additionally gated on the config actually having a last_seen_at/timestamp
+  // selector (Task 4) -- re-checked on every keystroke in the config textarea, not just on parser
+  // type change, since typing the selector in is what makes the field relevant.
+  function syncReactiveFieldVisibility() {
+    const isJsonPath = document.getElementById("feed-parser-type").value === "JSON_PATH";
+    document.getElementById("feed-parser-config-group").style.display = isJsonPath ? "" : "none";
+    const configText = document.querySelector('#feed-form [name="parser_config_json"]').value;
+    document.getElementById("feed-max-age-group").style.display = isJsonPath && hasLastSeenAtSelector(configText) ? "" : "none";
   }
-  document.getElementById("source-parser-type").addEventListener("change", syncParserConfigVisibility);
-  syncParserConfigVisibility();
-
-  if (existing) {
-    const selected = new Set((existing.targets || []).map((t) => t.vault_endpoint_id));
-    slot.querySelectorAll('select[name="targets"] option').forEach((opt) => {
-      if (selected.has(opt.value)) opt.selected = true;
-    });
-  }
+  document.getElementById("feed-parser-type").addEventListener("change", syncReactiveFieldVisibility);
+  document.querySelector('#feed-form [name="parser_config_json"]').addEventListener("input", syncReactiveFieldVisibility);
+  syncReactiveFieldVisibility();
 
   // Key/value editor for custom headers. State lives in `rows`, not the DOM, so re-rendering after
   // an add/remove never loses whatever the user had half-typed in another row — matching the
   // pattern `simply_ip_vault`'s webhook custom-headers editor uses for the same reason.
   const rows = headerRows.length ? headerRows : [];
-  function renderSourceHeaderRows() {
-    const list = document.getElementById("source-headers-list");
+  function renderFeedHeaderRows() {
+    const list = document.getElementById("feed-headers-list");
     if (rows.length === 0) {
       list.innerHTML = '<p class="kv-empty">No custom headers.</p>';
       return;
@@ -627,32 +838,32 @@ function showSourceForm(existing, vaults) {
     list.querySelectorAll(".kv-remove").forEach((btn) => {
       btn.addEventListener("click", () => {
         rows.splice(Number(btn.dataset.index), 1);
-        renderSourceHeaderRows();
+        renderFeedHeaderRows();
       });
     });
   }
-  document.getElementById("source-headers-add").addEventListener("click", () => {
+  document.getElementById("feed-headers-add").addEventListener("click", () => {
     rows.push({ name: "", value: "" });
-    renderSourceHeaderRows();
-    const inputs = document.querySelectorAll("#source-headers-list .kv-name");
+    renderFeedHeaderRows();
+    const inputs = document.querySelectorAll("#feed-headers-list .kv-name");
     inputs[inputs.length - 1]?.focus();
   });
-  renderSourceHeaderRows();
+  renderFeedHeaderRows();
 
-  document.getElementById("source-test-fetch").addEventListener("click", async () => {
-    const resultBox = document.getElementById("source-test-result");
-    const sourceUrl = document.querySelector('#source-form [name="source_url"]').value.trim();
-    const parserType = document.getElementById("source-parser-type").value;
+  document.getElementById("feed-test-fetch").addEventListener("click", async () => {
+    const resultBox = document.getElementById("feed-test-result");
+    const sourceUrl = document.querySelector('#feed-form [name="source_url"]').value.trim();
+    const parserType = document.getElementById("feed-parser-type").value;
     if (!sourceUrl) {
       toast("Enter a Source URL first", "error");
       return;
     }
-    const restConfigRaw = document.querySelector('#source-form [name="parser_config_json"]').value;
-    const userAgentValue = document.querySelector('#source-form [name="user_agent"]').value;
+    const restConfigRaw = document.querySelector('#feed-form [name="parser_config_json"]').value;
+    const userAgentValue = document.querySelector('#feed-form [name="user_agent"]').value;
     const mergedConfig = buildMergedParserConfig(rows, userAgentValue, restConfigRaw);
     if (mergedConfig === null) return; // buildMergedParserConfig already toasted the parse error.
 
-    const btn = document.getElementById("source-test-fetch");
+    const btn = document.getElementById("feed-test-fetch");
     btn.disabled = true;
     btn.textContent = "Testing…";
     resultBox.innerHTML = "";
@@ -680,33 +891,30 @@ function showSourceForm(existing, vaults) {
     }
   });
 
-  document.getElementById("source-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
-  document.getElementById("source-form").addEventListener("submit", async (e) => {
+  document.getElementById("feed-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
+  document.getElementById("feed-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const targets = Array.from(e.target.querySelector('select[name="targets"]').selectedOptions).map((o) => ({
-      vault_endpoint_id: o.value,
-    }));
 
     const mergedConfig = buildMergedParserConfig(rows, fd.get("user_agent"), fd.get("parser_config_json"));
     if (mergedConfig === null) return; // buildMergedParserConfig already toasted the parse error.
 
+    const bogonRaw = fd.get("skip_bogon_filtering");
     const payload = {
       name: fd.get("name"),
       source_url: fd.get("source_url"),
       parser_type: fd.get("parser_type"),
-      cron_schedule: fd.get("cron_schedule"),
-      target_group_name: fd.get("target_group_name"),
-      is_active: fd.get("is_active") === "true",
       parser_config_json: Object.keys(mergedConfig).length ? JSON.stringify(mergedConfig) : null,
-      targets,
+      max_age_days: fd.get("max_age_days") ? parseInt(fd.get("max_age_days"), 10) : null,
+      skip_bogon_filtering: bogonRaw === "" ? null : bogonRaw === "true",
     };
     try {
-      if (existing) await client.patch("/api/sources/" + existing.id, payload);
-      else await client.post("/api/sources", payload);
-      toast("Source saved", "success");
+      if (existing) await client.patch(`/api/destination-groups/${group.id}/feeds/${existing.id}`, payload);
+      else await client.post(`/api/destination-groups/${group.id}/feeds`, payload);
+      toast("Feed saved", "success");
       slot.innerHTML = "";
-      await renderSources();
+      const refreshed = await client.get(`/api/destination-groups/${group.id}`);
+      await renderFeedsView(refreshed, vaults);
     } catch (err) {
       toast("Save failed: " + err.message, "error");
     }

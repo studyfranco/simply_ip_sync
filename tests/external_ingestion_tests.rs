@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-use simply_ip_sync::entities::{external_source, external_source_vault_target, vault_endpoint};
+use simply_ip_sync::entities::{destination_group, destination_group_vault_target, external_source, vault_endpoint};
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -34,6 +34,8 @@ async fn insert_vault(conn: &sea_orm::DatabaseConnection, name: &str, target_url
     id
 }
 
+/// Inserts a `destination_groups` row with one child feed pointed at `source_url`, and returns the
+/// *group's* id — `jobs::external_ingestion::run` operates on groups, never on a bare feed.
 async fn insert_source(conn: &sea_orm::DatabaseConnection, source_url: &str, default_group: &str) -> Uuid {
     insert_source_with_mode(conn, source_url, default_group, "upsert").await
 }
@@ -44,35 +46,48 @@ async fn insert_source_with_mode(
     default_group: &str,
     mode: &str,
 ) -> Uuid {
-    let id = Uuid::new_v4();
+    let group_id = Uuid::new_v4();
     let now = Utc::now();
-    let model = external_source::ActiveModel {
-        id: Set(id),
-        name: Set(format!("source-{id}")),
-        source_url: Set(source_url.to_owned()),
-        parser_type: Set("REGEX_LINE".to_owned()),
-        parser_config_json: Set(None),
-        cron_schedule: Set("0 0 * * *".to_owned()),
+    let group = destination_group::ActiveModel {
+        id: Set(group_id),
+        name: Set(format!("group-{group_id}")),
         target_group_name: Set(default_group.to_owned()),
+        cron_schedule: Set("0 0 * * *".to_owned()),
         mode: Set(mode.to_owned()),
         is_active: Set(true),
+        skip_bogon_filtering: Set(false),
         last_run_at: Set(None),
         owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     };
-    model.insert(conn).await.expect("insert source");
-    id
+    group.insert(conn).await.expect("insert destination group");
+
+    let feed = external_source::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        destination_group_id: Set(group_id),
+        name: Set(format!("feed-{group_id}")),
+        source_url: Set(source_url.to_owned()),
+        parser_type: Set("REGEX_LINE".to_owned()),
+        parser_config_json: Set(None),
+        max_age_days: Set(None),
+        skip_bogon_filtering: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    feed.insert(conn).await.expect("insert feed");
+
+    group_id
 }
 
 async fn insert_target(
     conn: &sea_orm::DatabaseConnection,
-    source_id: Uuid,
+    group_id: Uuid,
     vault_id: Uuid,
     group_override: Option<&str>,
 ) {
-    let row = external_source_vault_target::ActiveModel {
-        external_source_id: Set(source_id),
+    let row = destination_group_vault_target::ActiveModel {
+        destination_group_id: Set(group_id),
         vault_endpoint_id: Set(vault_id),
         target_group_name: Set(group_override.map(str::to_owned)),
     };
@@ -92,7 +107,7 @@ async fn per_target_group_name_override_is_honored_independently_of_the_default(
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/feed.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("203.0.113.9\n"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("93.184.216.9\n"))
         .mount(&feed_mock)
         .await;
 
@@ -130,14 +145,17 @@ async fn per_target_group_name_override_is_honored_independently_of_the_default(
     );
 }
 
+/// A real, non-reserved /16 (historically `example.com`'s, not RFC 1918/loopback/bogon) — plenty
+/// of address space for up to 65,536 distinct synthetic entries, none of which the new
+/// `bogon::sanitize` pre-push filter (added alongside these tests' own session) would strip.
 fn synth_ip(i: u32) -> String {
-    format!("10.{}.{}.{}", (i / 65536) % 256, (i / 256) % 256, i % 256)
+    format!("93.184.{}.{}", (i / 256) % 256, i % 256)
 }
 
 /// Prompted by a bug audited in `example/simply_ip_vault`'s own test suite this session
 /// (2026-08-17 cross-project test audit — see `AGENT_NOTES.MD`): its `POST /api/records/batch`
 /// rejects a whole batch containing two entries that are the *same* address in different notation
-/// (`203.0.113.60` and `203.0.113.60/32`). A feed mixing bare-IP and CIDR-singleton notation for
+/// (`93.184.216.60` and `93.184.216.60/32`). A feed mixing bare-IP and CIDR-singleton notation for
 /// the same address would trip that rejection unless deduplication happens on *canonical* form,
 /// not raw string equality. `jobs::external_ingestion::execute`'s dedup (`seen.insert(r.clone())`)
 /// operates on whatever each `FeedParser` already returned — and every parser already normalizes
@@ -151,7 +169,7 @@ async fn mixed_notation_duplicate_addresses_canonicalize_and_dedupe_to_one_recor
 
     // Three notations of two addresses: a bare IPv4 and its /32 CIDR-singleton form (equal), and
     // an unabbreviated vs. abbreviated IPv6 spelling of the same address (also equal).
-    let feed_body = "203.0.113.60\n203.0.113.60/32\n2001:0db8::0001\n2001:db8::1\n";
+    let feed_body = "93.184.216.60\n93.184.216.60/32\n2606:4700:4700:0000:0000:0000:0000:0001\n2606:4700:4700::1\n";
 
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -184,7 +202,7 @@ async fn mixed_notation_duplicate_addresses_canonicalize_and_dedupe_to_one_recor
         .iter()
         .map(|r| r["target_address"].as_str().expect("target_address").to_owned())
         .collect();
-    assert_eq!(addresses, vec!["203.0.113.60".to_owned(), "2001:db8::1".to_owned()], "each pair must collapse to its single canonical form");
+    assert_eq!(addresses, vec!["93.184.216.60".to_owned(), "2606:4700:4700::1".to_owned()], "each pair must collapse to its single canonical form");
 }
 
 /// Task 4: a `full_replace` source whose feed is large enough to need multiple chunks (12,000
@@ -328,9 +346,9 @@ async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_par
         "bad_target's own chunk 1 legitimately carried full_replace before the run failed on chunk 2"
     );
 
-    let source = external_source::Entity::find_by_id(source_id).one(&conn).await.expect("query").expect("source exists");
+    let group = destination_group::Entity::find_by_id(source_id).one(&conn).await.expect("query").expect("group exists");
     assert!(
-        source.last_run_at.is_some(),
+        group.last_run_at.is_some(),
         "last_run_at is unconditional by design — it means 'the job executed', not 'the job succeeded'; \
          there is no incremental cursor here for a partial failure to corrupt"
     );
@@ -393,26 +411,38 @@ async fn html_response_via_json_path_parser_is_a_hard_parse_failure() {
         .mount(&feed_mock)
         .await;
 
-    let id = Uuid::new_v4();
     let now = Utc::now();
-    let source = external_source::ActiveModel {
-        id: Set(id),
-        name: Set(format!("json-source-{id}")),
-        source_url: Set(format!("{}/feed.json", feed_mock.uri())),
-        parser_type: Set("JSON_PATH".to_owned()),
-        parser_config_json: Set(Some(r#"{"ip_field":"ip"}"#.to_owned())),
-        cron_schedule: Set("0 0 * * *".to_owned()),
+    let group_id = Uuid::new_v4();
+    let group = destination_group::ActiveModel {
+        id: Set(group_id),
+        name: Set(format!("json-group-{group_id}")),
         target_group_name: Set("group".to_owned()),
+        cron_schedule: Set("0 0 * * *".to_owned()),
         mode: Set("upsert".to_owned()),
         is_active: Set(true),
+        skip_bogon_filtering: Set(false),
         last_run_at: Set(None),
         owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     };
+    group.insert(&conn).await.expect("insert destination group");
+
+    let source = external_source::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        destination_group_id: Set(group_id),
+        name: Set(format!("json-source-{group_id}")),
+        source_url: Set(format!("{}/feed.json", feed_mock.uri())),
+        parser_type: Set("JSON_PATH".to_owned()),
+        parser_config_json: Set(Some(r#"{"target_address":"$.ip"}"#.to_owned())),
+        max_age_days: Set(None),
+        skip_bogon_filtering: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
     source.insert(&conn).await.expect("insert source");
 
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, id).await.expect("job runs without panicking");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id).await.expect("job runs without panicking");
     assert_eq!(summary.status, "FAILED");
     assert_eq!(summary.items_processed, 0);
     assert!(summary.error_message.is_some());
@@ -426,7 +456,7 @@ async fn html_response_via_json_path_parser_is_a_hard_parse_failure() {
 async fn gzip_compressed_feed_response_is_transparently_decompressed() {
     let (conn, state, _master) = common::setup().await;
 
-    let plain = b"198.51.100.20\n198.51.100.21\n";
+    let plain = b"93.184.216.20\n93.184.216.21\n";
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(plain).expect("write to gzip encoder");
     let compressed = encoder.finish().expect("finish gzip stream");
@@ -552,9 +582,9 @@ async fn non_utf8_feed_body_does_not_crash_the_job_and_extracts_the_valid_ips() 
 
     let mut body = Vec::new();
     body.extend_from_slice(b"# Liste \xE9 jour (Latin-1, pas UTF-8)\n"); // raw Latin-1 'é'
-    body.extend_from_slice(b"203.0.113.44\n");
+    body.extend_from_slice(b"93.184.216.44\n");
     body.extend_from_slice(b"; commentaire avec un caract\xE8re \xE9trange\n"); // raw Latin-1 'è'/'é'
-    body.extend_from_slice(b"2001:db8::44\n");
+    body.extend_from_slice(b"2606:4700:4700::44\n");
 
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -588,7 +618,7 @@ async fn non_utf8_feed_body_does_not_crash_the_job_and_extracts_the_valid_ips() 
         .iter()
         .map(|r| r["target_address"].as_str().expect("target_address").to_owned())
         .collect();
-    assert_eq!(addresses, vec!["203.0.113.44".to_owned(), "2001:db8::44".to_owned()]);
+    assert_eq!(addresses, vec!["93.184.216.44".to_owned(), "2606:4700:4700::44".to_owned()]);
 }
 
 /// Task 3: a remote target that accepts the TCP connection but never responds (or responds far
@@ -602,7 +632,7 @@ async fn slow_target_vault_is_aborted_by_the_client_timeout_not_left_hanging() {
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/feed.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("203.0.113.50\n"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("93.184.216.50\n"))
         .mount(&feed_mock)
         .await;
 

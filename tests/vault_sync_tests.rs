@@ -29,6 +29,13 @@ async fn insert_vault(conn: &sea_orm::DatabaseConnection, name: &str, target_url
     id
 }
 
+/// `skip_bogon_filtering: true` throughout this file's own task constructors: every test here is
+/// about delta-replication *mechanics* (pagination, tombstones, partial failure, multi-vault
+/// fan-out), which use RFC 5737/1918 documentation-range addresses as arbitrary placeholder
+/// content — exactly the ranges `bogon::sanitize` now strips by default. Opting these fixtures out
+/// keeps that placeholder convention working; the filter itself is verified separately by
+/// `pre_push_bogon_filtering_strips_reserved_addresses_unless_the_task_opts_out` below, which
+/// deliberately sets `skip_bogon_filtering: false` (the real default) and checks its actual effect.
 async fn insert_task(
     conn: &sea_orm::DatabaseConnection,
     source_vault_id: Uuid,
@@ -46,6 +53,7 @@ async fn insert_task(
         last_sync_at: Set(None),
         mode: Set("upsert".to_owned()),
         is_active: Set(true),
+        skip_bogon_filtering: Set(true),
         owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
@@ -79,6 +87,7 @@ async fn insert_task_multi(
         last_sync_at: Set(None),
         mode: Set("upsert".to_owned()),
         is_active: Set(true),
+        skip_bogon_filtering: Set(true),
         owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
@@ -161,6 +170,96 @@ async fn multi_vault_sync_pushes_to_every_target_on_success() {
     let after = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
     let last_sync_at = after.last_sync_at.expect("last_sync_at must advance once every target succeeds");
     assert!(last_sync_at >= job_start, "last_sync_at must be set to (at least) the job's own start time");
+}
+
+/// Task 1: a delta containing a mix of real and bogon (loopback/private/reserved) addresses must
+/// have the bogon entries stripped before push when `skip_bogon_filtering` is `false` (the real
+/// default this test uses, unlike every other task constructor in this file — see `insert_task`'s
+/// own doc comment). `items_processed` must reflect what was actually pushed (post-filter), and
+/// the sanitized count must be reported in `sync_logs`.
+#[tokio::test]
+async fn pre_push_bogon_filtering_strips_reserved_addresses_unless_the_task_opts_out() {
+    let (conn, state, _master) = common::setup().await;
+
+    let source_mock = MockServer::start().await;
+    let target_mock = MockServer::start().await;
+
+    let delta = serde_json::json!([
+        {
+            "id": Uuid::new_v4(), "target_address": "8.8.8.8", "group_name": "source-group",
+            "is_deleted": false, "created_at": "2026-01-01T00:00:00", "updated_at": "2026-01-01T00:00:00",
+            "last_seen_at": "2026-01-01T00:00:00"
+        },
+        {
+            "id": Uuid::new_v4(), "target_address": "127.0.0.1", "group_name": "source-group",
+            "is_deleted": false, "created_at": "2026-01-01T00:00:00", "updated_at": "2026-01-01T00:00:00",
+            "last_seen_at": "2026-01-01T00:00:00"
+        },
+        {
+            "id": Uuid::new_v4(), "target_address": "10.0.0.5", "group_name": "source-group",
+            "is_deleted": false, "created_at": "2026-01-01T00:00:00", "updated_at": "2026-01-01T00:00:00",
+            "last_seen_at": "2026-01-01T00:00:00"
+        }
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(delta))
+        .mount(&source_mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "created": 1, "updated": 0, "restored": 0, "locked_skipped": 0, "soft_deleted": 0, "linked": 1
+        })))
+        .mount(&target_mock)
+        .await;
+
+    let source_id = insert_vault(&conn, "bogon-source", &source_mock.uri()).await;
+    let target_id = insert_vault(&conn, "bogon-target", &target_mock.uri()).await;
+
+    let task_id = Uuid::new_v4();
+    let now = Utc::now();
+    let task = vault_sync_task::ActiveModel {
+        id: Set(task_id),
+        name: Set(format!("bogon-filter-task-{task_id}")),
+        source_vault_id: Set(source_id),
+        source_group_name: Set("source-group".to_owned()),
+        target_group_name: Set("target-group".to_owned()),
+        cron_schedule: Set("0 0 * * *".to_owned()),
+        last_sync_at: Set(None),
+        mode: Set("upsert".to_owned()),
+        is_active: Set(true),
+        skip_bogon_filtering: Set(false), // the real default -- deliberately not opted out here
+        owner_key_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    task.insert(&conn).await.expect("insert task");
+    vault_sync_task_target::ActiveModel {
+        vault_sync_task_id: Set(task_id),
+        target_vault_id: Set(target_id),
+        target_group_name: Set(None),
+    }
+    .insert(&conn)
+    .await
+    .expect("insert task target");
+
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    assert_eq!(summary.status, "SUCCESS");
+    assert_eq!(summary.items_processed, 1, "only the one real, non-bogon address must survive the pre-push filter");
+    let message = summary.error_message.expect("the sanitized count must be reported");
+    assert!(message.contains('2'), "must report exactly 2 addresses sanitized, got: {message}");
+
+    let received = target_mock.received_requests().await.expect("recording enabled");
+    assert_eq!(received.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    let addresses: Vec<String> = body["records"]
+        .as_array()
+        .expect("records array")
+        .iter()
+        .map(|r| r["target_address"].as_str().expect("target_address").to_owned())
+        .collect();
+    assert_eq!(addresses, vec!["8.8.8.8".to_owned()], "the loopback and private addresses must never reach the target");
 }
 
 /// Partial failure across multiple targets: one target accepting the batch while another fails
@@ -364,6 +463,7 @@ async fn per_target_group_name_override_is_honored_independently_of_the_default(
         last_sync_at: Set(None),
         mode: Set("upsert".to_owned()),
         is_active: Set(true),
+        skip_bogon_filtering: Set(true),
         owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
@@ -756,6 +856,7 @@ async fn insert_alpha_task(conn: &sea_orm::DatabaseConnection, source_vault_id: 
         last_sync_at: Set(None),
         mode: Set("upsert".to_owned()),
         is_active: Set(true),
+        skip_bogon_filtering: Set(true),
         owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),

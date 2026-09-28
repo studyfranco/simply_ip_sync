@@ -91,7 +91,6 @@ async fn execute(
         }
     };
 
-    let items_processed = delta.len();
     let mapped: Vec<BatchRecordInput> = delta
         .into_iter()
         .map(|record| BatchRecordInput {
@@ -104,6 +103,22 @@ async fn execute(
             deleted_at: record.deleted_at,
         })
         .collect();
+
+    // Same pre-push sanitization `jobs::external_ingestion` applies, for the same reason: a
+    // source vault's own group can accumulate a loopback/private/link-local entry (a bad manual
+    // ban), and relaying it on unchanged just converts a target's own `400` into this task's own
+    // `sync_logs` failure instead of preventing it. `task.skip_bogon_filtering` bypasses this for
+    // a task deliberately replicating internal/lab address space between vaults.
+    let (mapped, bogons_removed) = if task.skip_bogon_filtering {
+        (mapped, 0usize)
+    } else {
+        let addresses: Vec<String> = mapped.iter().map(|r| r.target_address.clone()).collect();
+        let (kept, removed) = crate::bogon::sanitize(addresses);
+        let kept: std::collections::HashSet<&str> = kept.iter().map(String::as_str).collect();
+        let filtered = mapped.into_iter().filter(|r| kept.contains(r.target_address.as_str())).collect();
+        (filtered, removed)
+    };
+    let items_processed = mapped.len();
 
     let chunks = chunk_records(mapped, MAX_BATCH_SIZE);
     let mut chunks_sent = 0i32;
@@ -149,13 +164,19 @@ async fn execute(
         "FAILED"
     };
 
+    let mut message_parts = Vec::new();
+    if bogons_removed > 0 {
+        message_parts.push(format!("{bogons_removed} bogon/private/reserved address(es) sanitized before push"));
+    }
+    message_parts.extend(errors);
+
     (
         JobSummary {
             status,
             items_processed: items_processed as i32,
             chunks_sent,
             duration_ms: start.elapsed().as_millis() as i32,
-            error_message: if errors.is_empty() { None } else { Some(errors.join("; ")) },
+            error_message: if message_parts.is_empty() { None } else { Some(message_parts.join("; ")) },
         },
         all_succeeded,
     )

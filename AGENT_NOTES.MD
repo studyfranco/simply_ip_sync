@@ -2264,3 +2264,213 @@ no such blocklist today, and a preview endpoint gated by the identical right doe
 model, only when in the workflow the same fetch can happen. Did not add a Rust-side regression test
 for the parser-type-conditional visibility or the mapping example's exact wording — same JS-runtime
 limitation noted in Sessions 17/21, mitigated here by the live-Chromium verification instead.
+
+## Session 23 (2026-09-28): pre-push bogon filtering, Destination Groups (1-to-N feeds, concurrent fetch), `$.`-prefixed JSON_PATH selectors, SANS ISC compatibility, and sessionStorage credential persistence
+
+Seven bundled requests in one structured task, the largest single session to date. Read
+`AGENT.MD`/`RBAC_MODEL.md`/`SCHEMA.MD`/`FILE_MAP.MD` fresh before starting, per their own mandate,
+and audited both `example/simply_ip_exporter` (bogon filtering pattern) and `example/simply_ip_vault`
+(the `$name` webhook convention the task asked to reconcile `$.` selectors against) directly rather
+than relying solely on a delegated summary, per the user's explicit "You can see what example/ do."
+
+### 1. Pre-push bogon filtering (`src/bogon.rs`)
+
+New module, modeled on `simply_ip_exporter`'s `src/ipfilter.rs`: hand-rolled CIDR literal tables
+(RFC 1918, loopback, a broader bogon set — TEST-NET ranges, link-local, CGNAT, multicast, etc.),
+`is_bogon(&IpNetwork) -> bool`, `sanitize(records) -> (kept, removed_count)`. Applied at a different
+pipeline stage than the peer: the peer filters at *serve*-time with three independently toggleable
+flags (per output endpoint); here it's one combined `skip_bogon_filtering` toggle applied *before*
+a batch push, since the concern is "don't hand a target vault garbage it will reject with a `400`,"
+not "let an operator redact categories from a public feed." Wired into both pipelines:
+`destination_groups.skip_bogon_filtering` (group-level, per-feed overridable — see §3) and
+`vault_sync_tasks.skip_bogon_filtering` (new column, `m20260928_034145_vault_sync_task_bogon_filtering`).
+Default is `false` (filtering on) in both places. 8 unit tests in `bogon.rs` itself plus a new
+integration test, `pre_push_bogon_filtering_strips_reserved_addresses_unless_the_task_opts_out`
+(`tests/vault_sync_tests.rs`), seeding a mixed real/bogon delta and asserting only the real address
+survives with the real default (`skip_bogon_filtering: false`).
+
+**This one default-on change broke a wide swath of pre-existing tests**, because RFC 5737/1918
+documentation-range addresses (`10.x.x.x`, `203.0.113.x`, `198.51.100.x`, `2001:db8::x`) were used
+throughout the test suite as arbitrary placeholder content — now silently stripped by the new
+filter. Fixed two different ways depending on what each address was actually testing:
+`external_ingestion_tests.rs` (bogon status was incidental to what the test checked) got its
+fixture addresses swapped for genuinely non-reserved ones (`93.184.x.x`, `2606:4700:4700::x`);
+`vault_sync_tests.rs`'s four shared task-constructor fixtures (where the placeholder-range choice
+is baked into many tests' setup) instead got `skip_bogon_filtering: Set(true)` with an explanatory
+doc comment, and exactly one new dedicated test (above) exercises the real default. Also caught a
+test that was passing for the *wrong* reason in a related pass (see §3's referential-integrity note
+below) — a general reminder that a schema change can make an old assertion true by accident.
+
+### 2. Destination Groups — 1-to-N hierarchy with concurrent per-feed fetch
+
+`external_sources` (flat, directly RBAC-managed, directly-triggerable) split into a 2-tier model:
+`destination_groups` (new table — owns `cron_schedule`, `mode`, `is_active`,
+`skip_bogon_filtering`, target vaults, RBAC ownership) owning 1-to-N child **feeds** (the
+reshaped `external_sources`: `destination_group_id`, `name`, `source_url`, `parser_type`,
+`parser_config_json`, `max_age_days`, an optional per-feed `skip_bogon_filtering` override). A feed
+carries no RBAC of its own — every feed-management guard resolves to the *owning group's*
+`RESOURCE_DESTINATION_GROUP` permission row (`load_feed_in_group`, `404` on a feed/group id
+mismatch — oracle discipline). `src/jobs/external_ingestion.rs`'s `execute` now fetches every
+feed in a group **concurrently** (`tokio::spawn` per feed collected into a plain
+`Vec<JoinHandle>`, deliberately not adding the `futures` crate for `join_all` — one more
+dependency for what a hand-rolled join loop does just as well here), applies each feed's own
+temporal filter then bogon filter *before* merging into the group's shared dedup `HashSet` (so a
+feed's own override is honored correctly regardless of merge order), then dedupes, chunks, and
+pushes once per group. Dedup is **exact string match only**, per the task's explicit instruction —
+no CIDR supernetting/merging of overlapping or adjacent subnets, even though that would shrink the
+pushed set for some real feed combinations; merging address ranges is a materially different
+(and riskier — it can silently widen what's banned beyond what any single feed actually listed)
+feature than the one asked for.
+
+Migration `m20260928_033617_destination_groups`: creates both new tables, migrates every existing
+`external_sources` row 1:1 into a new `destination_groups` row **reusing the same id** (so nothing
+downstream needs a lookup table to find "the group this source became"), rebuilds `external_sources`
+into its child-feed shape (SQLite: full create-copy-drop-rename, no `ALTER TABLE...DROP COLUMN`
+there; Postgres/MySQL: direct `ADD`/`DROP COLUMN`), and drops the now-orphaned
+`external_source_vault_targets`. Followed the established `table_definition(flag: bool)` shared-
+function idiom from `m20260818_010217_audit_attribution_not_null` so the create and rebuild paths
+can't describe different tables.
+
+**Regression caught by mutation testing, not by review:** the new concurrent multi-feed `execute()`
+lost the old single-feed code's implicit "any fetch failure = hard `FAILED`" behavior — the old
+code `return`ed early on a fetch error, before the `any_success`/targets logic ever ran. With
+`any_success = targets.is_empty()` defaulting to `true` when zero target vaults are configured, a
+single feed's hard failure (a decompression bomb, an HTML block page defeating `JSON_PATH`) was
+wrongly reported `PARTIAL` instead of `FAILED`. Fixed by deriving
+`all_feeds_failed = !feeds.is_empty() && feed_error_count == feeds.len()` and checking it first —
+confirmed by re-running the three tests this broke
+(`html_response_via_json_path_parser_is_a_hard_parse_failure`,
+`oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buffering_it_fully`,
+`oversized_zip_member_is_rejected_as_a_decompression_bomb`), all now passing again.
+
+API/RBAC: `RESOURCE_EXTERNAL_SOURCE` → `RESOURCE_DESTINATION_GROUP` (`support.rs`). A hardcoded
+literal duplicate of this constant was initially missed by the rename — `keys.rs`'s
+`GrantPermissionPayload.resource_type` validation had its own separate `"external_source"` string
+check — caught by 4 failing RBAC compliance tests (`r1_`/`r2_`/`r5_`/`r7_`, all showing unexpected
+`400`s) rather than by the initial grep pass; a reminder that a "rename this constant" refactor
+still needs a full-text grep for the *string value*, not just the identifier. New routes: see
+`API_REFERENCE.md`'s "Destination Groups & Feeds" section (rewritten this session) for the full
+list; `scheduler.rs`'s `upsert_source`/`remove_source` method names were deliberately **kept** (not
+renamed to `upsert_group`) for continuity with the sibling `upsert_task`/`remove_task` — both name
+the *kind of scheduled thing*, not the current entity name.
+
+`referential_integrity.rs`'s `junction_row_with_a_dangling_foreign_key_is_rejected_at_insert_time`
+was passing for the wrong reason after the migration dropped `external_source_vault_targets`
+entirely — the test's `assert!(result.is_err())` still held, but only because the table no longer
+existed, not because of genuine FK enforcement. Rewrote it against
+`destination_groups`/`destination_group_vault_targets` so it exercises the real constraint again.
+
+### 3. `$.`-prefixed `JSON_PATH` selectors, reconciled against `simply_ip_vault`'s unrelated `$name` convention
+
+The task's own example (`"$.ipAddress"`) is ordinary JSONPath root-accessor syntax, but its prose
+also said to "match the variable naming conventions established in `simply_ip_vault`." Audited
+`simply_ip_vault/src/dispatch.rs` directly before assuming the two were the same thing: its `$name`
+convention (`$target_address`, `$cause`, `$group_name`, etc. — bare names, no dot) is an
+**output**-side webhook-template substitution language over a fixed, known set of event fields —
+there is nothing there to borrow for **input**-side field *selection* into an arbitrary third-party
+JSON document's own, unknown shape, which is what this parser configuration actually needs. Chose
+`$.` anyway, but as the ordinary JSONPath "root object" convention, and documented the reconciliation
+explicitly in `json_path.rs`'s own doc comment rather than silently picking an interpretation and
+letting a future reader wonder whether it's supposed to be the vault's convention or not.
+`target_address` (alias `ip`) is mandatory, rejected with `400` at feed save time if missing or not
+`$.`-prefixed (`validate_config`, called from `sources.rs`'s `create_feed`/`update_feed`); optional
+`last_seen_at` (alias `timestamp`) feeds `max_age_days` temporal filtering.
+
+### 4. SANS ISC compatibility (`REGEX_LINE` netblock notation, `JSON_PATH` date format)
+
+Verified both explicitly-named targets against the real live endpoints (never hit from an
+automated test, per `AGENT.MD`'s "local fixtures... never against the live rate-limited source"
+rule — this was a one-time, human-directed verification pass, same discipline as Session 22's
+AbuseIPDB fixtures) before writing the parser logic:
+- `https://isc.sans.edu/block.txt` is tab-delimited, 7 columns:
+  `<start-of-netblock>\t<end-of-netblock>\t<prefix-length>\t<targets>\t<org>\t<country>\t<contact>`.
+  A plain whole-line regex scan gets this wrong — it independently matches both the start *and*
+  end address as two bogus `/32`s and never notices the `24` is a prefix length meant to combine
+  with the first column. `regex_line.rs` now special-cases two whitespace-split shapes before
+  falling back to the generic scan: the simple `<ip>\t<n>` pair, and the real 3-or-more-column SANS
+  ISC shape (first field a bare IP, third a bare small integer) — both fold to `<ip>/<n>`. A bare
+  integer can never itself parse as an IP, so there's no ambiguity with an ordinary
+  two-address-per-line feed (FireHOL-style), which still falls through to the generic scan.
+- `https://isc.sans.edu/api/threatlist/erratasec?json` (the bare endpoint is XML; `?json` yields a
+  clean top-level array `[{"ipv4": "...", "date": "...", "lastseen": "..."}]`) reports `lastseen`
+  as a bare `YYYY-MM-DD` date, not RFC 3339 like AbuseIPDB. `json_path.rs`'s `parse_last_seen_at`
+  tries RFC 3339 first, falls back to the bare-date form, and treats anything else as `None` for
+  that record (kept, just without an age to filter on) rather than failing the whole feed.
+- Inline comments (content after `#`/`;`/`//` appearing mid-line, not just line-starting) are now
+  also stripped — none of the three marker sequences can appear inside a valid IP/CIDR token, so
+  this never truncates real data.
+
+### 5. Task 2 — inter-vault sync verification: no bug found, not a fabricated fix
+
+The task's literal ask was to "fix any underlying issue causing ITEMS: 0 when delta records
+actually exist." Investigated rather than assumed a fix was needed: a pre-existing test,
+`tombstones_propagate_and_last_sync_at_advances_on_success` (present before this session, seeding
+an active record **and** a soft-deleted one), already asserts `items_processed == 2` and passes —
+proving the pipeline correctly reports non-zero items whenever records genuinely exist. The
+production `ITEMS: 0` logs referenced in an earlier conversation are therefore legitimate behavior
+(nothing new since the last sync, or a genuinely empty remote group), not a code defect. No change
+was made to the pipeline logic for this task item — inventing a "fix" for a bug that doesn't exist
+would have been worse than doing nothing.
+
+### 6. WebUI: Destination Groups & Feeds, and sessionStorage credential persistence
+
+`static/app.js`: `renderSources()` now renders the Destination Groups table; selecting a group
+swaps the full `#tab-sources` panel to `renderFeedsView(group, vaults)` (a "← Back to Destination
+Groups" button returns to the group list) rather than a modal or a second tab — the tab's `data-tab`/
+`id` pair stayed `sources`/`tab-sources` (renaming it would be pure churn against
+`tests/source_hygiene.rs`'s pairing invariant for no behavioral gain; only the button's *label*
+changed, to "Destination Groups"). `showFeedForm` carries a tri-state bogon-filtering-override
+select (inherit the group's setting / bypass / enforce) and reactively shows "Max Age (Days)" only
+when `hasLastSeenAtSelector()` finds a valid `$.`-prefixed `last_seen_at`/`timestamp` mapping in the
+feed's `JSON_PATH` config — there's nothing to age-filter on without one.
+
+**Credential persistence — an explicit security decision, not a default.** The task's literal ask
+was `localStorage`, which directly contradicts this page's own documented design (the login
+screen's own copy: "kept only in this tab's memory"). Flagged this to the user via
+`AskUserQuestion` before implementing anything — persisting indefinitely (surviving a full browser
+restart, widening XSS blast radius to every future tab) versus session-scoped (survives a reload,
+dies with the tab/browser close). **The user chose `sessionStorage`.** Implemented as
+`saveSessionCredentials`/`loadSessionCredentials`/`clearSessionCredentials` (all try/catch-wrapped,
+matching the existing `localStorage`-for-the-API-base-override pattern's defensive style),
+`attemptSignIn()` factored out as the one shared path between the login form's submit handler and
+a new `restoreSessionOnLoad()` IIFE run on `DOMContentLoaded` (any restore failure falls through
+silently to the ordinary login screen, clearing the stale saved session). The Logout button now
+also calls `clearSessionCredentials()`, so logging out actually ends the saved session rather than
+merely hiding the dashboard behind a fresh login screen that would silently restore on the next
+reload.
+
+### Verification
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 244 tests across 18 binaries, all green, 0 failed, after fixing one file missed by
+  the initial `$.`-selector rename pass — `tests/source_test_fetch_tests.rs`'s two
+  real-AbuseIPDB-fixture `JSON_PATH` tests still used the old `ip_field` key and started failing
+  with `400` (config validation correctly rejecting the now-invalid shape) the moment
+  `validate_feed_parser`/`validate_config` went live; updated both to `target_address: "$."`-
+  prefixed selectors.
+- Live headless-Chromium verification (as in Session 22, injected script backed up/restored,
+  confirmed clean via `git diff` after — briefly lost two genuine uncommitted edits to
+  `index.html` to an over-eager `git checkout --` mid-session, caught immediately from the diff
+  output and reapplied): logged in, created a destination group, added a feed, used Test Fetch
+  against a local feed server, triggered the group, confirmed the aggregated/deduplicated push
+  reached the mock target vault. Required raising the outer wall-clock `timeout` to 90s — the
+  combination of `--virtual-time-budget` and genuinely outstanding network I/O (Test Fetch, a real
+  trigger) needs more real wall-clock time than the virtual-time-budget alone suggests, a fragility
+  noted earlier in this project's history too.
+- Updated `SCHEMA.MD`, `RBAC_MODEL.md`, `API_REFERENCE.md`, `FILE_MAP.MD`, `AGENT.MD`, `README.md`
+  for the new route/table/payload/parser-config shapes, per `AGENT.MD`'s "must be regenerated, not
+  left stale" documentation mandate.
+- `./scripts/test_e2e.sh` needed a substantial rewrite (~35 `/api/sources` call sites → the
+  two-step group-then-feed shape across cron validation, resilience, ZIP/JSONL/HTML-masquerade
+  fixture, live-feed, and hardening sections) — delegated to a background agent working in an
+  isolated worktree given the scale, then merged back. **231/231 against the real compiled
+  binary.** The agent surfaced a genuine cross-cutting interaction the task description hadn't
+  called out: `vault_sync_tasks.skip_bogon_filtering` (not just the destination-group side) meant
+  several e2e fixtures using RFC 1918/documentation-range placeholder addresses for their mock
+  sync-task delta data would now have that data silently stripped by the new default-on filter —
+  fixed the same way as the Rust test suite (§1 above), by setting `skip_bogon_filtering: true` on
+  the affected fixtures with an explanatory comment, keeping each test focused on what it actually
+  verifies (chunking, retries, fan-out, non-UTF-8 resilience) rather than accidentally becoming a
+  bogon-filter test.
+- `./scripts/verify_convergence.sh`: **PASSED** — 52 matching / 2 documented divergences (both
+  pre-existing, unrelated to this session's changes) / 0 unexplained.

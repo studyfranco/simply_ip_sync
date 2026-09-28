@@ -27,6 +27,13 @@ pub struct Model {
     pub mode: String,
     /// Enable/disable task execution.
     pub is_active: bool,
+    /// When `false` (the default), the delta fetched from the source vault is sanitized with
+    /// `bogon::sanitize` (loopback/private/link-local/other reserved ranges stripped) before it is
+    /// pushed to any target — a source vault's own group can accumulate one of these from a bad
+    /// manual ban, and pushing it on unchanged just relays a target's eventual `400` back onto this
+    /// service's own sync log instead of preventing it. `true` bypasses that stripping entirely,
+    /// for a task deliberately replicating internal/lab address space between vaults.
+    pub skip_bogon_filtering: bool,
     /// Key holding lifecycle authority over this task (RBAC §3).
     pub owner_key_id: Option<Uuid>,
     /// Creation timestamp.

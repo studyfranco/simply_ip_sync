@@ -13,8 +13,11 @@ use uuid::Uuid;
 use crate::entities::{api_key, api_key_sync_permission, audit_log};
 use crate::error::AppError;
 
-/// `api_key_sync_permissions.resource_type` value for external feed sources.
-pub const RESOURCE_EXTERNAL_SOURCE: &str = "external_source";
+/// `api_key_sync_permissions.resource_type` value for destination groups (the RBAC-managed parent
+/// resource of 1-to-N external feed sources — see `entities::destination_group`'s doc comment).
+/// Individual feeds carry no RBAC of their own; permissions are always granted on the owning
+/// group.
+pub const RESOURCE_DESTINATION_GROUP: &str = "destination_group";
 /// `api_key_sync_permissions.resource_type` value for inter-vault sync tasks.
 pub const RESOURCE_SYNC_TASK: &str = "sync_task";
 /// `api_key_sync_permissions.resource_type` value for vault endpoints.

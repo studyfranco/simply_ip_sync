@@ -103,9 +103,12 @@ below). `/health`, `/healthz`, `/ready`, `/readyz` are unauthenticated.
 | `DELETE /api/keys/{id}/permissions/{permission_id}` | Revoke a permission row. |
 | `GET/POST /api/vaults` | List / register `simply_ip_vault` endpoints. |
 | `GET/PATCH/DELETE /api/vaults/{id}` | Read / update / delete a vault endpoint. |
-| `GET/POST /api/sources` | List / create external threat feed sources. |
-| `GET/PATCH/DELETE /api/sources/{id}` | Read / update / delete a source. |
-| `POST /api/sources/{id}/trigger` | Manually run an external ingestion job now. |
+| `GET/POST /api/destination-groups` | List / create destination groups (scheduled feed collections). |
+| `GET/PATCH/DELETE /api/destination-groups/{id}` | Read / update / delete a destination group. |
+| `POST /api/destination-groups/{id}/trigger` | Manually run every feed in a destination group now. |
+| `POST /api/destination-groups/{group_id}/feeds` | Add a feed (URL + parser) to a destination group. |
+| `PATCH/DELETE /api/destination-groups/{group_id}/feeds/{feed_id}` | Update / remove a feed. |
+| `POST /api/sources/test-fetch` | Dry-run a feed URL/parser config without saving it. |
 | `GET/POST /api/sync-tasks` | List / create inter-vault sync tasks. |
 | `GET/PATCH/DELETE /api/sync-tasks/{id}` | Read / update / delete a sync task. |
 | `POST /api/sync-tasks/{id}/trigger` | Manually run an inter-vault delta sync now. |
@@ -143,16 +146,18 @@ New feed formats implement the `FeedParser` trait (`src/parsers/mod.rs`):
 
 ```rust
 pub trait FeedParser {
-    fn parse(&self, raw: &[u8], config: Option<&str>) -> Result<Vec<String>, ParseError>;
+    fn parse(&self, raw: &[u8], config: Option<&str>) -> Result<Vec<ParsedRecord>, ParseError>;
 }
 ```
 
 Built-in parsers:
-- **`REGEX_LINE`** — line-oriented text feeds. Strips `#`/`;`/`//` comment lines and extracts
-  IPv4/IPv6 addresses and CIDR subnets.
-- **`JSON_PATH`** — structured JSON feeds. Configured via `parser_config_json`:
-  `{"array_path": "data.items", "ip_field": "ipAddress"}` (`array_path` may be omitted for a bare
-  top-level array).
+- **`REGEX_LINE`** — line-oriented text feeds. Strips `#`/`;`/`//` comment markers, whether
+  line-starting or inline after real content, and extracts IPv4/IPv6 addresses and CIDR subnets —
+  including tab/space-separated `<ip>\t<prefix>` netblock notation (e.g. SANS ISC's `block.txt`).
+- **`JSON_PATH`** — structured JSON feeds. Configured via `parser_config_json` with `$.`-prefixed
+  field selectors: `{"array_path": "data.items", "target_address": "$.ipAddress"}` (`array_path`
+  may be omitted for a bare top-level array; `target_address` is mandatory, an optional
+  `last_seen_at` selector enables `max_age_days` temporal filtering).
 
 `parser_config_json` may also carry two generic keys read by the ingestion job itself, independent
 of the parser: `user_agent` and `headers` (an object of extra request headers).

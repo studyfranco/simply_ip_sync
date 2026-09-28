@@ -24,11 +24,15 @@ async fn file_backed_db() -> DatabaseConnection {
     conn
 }
 
-fn insert_source_sql(id: &str, owner_key_id: Option<&str>) -> String {
+/// Inserts a `destination_groups` row — `owner_key_id` and the cascade-tested junction table both
+/// moved here from `external_sources` in the destination-groups refactor (see
+/// `AGENT_NOTES.MD`'s corresponding session entry); a bare feed (`external_sources` row) carries
+/// neither anymore.
+fn insert_group_sql(id: &str, owner_key_id: Option<&str>) -> String {
     let owner = owner_key_id.map(|o| format!("'{o}'")).unwrap_or_else(|| "NULL".to_owned());
     format!(
-        "INSERT INTO external_sources (id, name, source_url, parser_type, cron_schedule, target_group_name, mode, is_active, owner_key_id, created_at, updated_at) \
-         VALUES ('{id}', 's-{id}', 'http://feed/{id}', 'REGEX_LINE', '0 0 * * *', 'g', 'upsert', 1, {owner}, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+        "INSERT INTO destination_groups (id, name, target_group_name, cron_schedule, mode, is_active, skip_bogon_filtering, owner_key_id, created_at, updated_at) \
+         VALUES ('{id}', 'g-{id}', 'g', '0 0 * * *', 'upsert', 1, 0, {owner}, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
     )
 }
 
@@ -48,48 +52,48 @@ async fn row_count(db: &DatabaseConnection, table: &str) -> i64 {
     row.try_get_by_index::<i64>(0).expect("count column")
 }
 
-/// Two sources, each fanning out to the same target vault (so the junction table has two rows
-/// sharing a `vault_endpoint_id` but different `external_source_id`s). Deleting only the *doomed*
-/// source must cascade-delete only its own junction row — the *survivor* source's junction row
-/// (same target vault, different parent) must remain untouched. A single-row cascade test (as
+/// Two groups, each fanning out to the same target vault (so the junction table has two rows
+/// sharing a `vault_endpoint_id` but different `destination_group_id`s). Deleting only the
+/// *doomed* group must cascade-delete only its own junction row — the *survivor* group's junction
+/// row (same target vault, different parent) must remain untouched. A single-row cascade test (as
 /// `schema_integrity_tests.rs::junction_table_rows_cascade_on_parent_delete` already has) cannot
 /// distinguish "cascaded correctly" from "cascaded too broadly" — this one can.
 #[tokio::test]
 async fn cascade_delete_does_not_reach_into_an_unrelated_parents_row() {
     let db = file_backed_db().await;
-    db.execute_unprepared(&insert_source_sql("d0000000-0000-0000-0000-000000000001", None)).await.expect("doomed source");
-    db.execute_unprepared(&insert_source_sql("50000000-0000-0000-0000-000000000002", None)).await.expect("survivor source");
+    db.execute_unprepared(&insert_group_sql("d0000000-0000-0000-0000-000000000001", None)).await.expect("doomed group");
+    db.execute_unprepared(&insert_group_sql("50000000-0000-0000-0000-000000000002", None)).await.expect("survivor group");
     db.execute_unprepared(&insert_vault_sql("70000000-0000-0000-0000-000000000003")).await.expect("shared target vault");
     db.execute_unprepared(
-        "INSERT INTO external_source_vault_targets (external_source_id, vault_endpoint_id, target_group_name) \
+        "INSERT INTO destination_group_vault_targets (destination_group_id, vault_endpoint_id, target_group_name) \
          VALUES ('d0000000-0000-0000-0000-000000000001', '70000000-0000-0000-0000-000000000003', NULL)",
     )
     .await
     .expect("doomed junction row");
     db.execute_unprepared(
-        "INSERT INTO external_source_vault_targets (external_source_id, vault_endpoint_id, target_group_name) \
+        "INSERT INTO destination_group_vault_targets (destination_group_id, vault_endpoint_id, target_group_name) \
          VALUES ('50000000-0000-0000-0000-000000000002', '70000000-0000-0000-0000-000000000003', NULL)",
     )
     .await
     .expect("survivor junction row");
 
-    db.execute_unprepared("DELETE FROM external_sources WHERE id = 'd0000000-0000-0000-0000-000000000001'")
+    db.execute_unprepared("DELETE FROM destination_groups WHERE id = 'd0000000-0000-0000-0000-000000000001'")
         .await
-        .expect("delete doomed source");
+        .expect("delete doomed group");
 
-    let remaining = row_count(&db, "external_source_vault_targets").await;
+    let remaining = row_count(&db, "destination_group_vault_targets").await;
     assert_eq!(remaining, 1, "exactly the survivor's junction row must remain — the cascade must not have swept up an unrelated parent's row");
     let survivor_still_present = db
         .query_all_raw(Statement::from_string(
             db.get_database_backend(),
-            "SELECT * FROM external_source_vault_targets WHERE external_source_id = '50000000-0000-0000-0000-000000000002'".to_owned(),
+            "SELECT * FROM destination_group_vault_targets WHERE destination_group_id = '50000000-0000-0000-0000-000000000002'".to_owned(),
         ))
         .await
         .expect("query");
     assert_eq!(survivor_still_present.len(), 1, "the survivor's own row must be exactly the one that remains");
 }
 
-/// Write-time enforcement, not just delete-time: a junction row naming an `external_source_id`
+/// Write-time enforcement, not just delete-time: a junction row naming a `destination_group_id`
 /// that does not exist must be refused by the database itself, not merely tolerated until a
 /// cascade happens to clean it up later.
 #[tokio::test]
@@ -99,18 +103,19 @@ async fn junction_row_with_a_dangling_foreign_key_is_rejected_at_insert_time() {
 
     let result = db
         .execute_unprepared(
-            "INSERT INTO external_source_vault_targets (external_source_id, vault_endpoint_id, target_group_name) \
+            "INSERT INTO destination_group_vault_targets (destination_group_id, vault_endpoint_id, target_group_name) \
              VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', '70000000-0000-0000-0000-000000000004', NULL)",
         )
         .await;
-    assert!(result.is_err(), "a junction row naming a non-existent external_source_id must be refused at write time, not silently accepted");
+    assert!(result.is_err(), "a junction row naming a non-existent destination_group_id must be refused at write time, not silently accepted");
 }
 
-/// `owner_key_id` on `external_sources`/`vault_endpoints`/`vault_sync_tasks` carries no FK
-/// constraint at all (confirmed against `src/migration/m20260101_013240_initial_schema.rs`: no
-/// `ForeignKey::create()` targets this column, unlike every other cross-table reference in the
-/// schema) — deliberately, not by oversight. `keys.rs::delete_api_key` enforces ownership
-/// transfer/cleanup at the *application* layer instead (see
+/// `owner_key_id` on `destination_groups`/`vault_endpoints`/`vault_sync_tasks` carries no FK
+/// constraint at all (confirmed against `src/migration/m20260101_013240_initial_schema.rs` and
+/// `m20260928_033617_destination_groups.rs`: no `ForeignKey::create()` targets this column, unlike
+/// every other cross-table reference in the schema) — deliberately, not by oversight.
+/// `keys.rs::delete_api_key` enforces ownership transfer/cleanup at the *application* layer
+/// instead (see
 /// `tests/rbac_model_compliance.rs::s6_deleting_a_key_that_still_owns_resources_is_blocked_with_inventory`),
 /// because a DB-level `CASCADE` here would silently delete every resource a Parent key ever
 /// created the moment that key is deleted, and a DB-level `RESTRICT`/`SET NULL` would either block
@@ -122,8 +127,8 @@ async fn junction_row_with_a_dangling_foreign_key_is_rejected_at_insert_time() {
 async fn owner_key_id_is_deliberately_unconstrained_by_design() {
     let db = file_backed_db().await;
     // No api_keys row with this id exists anywhere — if owner_key_id carried a real FK, this
-    // insert would be rejected exactly like the dangling-external_source_id case above.
-    let result = db.execute_unprepared(&insert_source_sql(
+    // insert would be rejected exactly like the dangling-destination_group_id case above.
+    let result = db.execute_unprepared(&insert_group_sql(
         "90000000-0000-0000-0000-000000000005",
         Some("ffffffff-ffff-ffff-ffff-ffffffffffff"),
     ))

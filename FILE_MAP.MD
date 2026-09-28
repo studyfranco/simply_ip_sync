@@ -203,17 +203,38 @@ own examples) to the 6-field `sec min hour dom month dow` form the underlying cr
 (carries an extractor's own status so normalizing the response *shape* doesn't also normalize its
 *meaning*), `Internal`.
 
+### `src/bogon.rs` — pre-push IP sanitization
+
+`is_bogon(&IpNetwork) -> bool` and `sanitize(records: Vec<String>) -> (Vec<String>, usize)`.
+Hand-rolled CIDR literal tables (`RFC1918_LITERALS`, `LOOPBACK_LITERALS`, `BOGON_LITERALS`),
+modeled on `example/simply_ip_exporter`'s `src/ipfilter.rs` but applied at a different pipeline
+stage — pre-push (`jobs::external_ingestion`, `jobs::vault_sync`), gated by one combined
+`skip_bogon_filtering` toggle rather than the peer's three independently-toggleable serve-time
+flags. Deliberately conservative: any overlap at all between a candidate CIDR and a reserved range
+drops the candidate entirely, even a supernet only partially overlapping one bogon range. See the
+module's own doc comment for the full design rationale.
+
 ---
 
 ## `src/parsers/` — the extensible parsing engine
 
-`mod.rs`: the `FeedParser` trait, `normalize_ip_or_cidr`, `for_type` (parser_type string →
-implementation). `regex_line.rs`: `REGEX_LINE` (comment-stripping, IPv4/IPv6/CIDR token
-extraction). `json_path.rs`: `JSON_PATH` (dotted `array_path` traversal, per-element `ip_field`
-pull; also a `"jsonl": true` mode for newline-delimited JSON feeds — Spamhaus DROP's actual wire
-format, one object per line with no enclosing array, verified against the real download). Both
-re-validate every extracted token through `normalize_ip_or_cidr` rather than trusting the
-extraction pattern alone.
+`mod.rs`: the `FeedParser` trait (`parse(&self, raw, config) -> Result<Vec<ParsedRecord>,
+ParseError>`), `ParsedRecord { address, last_seen_at: Option<DateTime<Utc>> }` (threads an optional
+per-record timestamp from a parser through to `jobs::external_ingestion`'s temporal filtering —
+`REGEX_LINE` never has a natural timestamp source and always returns `None`), `normalize_ip_or_cidr`.
+`regex_line.rs`: `REGEX_LINE` — comment-stripping (a marker anywhere on the line, not just at its
+start, so a trailing `# comment` after real content is also stripped), IPv4/IPv6/CIDR token
+extraction, plus tab/space-separated `<ip>\t<prefix>` and SANS ISC `block.txt`'s real 7-column
+netblock-table shape (`<start>\t<end>\t<prefix>\t...`), both folded to `<ip>/<prefix>` before the
+generic scan runs. `json_path.rs`: `JSON_PATH` — dotted `array_path` traversal (or `"jsonl": true`
+for newline-delimited feeds, Spamhaus DROP's actual wire format) into per-element `$.`-prefixed
+field selectors: `target_address` (alias `ip`, mandatory, `400` at save time if missing or not
+`$.`-prefixed — see `validate_config`) and optional `last_seen_at` (alias `timestamp`, RFC 3339 or
+bare `YYYY-MM-DD` — the latter needed for SANS ISC's `erratasec` threat list). The module's own doc
+comment reconciles this `$.` convention against `simply_ip_vault`'s unrelated `$name` *output*-side
+webhook-template substitution language — audited and deliberately not borrowed from, since it has
+no input-side field-selection equivalent to reuse. Both parsers re-validate every extracted token
+through `normalize_ip_or_cidr` rather than trusting the extraction pattern alone.
 
 ## `src/jobs/` — execution pipelines
 
@@ -235,25 +256,39 @@ running total crosses it — the decompression-bomb defense for the two independ
 body can expand: `Content-Encoding` (handled transparently by `reqwest`, so a naive `bytes()` read
 would already have fully buffered an oversized payload before anything could check its size) and a
 ZIP archive's own internal members.
-`external_ingestion.rs`: fetch → decompress-if-zip → parse → dedupe → chunk → push to every
-configured target vault, one `sync_logs` row per execution, `last_run_at` always updated (it means
-"last execution", not "last successful execution"). The fetch+decompress+parse portion (everything
-before dedupe/chunk/push) is its own `pub(crate)` function, `fetch_and_parse(http, source_url,
-parser_type, parser_config_json) -> Result<Vec<String>, String>` — factored out so both `execute`
-and the WebUI's "Test Fetch" preview (`api::test_fetch_external_source`, `POST
-/api/sources/test-fetch`) run the exact same pipeline (same retry policy, same decompression-bomb
-ceiling, same header/user-agent handling), rather than the test tool risking testing something
-subtly different from what a real scheduled run does. A fetch+parse that completes but yields
-**zero** items is deliberately reported as `PARTIAL`, not `SUCCESS` (both in `execute`'s
-`JobSummary` and in the test-fetch response) — this pipeline re-fetches a feed's full content every
-run (not an incremental diff), so genuinely zero entries is anomalous and is exactly what an HTML
+`external_ingestion.rs`: `run(state, group_id)` loads a `destination_groups` row plus its child
+`external_sources` feeds and target vaults, then `execute` fetches every feed **concurrently**
+(`fetch_all_feeds_concurrently` — one `tokio::spawn`ed task per feed, collected via a plain
+`Vec<JoinHandle>`, deliberately not `futures::future::join_all` to avoid the extra dependency),
+each running fetch → decompress-if-zip → parse → per-feed temporal filter
+(`apply_temporal_filter`, using that feed's own `max_age_days` against `ParsedRecord.last_seen_at`)
+→ per-feed bogon filter (`crate::bogon::sanitize`, using that feed's own `skip_bogon_filtering`
+override if set, else the owning group's) — applied **before** merging into the shared dedup
+`HashSet`, so a feed's override is honored correctly regardless of merge order — then dedupe →
+chunk → push to every configured target vault. One `sync_logs` row per execution, `last_run_at`
+always updated (it means "last execution", not "last successful execution"). `execute` derives
+`all_feeds_failed = !feeds.is_empty() && feed_error_count == feeds.len()` and checks it first when
+deriving the run's overall status — without it, a single configured feed whose fetch/parse hard-
+fails (a decompression bomb, an HTML block page) was wrongly reported `PARTIAL` instead of
+`FAILED`, since `any_success` alone defaults to `true` when zero target vaults are configured. The
+fetch+decompress+parse portion of a single feed is its own `pub(crate)` function,
+`fetch_and_parse(http, source_url, parser_type, parser_config_json) -> Result<Vec<ParsedRecord>,
+String>` — factored out so both `execute` (per feed) and the WebUI's "Test Fetch" preview
+(`api::test_fetch_external_source`, `POST /api/sources/test-fetch`) run the exact same pipeline
+(same retry policy, same decompression-bomb ceiling, same header/user-agent handling), rather than
+the test tool risking testing something subtly different from what a real scheduled run does. A
+feed's fetch+parse that completes but yields **zero** items is deliberately reported as `PARTIAL`
+for that feed, not `SUCCESS` — this pipeline re-fetches a feed's full content every run (not an
+incremental diff), so genuinely zero entries is anomalous and is exactly what an HTML
 error/captive-portal page served with `200 OK` looks like to `REGEX_LINE`. See AGENT_NOTES.MD
-Session 22. `vault_sync.rs`: delta fetch (including tombstones) → chunk → push, `last_sync_at`
-only advances when **every** target succeeds — zero *new* delta records is routine here (it is an
-incremental diff), so that same zero-items flag does not apply. Both are plain
-`(&AppState, Uuid) -> Result<JobSummary, AppError>` functions, callable identically from
-`scheduler.rs` and from the manual-trigger HTTP handlers (both of which claim the concurrency
-guard above before calling in).
+Session 22. `vault_sync.rs`: delta fetch (including tombstones) → bogon filter (unless
+`vault_sync_tasks.skip_bogon_filtering`, applied to the delta's `target_address` set the same way
+as the ingestion side) → chunk → push, `last_sync_at` only advances when **every** target
+succeeds — zero *new* delta records is routine here (it is an incremental diff), so the ingestion
+side's zero-items-is-`PARTIAL` flag does not apply. Both `run` functions are plain
+`(&AppState, Uuid) -> Result<JobSummary, AppError>`, callable identically from `scheduler.rs` and
+from the manual-trigger HTTP handlers (both of which claim the concurrency guard above before
+calling in).
 
 `scheduler.rs` additionally exposes `validate_cron_expression` — called from the `POST`/`PATCH`
 handlers in `api/sources.rs` and `api/sync_tasks.rs` *before* any database write, via the same
@@ -287,14 +322,19 @@ suites mint keys directly against the database.
   inventory, permission grant/revoke. The largest module, deliberately not split further — R1–R7
   are all about how keys delegate to other keys.
 - **`vaults.rs`** — `vault_endpoints` CRUD. Credentials are never returned in any response.
-- **`sources.rs`** — `external_sources` CRUD, target-vault mapping, `trigger_external_source`, and
+- **`sources.rs`** — `destination_groups` CRUD, target-vault mapping, `trigger_destination_group`,
+  plus child-feed (`external_sources`) `create_feed`/`update_feed`/`delete_feed` nested under a
+  group (every guard here resolves to the *owning group's* `RESOURCE_DESTINATION_GROUP` permission
+  row via `load_feed_in_group` — a feed carries no RBAC of its own, see `RBAC_MODEL.md`), and
   `test_fetch_external_source` (`POST /api/sources/test-fetch`, `can_manage_sources`/Master via
   `guard_resource_creation`) — a read-only dry-run of `jobs::external_ingestion::fetch_and_parse`
   against values that have never been saved (no `id`, no persistence, no `sync_logs`/`audit_logs`
   row), so the WebUI's "Test Fetch" button can validate a feed URL/parser config before `Create`
-  is even clicked. Response mirrors `trigger_external_source`'s `200`-with-status-field shape
+  is even clicked. Response mirrors `trigger_destination_group`'s `200`-with-status-field shape
   (`SUCCESS`/`PARTIAL`/`FAILED`) rather than mapping a feed/network failure to an HTTP error — see
-  AGENT_NOTES.MD Session 22.
+  AGENT_NOTES.MD Session 22. `validate_feed_parser` calls `parsers::json_path::validate_config` for
+  `JSON_PATH` feeds, rejecting a missing/malformed `target_address` selector with `400` at save
+  time rather than discovering it later as a `FAILED` sync log entry.
 - **`sync_tasks.rs`** — `vault_sync_tasks` CRUD, target-vault mapping, `trigger_vault_sync_task`.
   Re-uses `sources::TargetSpec`, the one type genuinely shared between the two junction-table
   shapes.
@@ -313,6 +353,14 @@ set). No business logic, no defaults that encode policy.
 column exists in the database (see the migration below) and SeaORM builds explicit column lists
 from the entity, so leaving the field out of the struct is what guarantees no query ever names it
 — every engine rejects a write to a generated column. Do not add it back.
+
+`destination_group.rs`/`destination_group_vault_target.rs` are the RBAC-managed group and its
+target-vault junction (§`RBAC_MODEL.md` §3); `external_source.rs` is the reshaped child-feed
+table (`destination_group_id`, `name`, `source_url`, `parser_type`, `parser_config_json`,
+`max_age_days`, `skip_bogon_filtering: Option<bool>`, `created_at`/`updated_at`) — it carries no
+`owner_key_id` and no target-vault mapping of its own; both belong to the owning group. The former
+`external_source_vault_target.rs` (the old 1-to-N external-source-to-vault junction) no longer
+exists — target vaults are now a group-level concept.
 
 ## `src/migration/` — schema migrations
 
@@ -333,6 +381,14 @@ before constraining, and rebuilds the table on SQLite (no `ALTER COLUMN` there) 
 `table_definition(attribution_not_null: bool)` shared by both the rebuild and `down`, so the two
 paths cannot describe different tables.
 
+`m20260928_033617_destination_groups` — creates `destination_groups` and
+`destination_group_vault_targets`, migrates every existing `external_sources` row 1:1 into a new
+group row **reusing the same id** (so nothing downstream needs a lookup table to find "the group
+this source became"), rebuilds `external_sources` into its new child-feed shape (SQLite: full
+create-copy-drop-rename; Postgres/MySQL: direct `ADD`/`DROP COLUMN`), and drops the now-orphaned
+`external_source_vault_targets`. `m20260928_034145_vault_sync_task_bogon_filtering` — a plain
+`ADD COLUMN skip_bogon_filtering BOOLEAN NOT NULL DEFAULT false` on `vault_sync_tasks`.
+
 ## `tests/` — what each suite owns
 
 | File | Owns |
@@ -341,16 +397,16 @@ paths cannot describe different tables.
 | `security_tests.rs` | Inbound HMAC verification, replay, `bound_ips`, outbound signature generation against a `wiremock`-mocked vault (including a `target_url` with a reverse-proxy subpath, on both the push and delta-fetch sides, mutation-tested against the `Url::join` leading-slash bug it regresses — see AGENT_NOTES.MD Session 19), and trusted-proxy `X-Forwarded-For` handling (permitted when forwarded through a trusted peer, never a `bound_ips` bypass from an untrusted one) |
 | `parser_tests.rs` | `REGEX_LINE`/`JSON_PATH` black-box behavior through the public `parsers` API, local fixtures reproducing StopForumSpam's ZIP and Spamhaus's JSONL feed shapes (both inspected against the real downloads) via `tempfile::tempdir()` for automatic cleanup, and HTML-masquerading-as-a-feed fixtures (block page, captive portal, a large synthetic body) |
 | `chunking_tests.rs` | Batch chunking never exceeds `MAX_BATCH_SIZE` at any boundary |
-| `api_validation_tests.rs` | Malformed `cron_schedule` on `POST`/`PATCH` for both `/api/sources` and `/api/sync-tasks` is rejected with `400` before any database write |
-| `external_ingestion_tests.rs` | Per-target `target_group_name` override; HTML-masquerade-as-200 via both parser types; gzip-compressed response decompression; a slow/hung target aborted by the client's own timeout rather than hanging; the `try_start_job` concurrency guard exercised directly |
+| `api_validation_tests.rs` | Malformed `cron_schedule` on `POST`/`PATCH` for both `/api/destination-groups` and `/api/sync-tasks` is rejected with `400` before any database write; `CreateDestinationGroupPayload`/`CreateFeedPayload` shape validation (no `source_url` at the group level, `JSON_PATH` feed config validated via `parsers::json_path::validate_config`) |
+| `external_ingestion_tests.rs` | Per-target `target_group_name` override; HTML-masquerade-as-200 via both parser types; gzip-compressed response decompression; a slow/hung target aborted by the client's own timeout rather than hanging; the `try_start_job` concurrency guard exercised directly; concurrent multi-feed fetch and aggregation (dedup across feeds); the `all_feeds_failed` regression (every configured feed hard-failing reports `FAILED`, not `PARTIAL`) |
 | `source_test_fetch_tests.rs` | `POST /api/sources/test-fetch`: RBAC (`can_manage_sources`/Master required, a bare key rejected), each response outcome (`SUCCESS`/`PARTIAL`/`FAILED`, an unknown `parser_type` as `400` instead), `sample`/`truncated`/`total_extracted` with a 75-record feed against the 50-entry cap, a configured custom header actually reaching the mocked feed, and that nothing is ever persisted (`external_sources` row count and `audit_logs` row count both unchanged). Two of its `JSON_PATH` fixtures (`ipVersion=4` and `ipVersion=6`) are trimmed, real responses from AbuseIPDB's own blacklist endpoint, fetched once during development — never hit that endpoint from an automated test, per AGENT.MD's "local fixtures... never against the live rate-limited source" rule — see AGENT_NOTES.MD Session 22 |
-| `vault_sync_tests.rs` | Tombstone propagation through a full fetch→push cycle; `last_sync_at` only advances on total success; multi-vault fan-out and partial-failure resilience; per-target `target_group_name` override; a slow/hung target vault aborted on the push path specifically; multi-page delta paging (15,001 records / 4 pages). Plus the high-volume two-vault convergence scenario (`test_inter_vault_sync_high_volume_partial_overlap`): 1,000-record groups with a 500-record partial overlap converging to 1,500 distinct rows against a stateful `MockVault`, then a differential second pass delivering exactly 200 tombstones + 100 additions |
-| `live_feed_ingestion_tests.rs` | `#[ignore]`d — real network calls to the four feeds named in `AGENT_NOTES.MD`, both via the parser directly and through the full `jobs::external_ingestion::run` pipeline. Run explicitly with `cargo test -- --ignored` |
-| `rbac_model_compliance.rs` | One test per `RBAC_MODEL.md` rule/section, named `r1_`…`r7_`/`s3_`…`s7_` so `scripts/verify_convergence.sh` can mechanically confirm every rule has coverage; `s5_`/`s7_` additionally carry an `ADVERSARIAL(§N)` raw-SQL test proving the guarantee holds against a writer that bypasses the application, not only a cooperative one. Plus `can_sync` manual-trigger allow/403, a 2-way concurrent-delete regression test, and the unauthenticated-request-never-reaches-a-handler check |
+| `vault_sync_tests.rs` | Tombstone propagation through a full fetch→push cycle; `last_sync_at` only advances on total success; multi-vault fan-out and partial-failure resilience; per-target `target_group_name` override; a slow/hung target vault aborted on the push path specifically; multi-page delta paging (15,001 records / 4 pages); pre-push bogon filtering strips reserved addresses from a delta unless `skip_bogon_filtering` opts out. Plus the high-volume two-vault convergence scenario (`test_inter_vault_sync_high_volume_partial_overlap`): 1,000-record groups with a 500-record partial overlap converging to 1,500 distinct rows against a stateful `MockVault`, then a differential second pass delivering exactly 200 tombstones + 100 additions |
+| `live_feed_ingestion_tests.rs` | `#[ignore]`d — real network calls to the four feeds named in `AGENT_NOTES.MD`, both via the parser directly and through the full `jobs::external_ingestion::run` pipeline (each seeded as a destination group + one child feed). Run explicitly with `cargo test -- --ignored` |
+| `rbac_model_compliance.rs` | One test per `RBAC_MODEL.md` rule/section, named `r1_`…`r7_`/`s3_`…`s7_` so `scripts/verify_convergence.sh` can mechanically confirm every rule has coverage; `s5_`/`s7_` additionally carry an `ADVERSARIAL(§N)` raw-SQL test proving the guarantee holds against a writer that bypasses the application, not only a cooperative one. Plus `can_sync` manual-trigger allow/403, a 2-way concurrent-delete regression test, and the unauthenticated-request-never-reaches-a-handler check. `insert_source()` builds a destination-group + feed pair and returns the *group* id, since RBAC resolves at the group level |
 | `schema_integrity_tests.rs` | Migrations apply cleanly; `ADVERSARIAL(§5)` — a raw-SQL insert with the marker column absent is rejected by the database itself; FK cascade on a junction table |
-| `referential_integrity.rs` | FK enforcement via `db::connect` (not `common::setup`'s bare `Database::connect`, which never enables `PRAGMA foreign_keys`): bidirectional cascade correctness (a doomed and a survivor source sharing one target vault), write-time rejection of a dangling FK, and a test proving `owner_key_id` deliberately carries **no** FK constraint at all |
+| `referential_integrity.rs` | FK enforcement via `db::connect` (not `common::setup`'s bare `Database::connect`, which never enables `PRAGMA foreign_keys`): bidirectional cascade correctness (a doomed and a survivor destination group sharing one target vault), write-time rejection of a dangling FK against `destination_groups`/`destination_group_vault_targets`, and a test proving `owner_key_id` deliberately carries **no** FK constraint at all |
 | `health_probes.rs` | `/health` never touches the database even when it's closed; `/ready` independently depends on both a live database and the boot-time Master pin (including a startup-ordering test — an unpinned `MasterPin` swapped into `AppState` post-setup — that a steady-state-only suite can't produce); the liveness body has exactly the two documented fields; neither probe leaks internal error text |
-| `concurrency_and_contracts.rs` | Real multi-task/thread contention the router's single-connection SQLite pool can't otherwise expose: 16 OS threads hammering `ReplayGuard::check_and_record` directly via a `Barrier` (exactly one admitted; distinct signatures never block each other), 16 concurrent `tokio::spawn`ed deletes of the same resource (exactly one `204`), and the `StrictPath`/`StrictQuery` JSON-envelope-totality contract (malformed path/query, and the oracle-discipline pairing between a malformed id and a nonexistent one) |
+| `concurrency_and_contracts.rs` | Real multi-task/thread contention the router's single-connection SQLite pool can't otherwise expose: 16 OS threads hammering `ReplayGuard::check_and_record` directly via a `Barrier` (exactly one admitted; distinct signatures never block each other), 16 concurrent `tokio::spawn`ed deletes of the same destination group (exactly one `204`), and the `StrictPath`/`StrictQuery` JSON-envelope-totality contract (malformed path/query, and the oracle-discipline pairing between a malformed id and a nonexistent one) |
 | `client_resilience_tests.rs` | Outbound retry/backoff on transient vault failures, adaptive batch splitting on `413`, `full_replace`'s chunk-0-only rule surviving a `413` split, and per-page retry on the delta-fetch side |
 | `source_hygiene.rs` | `static/app.js` parses as valid ECMAScript (`oxc_parser`, self-tested against a known-broken fixture); every literal `document.getElementById()` reference resolves against `index.html` or an id `app.js` injects itself; the one dynamic id-construction pattern is verified against its actual invariant (every nav button's `data-tab` has a matching panel id); reverse-proxy subpath support — `SyncClient` derives its request base from `window.location.pathname`, the one `fetch()` call site is prefixed with `requestBase`, the signed message covers `signingBase`, and `login-api-base` exists as an optional (never `required`) override field, each mutation-tested to confirm it actually catches the hardcoded-path regression it targets |
 
@@ -379,6 +435,6 @@ against all three peers under `example/*/static/` (see `AGENT_NOTES.MD` Session 
 
 | File | Responsibility |
 | :--- | :--- |
-| `index.html` | The page shell only — it contains no data-bearing markup. A `.login-screen` > `.login-card` sign-in view (including the optional "API base path override" field — see `app.js`), then `#dashboard-container` holding a `.top-bar` (`.header` with `.logo`, the RBAC tier chip, Refresh/Logout) and a `nav.tab-nav[role=tablist]` of `.tab-btn[data-tab]`. Each `data-tab="X"` pairs with an empty `<main id="tab-X" class="tab-panel">` that `app.js` fills; `tests/source_hygiene.rs` enforces that pairing. `#toast-container` is the single mount point for notifications. Both `<link>`/`<script>` tags reference `style.css`/`app.js` with **no leading slash**, so they resolve relative to whatever directory the page is served from. |
-| `style.css` | The design system. Its `:root` block is **byte-identical** to `simply_ip_vault`/`simply_hook_executor`/`simply_ip_exporter` — a token meaning something different here than one service over is worse than no token, because everything built on it drifts silently. Below that, the shared component set (`.card`, `.data-table` in a `.table-container`, `.tab-nav`/`.tab-btn`, `.btn` family, `.form-group`/`.input-field`, `.badge` family, `.toast`, utilities). Components the peers have but this UI has no markup for (modals, pagination, batch selection) are deliberately absent rather than carried as dead rules. `.kv-editor`/`.kv-row`/`.kv-remove`/`.kv-empty` (key/value row editor) is ported byte-for-byte from `simply_ip_vault`'s webhook custom-headers editor — see AGENT_NOTES.MD Session 21. `.container`/`.top-bar` are `max-width: 1800px` with `clamp(1rem, 3vw, 4rem)` fluid side padding (previously a fixed `1280px`/`2rem` — cramped on anything wider than a small laptop given how wide this dashboard's own tables run), matching `simply_hook_executor`'s layout rather than `simply_ip_vault`/`simply_ip_exporter`'s narrower fixed one; the 768px mobile breakpoint additionally stacks `.header` and `.form-actions` (full-width buttons) rather than only adjusting padding. `.code-example`/`.test-fetch-result`/`.test-fetch-sample` support the External Sources form's JSON_PATH mapping example and Test Fetch preview. See AGENT_NOTES.MD Session 22. |
-| `app.js` | Everything dynamic: a pure-JS SHA-256/HMAC fallback for non-secure contexts (`crypto.subtle` is unavailable over plain-HTTP LAN), the `SyncClient` that signs every request with `CANONICAL_V1` and unwraps the `{"error": …}` envelope, `activateTab()` reactive menu switching, and one `render*`/`*Row`/`show*Form` trio per resource. One-time credentials render into a `.key-reveal` block rather than a `window.alert()`, since the value has to be selectable and re-readable. **Reverse-proxy subpath support:** `SyncClient` carries two independent path prefixes — `requestBase` (where to *send*, derived from `window.location.pathname` via `deriveRequestBase()`, so a dashboard mounted at `/ip_sync/` needs no configuration) and `signingBase` (what to *sign*, defaulting to `""` — sign `path` exactly as called, no mount prefix — matching `simply_ip_exporter`'s convention for the same call-site shape, and overridable via the login form's "API base path override" field, persisted in `localStorage` under `simply_ip_sync_api_base`). The blank default is correct for the common reverse-proxy config where the proxy strips the mount prefix before forwarding; the override (set to the bare mount prefix alone, e.g. `/ip_sync`) covers the less-common case where the proxy forwards the prefix through untouched — though that case cannot actually reach a route today regardless of signing (`src/lib.rs::create_app` only nests under the literal `/api`, so an unstripped `/ip_sync/api/...` 404s before signature verification runs; see AGENT_NOTES.MD Session 18). See `tests/source_hygiene.rs`'s dedicated regression tests for the exact shape a regression here would take. **`/api/vaults` fetch caching:** `getVaultsCached()`/`invalidateVaultsCache()` route every dropdown/list consumer of the vault list (`renderSources`, `renderSyncTasks`, and `renderVaults`'s own cache-hit path) through one shared, session-scoped cache, so two calls landing in the same wall-clock second never produce the duplicate `CANONICAL_V1` signature that `src/replay.rs::ReplayGuard` would otherwise correctly reject as a replay. `renderVaults()` alone still issues a raw, uncaught fetch on a cache *miss*, so a genuine server-side failure in its own authoritative tab still surfaces instead of being swallowed. Invalidated on login, logout, `btn-refresh`, and any local vault create/delete. See AGENT_NOTES.MD Session 17. **Custom Headers editor (External Sources form):** `showSourceForm` splits a source's `parser_config_json` via `splitParserConfig()` into the two generic keys `src/jobs/external_ingestion.rs`'s `FetchOptions` reads (`headers`, `user_agent` — each gets its own UI: a `simply_ip_vault`-style `.kv-editor` row list with `+ Add Header`, and a plain text field) and whatever's left (parser-specific keys like `array_path`/`ip_field`, still raw JSON in the "Parser Config JSON" textarea, now relabeled to say so). On submit the two are re-merged into one `parser_config_json` string — the stored wire format is unchanged, only how the form builds it. See AGENT_NOTES.MD Session 21. **Parser-type-conditional Parser Config JSON, mapping example, and Test Fetch:** the Parser Config JSON group (and its inline JSON_PATH mapping example — `array_path`/`ip_field`, real-world-verified against AbuseIPDB's actual blacklist shape) is hidden entirely when Parser Type is `REGEX_LINE` (`src/parsers/regex_line.rs` ignores its `config` argument, so the box has zero effect there — showing it would be pure confusion) and shown for `JSON_PATH`, toggled live on the select's `change` event. A "Test Fetch" button calls `POST /api/sources/test-fetch` with the form's *current* values (via `buildMergedParserConfig`, the same merge helper the submit handler uses, so a preview can never drift from what `Create`/`Save` would actually send) and renders the result inline — `statusBadge()` (reused from the Sync Logs table), extracted-count/duration summary, and a scrollable sample list — without saving anything. See AGENT_NOTES.MD Session 22. |
+| `index.html` | The page shell only — it contains no data-bearing markup. A `.login-screen` > `.login-card` sign-in view (including the optional "API base path override" field — see `app.js`), then `#dashboard-container` holding a `.top-bar` (`.header` with `.logo`, the RBAC tier chip, Refresh/Logout) and a `nav.tab-nav[role=tablist]` of `.tab-btn[data-tab]`. Each `data-tab="X"` pairs with an empty `<main id="tab-X" class="tab-panel">` that `app.js` fills; `tests/source_hygiene.rs` enforces that pairing. The first tab's button label reads "Destination Groups" but its `data-tab`/`id` pair is still the original `sources`/`tab-sources` — renaming the DOM id along with the two-tier refactor would be pure churn against that invariant for no behavioral gain. `#toast-container` is the single mount point for notifications. Both `<link>`/`<script>` tags reference `style.css`/`app.js` with **no leading slash**, so they resolve relative to whatever directory the page is served from. |
+| `style.css` | The design system. Its `:root` block is **byte-identical** to `simply_ip_vault`/`simply_hook_executor`/`simply_ip_exporter` — a token meaning something different here than one service over is worse than no token, because everything built on it drifts silently. Below that, the shared component set (`.card`, `.data-table` in a `.table-container`, `.tab-nav`/`.tab-btn`, `.btn` family, `.form-group`/`.input-field`, `.badge` family, `.toast`, utilities). Components the peers have but this UI has no markup for (modals, pagination, batch selection) are deliberately absent rather than carried as dead rules. `.kv-editor`/`.kv-row`/`.kv-remove`/`.kv-empty` (key/value row editor) is ported byte-for-byte from `simply_ip_vault`'s webhook custom-headers editor — see AGENT_NOTES.MD Session 21. `.container`/`.top-bar` are `max-width: 1800px` with `clamp(1rem, 3vw, 4rem)` fluid side padding (previously a fixed `1280px`/`2rem` — cramped on anything wider than a small laptop given how wide this dashboard's own tables run), matching `simply_hook_executor`'s layout rather than `simply_ip_vault`/`simply_ip_exporter`'s narrower fixed one; the 768px mobile breakpoint additionally stacks `.header` and `.form-actions` (full-width buttons) rather than only adjusting padding. `.code-example`/`.test-fetch-result`/`.test-fetch-sample` support the feed form's JSON_PATH mapping example and Test Fetch preview. See AGENT_NOTES.MD Session 22. |
+| `app.js` | Everything dynamic: a pure-JS SHA-256/HMAC fallback for non-secure contexts (`crypto.subtle` is unavailable over plain-HTTP LAN), the `SyncClient` that signs every request with `CANONICAL_V1` and unwraps the `{"error": …}` envelope, `activateTab()` reactive menu switching, and one `render*`/`*Row`/`show*Form` trio per resource. One-time credentials render into a `.key-reveal` block rather than a `window.alert()`, since the value has to be selectable and re-readable. **Session credential persistence:** `saveSessionCredentials`/`loadSessionCredentials`/`clearSessionCredentials` persist the signed-in `X-API-Key`/signing secret in `sessionStorage` (never `localStorage` — a reload should restore the session, but a login must not silently survive a full browser restart or widen an XSS's blast radius beyond the current tab; this was an explicit user decision made against the page's own documented "kept only in this tab's memory" design). `attemptSignIn()` is the shared login path used both by the login form's submit handler and by `restoreSessionOnLoad()`, an IIFE run on `DOMContentLoaded` that silently re-authenticates from a saved session (any failure just falls through to the ordinary login screen, cleared via `clearSessionCredentials()`). The Logout button also calls `clearSessionCredentials()`, so logging out actually ends the saved session rather than merely hiding the dashboard. **Destination Groups & Feeds UI:** `renderSources()` renders the Destination Groups table (`groupRow()`, `showGroupForm()` — cron/target-vaults/mode/`skip_bogon_filtering` at the group level); selecting a group swaps the full `#tab-sources` panel to `renderFeedsView(group, vaults)` (`feedRow()`, `showFeedForm()` — a "← Back to Destination Groups" button returns to `renderSources()`). `showFeedForm` carries a tri-state bogon-filtering-override select (inherit / bypass / enforce) and reactively shows "Max Age (Days)" only when `hasLastSeenAtSelector()` finds a valid `$.`-prefixed `last_seen_at`/`timestamp` mapping in the feed's `JSON_PATH` config — there is nothing to age-filter on without one. **Reverse-proxy subpath support:** `SyncClient` carries two independent path prefixes — `requestBase` (where to *send*, derived from `window.location.pathname` via `deriveRequestBase()`, so a dashboard mounted at `/ip_sync/` needs no configuration) and `signingBase` (what to *sign*, defaulting to `""` — sign `path` exactly as called, no mount prefix — matching `simply_ip_exporter`'s convention for the same call-site shape, and overridable via the login form's "API base path override" field, persisted in `localStorage` under `simply_ip_sync_api_base`). The blank default is correct for the common reverse-proxy config where the proxy strips the mount prefix before forwarding; the override (set to the bare mount prefix alone, e.g. `/ip_sync`) covers the less-common case where the proxy forwards the prefix through untouched — though that case cannot actually reach a route today regardless of signing (`src/lib.rs::create_app` only nests under the literal `/api`, so an unstripped `/ip_sync/api/...` 404s before signature verification runs; see AGENT_NOTES.MD Session 18). See `tests/source_hygiene.rs`'s dedicated regression tests for the exact shape a regression here would take. **`/api/vaults` fetch caching:** `getVaultsCached()`/`invalidateVaultsCache()` route every dropdown/list consumer of the vault list (`renderSources`, `renderSyncTasks`, and `renderVaults`'s own cache-hit path) through one shared, session-scoped cache, so two calls landing in the same wall-clock second never produce the duplicate `CANONICAL_V1` signature that `src/replay.rs::ReplayGuard` would otherwise correctly reject as a replay. `renderVaults()` alone still issues a raw, uncaught fetch on a cache *miss*, so a genuine server-side failure in its own authoritative tab still surfaces instead of being swallowed. Invalidated on login, logout, `btn-refresh`, and any local vault create/delete. See AGENT_NOTES.MD Session 17. **Custom Headers editor (feed form):** `showFeedForm` splits a feed's `parser_config_json` via `splitParserConfig()` into the two generic keys `src/jobs/external_ingestion.rs`'s `FetchOptions` reads (`headers`, `user_agent` — each gets its own UI: a `simply_ip_vault`-style `.kv-editor` row list with `+ Add Header`, and a plain text field) and whatever's left (parser-specific keys like `array_path`/`target_address`, still raw JSON in the "Parser Config JSON" textarea, now relabeled to say so). On submit the two are re-merged into one `parser_config_json` string — the stored wire format is unchanged, only how the form builds it. See AGENT_NOTES.MD Session 21. **Parser-type-conditional Parser Config JSON, mapping example, and Test Fetch:** the Parser Config JSON group (and its inline JSON_PATH mapping example, `JSON_PATH_EXAMPLE_HINT` — `$.`-prefixed `target_address`/`last_seen_at` selectors, matching `parsers::json_path`'s real config shape) is hidden entirely when Parser Type is `REGEX_LINE` (`src/parsers/regex_line.rs` ignores its `config` argument, so the box has zero effect there — showing it would be pure confusion) and shown for `JSON_PATH`, toggled live on the select's `change` event. A "Test Fetch" button calls `POST /api/sources/test-fetch` with the form's *current* values (via `buildMergedParserConfig`, the same merge helper the submit handler uses, so a preview can never drift from what `Create`/`Save` would actually send) and renders the result inline — `statusBadge()` (reused from the Sync Logs table), extracted-count/duration summary, and a scrollable sample list — without saving anything. See AGENT_NOTES.MD Session 22. |

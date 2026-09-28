@@ -9,7 +9,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::support::{find_permission, RESOURCE_EXTERNAL_SOURCE, RESOURCE_SYNC_TASK};
+use super::support::{find_permission, RESOURCE_DESTINATION_GROUP, RESOURCE_SYNC_TASK};
 use super::guard_can_view_logs;
 use crate::entities::{api_key, sync_log};
 use crate::error::AppError;
@@ -30,7 +30,7 @@ pub struct SyncLogQuery {
 
 fn resource_type_for(job_type: &str) -> Option<&'static str> {
     match job_type {
-        "EXTERNAL_FEED" => Some(RESOURCE_EXTERNAL_SOURCE),
+        "EXTERNAL_FEED" => Some(RESOURCE_DESTINATION_GROUP),
         "VAULT_SYNC" => Some(RESOURCE_SYNC_TASK),
         _ => None,
     }

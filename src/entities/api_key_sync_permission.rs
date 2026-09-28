@@ -12,7 +12,7 @@ pub struct Model {
     pub id: Uuid,
     /// Target API key.
     pub api_key_id: Uuid,
-    /// Resource category: `"external_source"`, `"sync_task"`, or `"vault_endpoint"`.
+    /// Resource category: `"destination_group"`, `"sync_task"`, or `"vault_endpoint"`.
     pub resource_type: String,
     /// Id of the specific resource.
     pub resource_id: Uuid,

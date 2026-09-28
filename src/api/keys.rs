@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use super::support::{create_audit_log, generate_random_key, hash_key, key_prefix};
 use super::{guard_delegated_grant, guard_manage_keys, guard_master_immutable, guard_revocation, guard_rotation_allowed, guard_scope_elevation};
-use crate::entities::{api_key, api_key_sync_permission, external_source, vault_endpoint, vault_sync_task};
+use crate::entities::{api_key, api_key_sync_permission, destination_group, vault_endpoint, vault_sync_task};
 use crate::error::AppError;
 use crate::extract::StrictJson;
 use crate::middleware::ClientIp;
@@ -260,11 +260,14 @@ async fn owned_resource_inventory(
         .all(db)
         .await?;
     inventory.extend(vaults.into_iter().map(|v| json!({"type": "vault_endpoint", "id": v.id, "name": v.name, "owner_key_id": v.owner_key_id})));
-    let sources = external_source::Entity::find()
-        .filter(external_source::Column::OwnerKeyId.is_in(key_ids.to_vec()))
+    // Individual feeds (`external_sources`) carry no `owner_key_id` of their own -- lifecycle
+    // authority lives on their owning `destination_groups` row (RBAC §3), so the inventory is
+    // scoped there; deleting/reassigning a group's owner implicitly covers every feed under it.
+    let groups = destination_group::Entity::find()
+        .filter(destination_group::Column::OwnerKeyId.is_in(key_ids.to_vec()))
         .all(db)
         .await?;
-    inventory.extend(sources.into_iter().map(|s| json!({"type": "external_source", "id": s.id, "name": s.name, "owner_key_id": s.owner_key_id})));
+    inventory.extend(groups.into_iter().map(|g| json!({"type": "destination_group", "id": g.id, "name": g.name, "owner_key_id": g.owner_key_id})));
     let tasks = vault_sync_task::Entity::find()
         .filter(vault_sync_task::Column::OwnerKeyId.is_in(key_ids.to_vec()))
         .all(db)
@@ -375,7 +378,7 @@ pub async fn rotate_signing_secret(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantPermissionPayload {
-    /// Resource category: `"external_source"`, `"sync_task"`, or `"vault_endpoint"`.
+    /// Resource category: `"destination_group"`, `"sync_task"`, or `"vault_endpoint"`.
     pub resource_type: String,
     /// Id of the specific resource.
     pub resource_id: Uuid,
@@ -418,8 +421,8 @@ pub async fn grant_key_permission(
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
     let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    if payload.resource_type != "external_source" && payload.resource_type != "sync_task" && payload.resource_type != "vault_endpoint" {
-        return Err(AppError::InvalidInput("resource_type must be external_source, sync_task, or vault_endpoint".to_owned()));
+    if payload.resource_type != "destination_group" && payload.resource_type != "sync_task" && payload.resource_type != "vault_endpoint" {
+        return Err(AppError::InvalidInput("resource_type must be destination_group, sync_task, or vault_endpoint".to_owned()));
     }
 
     let caller_permission =

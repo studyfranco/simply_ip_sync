@@ -31,8 +31,9 @@ async fn assert_feed_yields_valid_entries(url: &str) {
     assert!(!entries.is_empty(), "{url} yielded zero parsed entries — the feed format may have changed");
     for entry in &entries {
         assert!(
-            entry.parse::<ipnetwork::IpNetwork>().is_ok() || entry.parse::<std::net::IpAddr>().is_ok(),
-            "{url} yielded an entry that is not a valid IP/CIDR: '{entry}'"
+            entry.address.parse::<ipnetwork::IpNetwork>().is_ok() || entry.address.parse::<std::net::IpAddr>().is_ok(),
+            "{url} yielded an entry that is not a valid IP/CIDR: '{}'",
+            entry.address
         );
     }
     println!("{url}: {} valid entries", entries.len());
@@ -69,19 +70,19 @@ async fn doh_ipv6_blocklist_parses_to_valid_entries() {
     let body = response.bytes().await.expect("read body");
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
     let entries = parser.parse(&body, None).expect("parse");
-    let v6_count = entries.iter().filter(|e| e.parse::<std::net::Ipv6Addr>().is_ok()).count();
+    let v6_count = entries.iter().filter(|e| e.address.parse::<std::net::Ipv6Addr>().is_ok()).count();
     assert!(v6_count > 0, "doh-ipv6.txt yielded no actual IPv6 addresses among its {} entries", entries.len());
 }
 
-/// End-to-end through the real ingestion pipeline (not just the parser in isolation): an
-/// `external_source` pointed at a live feed, triggered through `jobs::external_ingestion::run`,
-/// must report a `SUCCESS` summary with `items_processed > 0`.
+/// End-to-end through the real ingestion pipeline (not just the parser in isolation): a
+/// `destination_groups` row with one child feed pointed at a live feed, triggered through
+/// `jobs::external_ingestion::run`, must report a `SUCCESS` summary with `items_processed > 0`.
 #[tokio::test]
 #[ignore = "hits a live network endpoint; run with `cargo test -- --ignored`"]
 async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
-    use simply_ip_sync::entities::external_source;
+    use simply_ip_sync::entities::{destination_group, external_source};
     use uuid::Uuid;
 
     let conn = sea_orm::Database::connect("sqlite::memory:").await.expect("connect");
@@ -106,27 +107,39 @@ async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
     master.insert(&conn).await.expect("insert master");
     let state = simply_ip_sync::state::AppState::for_tests(conn.clone(), master_id).await;
 
-    let source_id = Uuid::new_v4();
-    let source = external_source::ActiveModel {
-        id: Set(source_id),
-        name: Set("live-doh-ipv4".to_owned()),
-        source_url: Set(DOH_IPV4_URL.to_owned()),
-        parser_type: Set("REGEX_LINE".to_owned()),
-        parser_config_json: Set(None),
-        cron_schedule: Set("0 0 * * *".to_owned()),
+    let group_id = Uuid::new_v4();
+    let group = destination_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("live-doh-ipv4-group".to_owned()),
         target_group_name: Set("group".to_owned()),
+        cron_schedule: Set("0 0 * * *".to_owned()),
         mode: Set("upsert".to_owned()),
         is_active: Set(true),
+        skip_bogon_filtering: Set(false),
         last_run_at: Set(None),
         owner_key_id: Set(Some(master_id)),
         created_at: Set(now),
         updated_at: Set(now),
     };
-    source.insert(&conn).await.expect("insert source");
+    group.insert(&conn).await.expect("insert destination group");
+
+    let source = external_source::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        destination_group_id: Set(group_id),
+        name: Set("live-doh-ipv4".to_owned()),
+        source_url: Set(DOH_IPV4_URL.to_owned()),
+        parser_type: Set("REGEX_LINE".to_owned()),
+        parser_config_json: Set(None),
+        max_age_days: Set(None),
+        skip_bogon_filtering: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    source.insert(&conn).await.expect("insert feed");
 
     // No targets configured: the job still fetches and parses, it just has nothing to push to —
     // exactly what's needed to prove ingestion itself works without standing up a mock vault.
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id).await.expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
     assert!(summary.items_processed > 0, "expected at least one parsed entry from a live feed");
 }

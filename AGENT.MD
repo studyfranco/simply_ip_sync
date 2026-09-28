@@ -142,19 +142,37 @@ directory that contains a `.git` — see that script for the graceful offline-mo
 
 ---
 
-### 2. Extensible Parsing Engine (External Sources)
+### 2. Extensible Parsing Engine (Destination Groups & Feeds)
 
-`simply_ip_sync` supports fetching external threat intelligence over HTTP/HTTPS with modular parsers:
+`simply_ip_sync` supports fetching external threat intelligence over HTTP/HTTPS with modular
+parsers. A **destination group** (`destination_groups`) is the scheduled, RBAC-managed, triggerable
+unit; it owns 1-to-N **feeds** (`external_sources` rows), each independently configured with its
+own URL/parser, fetched **concurrently**, and merged into one deduplicated set per execution (see
+§3.A). A feed carries no RBAC of its own — see `RBAC_MODEL.md`.
 
 1. **`REGEX_LINE` (Text / Line-by-Line):**
-   - Strips comments (lines starting with `#`, `;`, `//`).
-   - Extracts valid IPv4/IPv6 addresses and CIDR subnets using strict IP regex patterns line by line.
+   - Strips comments — both a line starting with `#`/`;`/`//` and an inline comment appearing after
+     real content on the same line (the first occurrence of any of the three markers truncates the
+     line from that point on).
+   - Extracts valid IPv4/IPv6 addresses and CIDR subnets using strict IP regex patterns line by
+     line. Also recognizes tab/space-separated `<ip>\t<prefix-length>` and SANS ISC `block.txt`'s
+     real 7-column netblock-table shape (`<start>\t<end>\t<prefix>\t<targets>\t<org>\t<country>\t<contact>`),
+     folding either to `<ip>/<prefix>` before the generic token scan runs.
    - Decoded with `String::from_utf8_lossy`, not a hard UTF-8 validation: a body containing
      ISO-8859-1/Windows-1252 bytes or transit corruption degrades those bytes to `U+FFFD`
      (extracting nothing from that stretch) rather than failing the entire feed.
 2. **`JSON_PATH` (Structured JSON):**
-   - Parses JSON payloads (e.g., AbuseIPDB API response, pfSense JSON exports).
-   - Configured via `parser_config_json` containing the JSON path/pointer to the array of items and target key field (e.g., `{"array_path": "data", "ip_field": "ipAddress"}`).
+   - Parses JSON payloads (e.g., AbuseIPDB API responses, SANS ISC's `?json`-suffixed threat lists,
+     pfSense JSON exports).
+   - Configured via `parser_config_json` with `$.`-prefixed per-item field selectors:
+     `target_address` (alias `ip`) is **mandatory** and must start with `$.` (e.g.
+     `{"array_path": "data", "target_address": "$.ipAddress"}`); `last_seen_at` (alias `timestamp`)
+     is optional, same `$.`-prefixed shape, parsed as RFC 3339 or a bare `YYYY-MM-DD` date (the
+     latter needed for SANS ISC's `erratasec` threat list). A feed's own `max_age_days` column
+     combines with a mapped `last_seen_at` to discard stale entries — see §3.A point 2. This `$.`
+     convention is deliberately unrelated to `simply_ip_vault`'s own `$name` webhook-template
+     substitution language (an *output*-side convention with no input-side field-selection
+     equivalent to borrow) — see `src/parsers/json_path.rs`'s doc comment for the full reconciliation.
    - `jsonl` mode (newline-delimited JSON, one object per line) decodes each line with the same
      lossy UTF-8 conversion as `REGEX_LINE`, so one non-UTF-8 line among well-formed ones only
      fails that line (skipped, same as any other malformed JSONL line) rather than the whole feed.
@@ -162,21 +180,55 @@ directory that contains a `.git` — see that script for the graceful offline-mo
      UTF-8 as ordinary JSON syntax and returns a clean `Err`, never a panic, on invalid bytes.
 3. **Extensible Trait (`FeedParser`):**
    - Modular architecture allowing simple addition of future parsers (e.g., CSV, XML, STIX/TAXII).
+   - `parse` returns `Vec<ParsedRecord>` (`{ address, last_seen_at: Option<DateTime<Utc>> }`), not a
+     bare address list — the optional timestamp threads through to the temporal filter above.
 
 ---
 
 ### 3. Synchronization & Ingestion Pipeline
 
 #### A. External Ingestion Pipeline
-1. **Fetch:** HTTP GET to `external_sources.source_url` with optional custom headers/user-agent. Transient upstream failures (`429`/`502`/`503`/`504`) are retried with exponential backoff and jitter (`OUTBOUND_MAX_RETRIES`, `OUTBOUND_RETRY_BACKOFF_MS`) before the job is marked `FAILED`. The response body is read via `jobs::decompress::read_capped_body` — a streaming read with a running byte count, not a single-shot `Response::bytes()` — so a `Content-Encoding` (gzip/deflate/brotli/zstd) decompression bomb aborts mid-stream with `FAILED` at `MAX_DECOMPRESSED_BYTES` (default 50 MiB) instead of buffering an arbitrarily large decompressed payload in memory first.
-2. **Parse:** Execute configured `FeedParser` to extract normalized IP/CIDR strings. A `.zip`-archived body (`jobs::decompress::decompress_if_zip`) is decompressed first, member by member, under the same `MAX_DECOMPRESSED_BYTES` ceiling applied independently to the combined member output — a small archive whose member(s) decompress far past that ceiling aborts the same way, never after fully decompressing the bomb.
-3. **Chunking & Batching:** Split extracted records into chunks of **5,000 items maximum** to comply with `ip_vault`'s `MAX_REQUEST_BODY_BYTES` (3 MiB limit).
-4. **Push:** Send each chunk via `POST /api/records/batch` to all associated target `vault_endpoints` (defined in `external_source_vault_targets`). `external_sources.mode` is `"upsert"` (default — never implicitly deletes) or `"full_replace"` (this run's fetched content becomes the group's full authoritative set). **`full_replace` semantics apply to chunk 0 of each target's own chunk sequence only** — every later chunk of the same run automatically downgrades to `"upsert"` (`jobs::mode_for_chunk_index`), since a second `full_replace` write would read as "delete everything not in this chunk" and erase the previous chunk's just-delivered records. A `413 Payload Too Large` response from a target additionally triggers adaptive splitting: the offending chunk is halved and each half resent (recursively, if still too large), with the same first-piece-only-keeps-the-original-mode rule applied to the halves.
-5. **Log:** Write detailed outcome to `sync_logs`.
+1. **Fetch (concurrent, per group):** One HTTP GET per feed (`external_sources.source_url`, with
+   that feed's own optional custom headers/user-agent), all feeds belonging to a destination group
+   fetched **concurrently** (`tokio::spawn` per feed, joined via a plain `Vec<JoinHandle>`).
+   Transient upstream failures (`429`/`502`/`503`/`504`) are retried with exponential backoff and
+   jitter (`OUTBOUND_MAX_RETRIES`, `OUTBOUND_RETRY_BACKOFF_MS`) before that feed is marked failed.
+   The response body is read via `jobs::decompress::read_capped_body` — a streaming read with a
+   running byte count, not a single-shot `Response::bytes()` — so a `Content-Encoding`
+   (gzip/deflate/brotli/zstd) decompression bomb aborts mid-stream at `MAX_DECOMPRESSED_BYTES`
+   (default 50 MiB) instead of buffering an arbitrarily large decompressed payload in memory first.
+   If every configured feed in the group hard-fails, the group's overall status is `FAILED`, not
+   `PARTIAL`.
+2. **Parse, filter, and merge:** Execute each feed's configured `FeedParser` to extract normalized
+   `ParsedRecord`s. A `.zip`-archived body (`jobs::decompress::decompress_if_zip`) is decompressed
+   first, member by member, under the same `MAX_DECOMPRESSED_BYTES` ceiling applied independently
+   to the combined member output. Per feed, in order: a **temporal filter** discards any record
+   older than that feed's own `max_age_days` (when set, and only for records carrying a
+   `last_seen_at`); then a **bogon filter** (`bogon::sanitize`, `src/bogon.rs`) strips
+   loopback/unspecified/private-IPv4 (RFC 1918)/link-local/other reserved ranges, governed by that
+   feed's own `skip_bogon_filtering` override if set, else the owning group's
+   `skip_bogon_filtering` (default `false` — filter on). Both filters run **before** a feed's
+   results are merged into the group's shared deduplicated set, so a feed's own override is honored
+   correctly regardless of merge order. Deduplication across feeds is **exact string match only** —
+   no CIDR supernetting/merging of overlapping or adjacent subnets.
+3. **Chunking & Batching:** Split the merged, deduplicated records into chunks of **5,000 items
+   maximum** to comply with `ip_vault`'s `MAX_REQUEST_BODY_BYTES` (3 MiB limit).
+4. **Push:** Send each chunk via `POST /api/records/batch` to all associated target
+   `vault_endpoints` (defined in `destination_group_vault_targets`). `destination_groups.mode` is
+   `"upsert"` (default — never implicitly deletes) or `"full_replace"` (this run's aggregated
+   content becomes the group's full authoritative set). **`full_replace` semantics apply to chunk 0
+   of each target's own chunk sequence only** — every later chunk of the same run automatically
+   downgrades to `"upsert"` (`jobs::mode_for_chunk_index`), since a second `full_replace` write
+   would read as "delete everything not in this chunk" and erase the previous chunk's
+   just-delivered records. A `413 Payload Too Large` response from a target additionally triggers
+   adaptive splitting: the offending chunk is halved and each half resent (recursively, if still
+   too large), with the same first-piece-only-keeps-the-original-mode rule applied to the halves.
+5. **Log:** Write detailed outcome to `sync_logs`, including the count of records sanitized by the
+   bogon filter.
 
 #### B. Inter-Vault Sync Pipeline (Vault-to-Vault Delta)
 1. **Fetch Delta:** Query source Vault via `GET /api/ips?group_name=X&since=<last_sync_at>&include_deleted=true`, transparently paginating (`limit`/`offset`) through the full delta result set and retrying transient per-page failures independently. `since` and `include_deleted=true` are what make this an *incremental* fetch — see point 3 below for why that rules out `full_replace` for this pipeline.
-2. **Chunking & Batching:** Group incoming delta records (including soft-deleted tombstones) into lots of 5,000 records.
+2. **Sanitize (optional) & Batch:** Unless `vault_sync_tasks.skip_bogon_filtering` is `true` (default `false`), the fetched delta's addresses are run through the same pre-push bogon filter as external ingestion (`bogon::sanitize`) before chunking — a source vault's own records could otherwise contain loopback/private/reserved addresses a target vault has no business receiving. Group the (possibly sanitized) incoming delta records (including soft-deleted tombstones) into lots of 5,000 records.
 3. **Replicate:** Post chunked payload to `POST /api/records/batch` in mode `"upsert"` on all target Vaults (defined in `vault_sync_task_targets`). Unlike external ingestion, `vault_sync_tasks.mode` is **strictly `"upsert"`, deliberately not extended to `full_replace`**: a delta batch is a small incremental slice, not a group's full content, so a `full_replace` write here would read as "delete everything in the target group this run's delta didn't happen to touch" — which is nearly everything, on every run. The `413`-adaptive-splitting behavior still applies (it's a property of `client::post_batch`, independent of mode).
 4. **Timestamp Update:** On success across all targets, update `vault_sync_tasks.last_sync_at` to the job start timestamp.
 
@@ -184,11 +236,11 @@ directory that contains a `.git` — see that script for the graceful offline-mo
 
 ### 4. Scheduler & Manual Execution
 
-- **Background Cron Scheduler:** Uses an in-process async scheduler (`tokio-cron-scheduler`) reading active `external_sources` and `vault_sync_tasks` schedules.
+- **Background Cron Scheduler:** Uses an in-process async scheduler (`tokio-cron-scheduler`) reading active `destination_groups` (one job per group, covering every child feed) and `vault_sync_tasks` schedules.
 - **Manual Trigger Endpoints:**
-  - `POST /api/sources/{id}/trigger`
+  - `POST /api/destination-groups/{id}/trigger`
   - `POST /api/sync-tasks/{id}/trigger`
-- **Execution Rights:** Non-master keys holding `can_sync = true` permission on a specific source or sync task can manually trigger immediate execution outside the cron schedule.
+- **Execution Rights:** Non-master keys holding `can_sync = true` permission on a specific destination group or sync task can manually trigger immediate execution outside the cron schedule. A feed has no permission row of its own — triggering always operates at the group level, running every one of its feeds.
 
 ---
 
@@ -204,7 +256,7 @@ Implements `RBAC_MODEL.md` (Master / Parent / Daughter):
 
 ### 6. Audit Trail
 
-Every mutating action (Key CRUD, Vault Endpoint CRUD, External Source CRUD, Sync Task CRUD, Permission updates) writes an entry to `audit_logs` storing denormalized actor details (`api_key_id`, `api_key_name`, `api_key_prefix`, `client_ip`), `action`, `target_resource`, and timestamp. `api_key_name`, `api_key_prefix`, and `client_ip` are **`NOT NULL`** (since `m20260818_010217_audit_attribution_not_null`): `api_key_id` is nullable and `ON DELETE SET NULL` specifically so deleting a key cannot erase the record of what it did, which means the denormalized snapshot columns are the *only* attribution that survives the key — an audit row with no name/prefix/IP recorded would be an action with no representable actor at all. See the migration's own module doc for the full rationale and the pre-`NOT NULL` backfill it performs.
+Every mutating action (Key CRUD, Vault Endpoint CRUD, Destination Group CRUD, Feed CRUD, Sync Task CRUD, Permission updates) writes an entry to `audit_logs` storing denormalized actor details (`api_key_id`, `api_key_name`, `api_key_prefix`, `client_ip`), `action`, `target_resource`, and timestamp. `api_key_name`, `api_key_prefix`, and `client_ip` are **`NOT NULL`** (since `m20260818_010217_audit_attribution_not_null`): `api_key_id` is nullable and `ON DELETE SET NULL` specifically so deleting a key cannot erase the record of what it did, which means the denormalized snapshot columns are the *only* attribution that survives the key — an audit row with no name/prefix/IP recorded would be an action with no representable actor at all. See the migration's own module doc for the full rationale and the pre-`NOT NULL` backfill it performs.
 
 ---
 
@@ -222,7 +274,8 @@ change and audited whenever a new migration is added:
    and that list's order **must** match filename order — the filename is not decorative, it is the
    mechanism a human (or an agent) uses to verify the applied order matches the intended one at a
    glance. Current migrations: `m20260101_013240_initial_schema.rs`,
-   `m20260101_013241_derive_master_marker.rs`, `m20260818_010217_audit_attribution_not_null.rs`.
+   `m20260101_013241_derive_master_marker.rs`, `m20260818_010217_audit_attribution_not_null.rs`,
+   `m20260928_033617_destination_groups.rs`, `m20260928_034145_vault_sync_task_bogon_filtering.rs`.
    **Renaming an already-applied migration is a breaking change against any deployed database**
    (its filename is the identifier recorded in `seaql_migrations`) and must not be done against a
    database with real history; the three current files were renamed to this literal-time format on
@@ -285,8 +338,8 @@ change and audited whenever a new migration is added:
      advance `last_sync_at`, and must never attempt the chunk(s) after the one that failed.
   6. Manual trigger permissions (`can_sync` vs unauthorized 403).
   7. Adversarial infrastructure tests (`ADVERSARIAL(§N)` for master uniqueness).
-  8. Cron expression validation: `POST /api/sources` and `POST /api/sync-tasks` must reject a
-     malformed `cron_schedule` with `400` before any database write.
+  8. Cron expression validation: `POST /api/destination-groups` and `POST /api/sync-tasks` must
+     reject a malformed `cron_schedule` with `400` before any database write.
   9. `static/app.js` source hygiene: zero JavaScript syntax errors, and every
      `document.getElementById()` reference resolvable against `static/index.html` (statically or
      dynamically injected).

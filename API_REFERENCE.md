@@ -230,66 +230,101 @@ Credentials (`api_key`, `signing_secret`) are **never** returned in any response
 
 ---
 
-## 5. External Sources — `/api/sources`
+## 5. Destination Groups & Feeds — `/api/destination-groups`
 
-Resource model: `external_sources` (+ `external_source_vault_targets` junction). Creation right:
-`can_manage_sources`. Handler file: `src/api/sources.rs`.
+Resource model: `destination_groups` (+ `destination_group_vault_targets` junction) as the
+RBAC-managed, scheduled parent; `external_sources` rows are its 1-to-N child feeds, fetched
+**concurrently** and aggregated into one deduplicated, sanitized set per group execution (see
+`AGENT.MD` §3.A). Creation right: `can_manage_sources`. Handler file: `src/api/sources.rs`.
 
 | Method & Path | Auth / RBAC | Request Body | Response |
 | :--- | :--- | :--- | :--- |
-| `GET /api/sources` | Visible rows only: Master, owner, or any key with a permission row. | — | `200` `ExternalSourceResponse[]`. |
-| `GET /api/sources/{id}` | Same visibility rule; otherwise `404`. | — | `200` `ExternalSourceResponse`. |
-| `POST /api/sources` | `can_manage_sources` or Master. | `CreateExternalSourcePayload` | `200` `ExternalSourceResponse`. `400` if `parser_type` isn't `REGEX_LINE`/`JSON_PATH`, if `mode` isn't `upsert`/`full_replace`, or if `cron_schedule` fails cron validation. `409` on duplicate `name`. Auto-grants the creator full permissions; registers the job with the cron scheduler if `is_active`. |
-| `PATCH /api/sources/{id}` | RBAC R2 (`can_manage_keys` + `can_manage=true` on this source). | `UpdateExternalSourcePayload`, all fields optional | `200` `ExternalSourceResponse` (updated). Same `parser_type`/`mode`/`cron_schedule` validation as creation, applied only to fields actually present. Re-syncs the live scheduler entry. |
-| `DELETE /api/sources/{id}` | RBAC §3 (Master or owner only). | — | `204 No Content`. `404` on a lost TOCTOU race. Removes the live scheduler entry. |
-| `POST /api/sources/{id}/trigger` | `can_sync` on this source, or Master (`guard_can_sync`). | — | `200` `{"status": "SUCCESS"\|"FAILED"\|"PARTIAL", "items_processed": int, "chunks_sent": int, "duration_ms": int, "error_message": string\|null}`. `409` if a run for this source (cron or manual) is already in progress (`try_start_job` concurrency guard — refuses to overlap rather than racing two executions). |
-| `POST /api/sources/test-fetch` | `can_manage_sources` or Master (`guard_resource_creation`) — the same right creation itself requires, not a per-resource permission (there is no resource yet). | `TestFetchPayload`: `{"source_url": string, "parser_type": "REGEX_LINE"\|"JSON_PATH", "parser_config_json": string\|null}` | `200` `{"status": "SUCCESS"\|"FAILED"\|"PARTIAL", "total_extracted": int, "sample": string[], "truncated": bool, "duration_ms": int, "error": string\|null}`. `400` only if `parser_type` itself is invalid — a feed/network failure is reported as `status: "FAILED"` with `error` set, not an HTTP error, since that is exactly the information this endpoint exists to surface. `sample` is capped at 50 entries (`truncated: true` beyond that; `total_extracted` is always the true count). Runs the same `jobs::external_ingestion::fetch_and_parse` pipeline a real scheduled run uses — same retry policy, same decompression-bomb ceiling, same custom-header/User-Agent handling — but never pushes to any vault, and writes neither a `sync_logs` nor an `audit_logs` row (read-only; works against values that have never been saved, unlike every other `/api/sources/*` route, which is the point — it exists to be tried before `POST /api/sources` itself). |
+| `GET /api/destination-groups` | Visible rows only: Master, owner, or any key with a permission row. | — | `200` `DestinationGroupResponse[]`, each with its `feeds` nested inline. |
+| `GET /api/destination-groups/{id}` | Same visibility rule; otherwise `404`. | — | `200` `DestinationGroupResponse`. |
+| `POST /api/destination-groups` | `can_manage_sources` or Master. | `CreateDestinationGroupPayload` | `200` `DestinationGroupResponse` (`feeds: []` — created with none). `400` if `mode` isn't `upsert`/`full_replace`, or if `cron_schedule` fails cron validation. `409` on duplicate `name`. Auto-grants the creator full permissions on the group; registers the job with the cron scheduler if `is_active`. |
+| `PATCH /api/destination-groups/{id}` | RBAC R2 (`can_manage_keys` + `can_manage=true` on this group). | `UpdateDestinationGroupPayload`, all fields optional | `200` `DestinationGroupResponse` (updated). Same `mode`/`cron_schedule` validation as creation. Re-syncs the live scheduler entry. |
+| `DELETE /api/destination-groups/{id}` | RBAC §3 (Master or owner only). | — | `204 No Content`. `404` on a lost TOCTOU race. Cascades to every child feed and target-vault mapping. Removes the live scheduler entry. |
+| `POST /api/destination-groups/{id}/trigger` | `can_sync` on this group, or Master (`guard_can_sync`). | — | `200` `{"status": "SUCCESS"\|"FAILED"\|"PARTIAL", "items_processed": int, "chunks_sent": int, "duration_ms": int, "error_message": string\|null}`. `409` if a run for this group (cron or manual) is already in progress (`try_start_job` concurrency guard). |
+| `POST /api/destination-groups/{group_id}/feeds` | RBAC R2 on the owning group — a feed has no permission row of its own. | `CreateFeedPayload` | `200` `FeedResponse`. `400` if `parser_type` isn't `REGEX_LINE`/`JSON_PATH`, if `max_age_days` isn't positive, or — for `JSON_PATH` — if `parser_config_json`'s `target_address` selector is missing or not `$.`-prefixed (`parsers::json_path::validate_config`). `409` on duplicate feed `name` (unique across all feeds, regardless of group). |
+| `PATCH /api/destination-groups/{group_id}/feeds/{feed_id}` | RBAC R2 on the owning group. | `UpdateFeedPayload`, all fields optional | `200` `FeedResponse` (updated). `404` if `feed_id` doesn't belong to `group_id` (oracle discipline — indistinguishable from a nonexistent feed). Same `JSON_PATH` config validation as creation. |
+| `DELETE /api/destination-groups/{group_id}/feeds/{feed_id}` | RBAC R2 on the owning group. | — | `204 No Content`. `404` if the feed doesn't exist or doesn't belong to `group_id`. |
+| `POST /api/sources/test-fetch` | `can_manage_sources` or Master (`guard_resource_creation`) — the same right creating a group requires, not a per-resource permission (there is no resource yet; unrelated to grouping, tests an arbitrary URL/parser combination directly). | `TestFetchPayload`: `{"source_url": string, "parser_type": "REGEX_LINE"\|"JSON_PATH", "parser_config_json": string\|null}` | `200` `{"status": "SUCCESS"\|"FAILED"\|"PARTIAL", "total_extracted": int, "sample": string[], "truncated": bool, "duration_ms": int, "error": string\|null}`. `400` if `parser_type` (or, for `JSON_PATH`, `parser_config_json`'s own shape) is invalid — a feed/network failure is reported as `status: "FAILED"` with `error` set, not an HTTP error. `sample` is capped at 50 entries (`truncated: true` beyond that; `total_extracted` is always the true count). Runs the same `jobs::external_ingestion::fetch_and_parse` pipeline a real scheduled run uses, but never pushes to any vault, and writes neither a `sync_logs` nor an `audit_logs` row. |
 
-### Response Schema — `ExternalSourceResponse`
+### Response Schema — `DestinationGroupResponse`
 
 | Field | Type | Notes |
 | :--- | :--- | :--- |
 | `id` | UUID | |
 | `name` | string | Unique |
-| `source_url` | string | |
-| `parser_type` | string | `"REGEX_LINE"` or `"JSON_PATH"` |
-| `parser_config_json` | string \| null | |
-| `cron_schedule` | string | |
 | `target_group_name` | string | Default group name in target vaults |
+| `cron_schedule` | string | |
 | `mode` | string | `"upsert"` or `"full_replace"` |
 | `is_active` | bool | |
-| `last_run_at` | ISO-8601 datetime \| null | |
-| `owner_key_id` | UUID \| null | |
-| `targets` | `TargetSpec[]` | Resolved from `external_source_vault_targets` |
+| `skip_bogon_filtering` | bool | `false` (default) sanitizes the aggregated feed set before push; `true` bypasses it |
+| `last_run_at` | ISO-8601 datetime \| null | Across every child feed |
+| `owner_key_id` | UUID \| null | Also governs every child feed |
+| `targets` | `TargetSpec[]` | Resolved from `destination_group_vault_targets` |
+| `feeds` | `FeedResponse[]` | Every child feed, nested inline |
 | `created_at` / `updated_at` | ISO-8601 datetime | |
 
 `TargetSpec`: `{"vault_endpoint_id": UUID, "target_group_name": string | null}` (`null` falls back
-to the source's own `target_group_name`).
+to the group's own `target_group_name`).
+
+### Response Schema — `FeedResponse`
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `id` | UUID | |
+| `destination_group_id` | UUID | Owning group |
+| `name` | string | Unique across all feeds, regardless of group |
+| `source_url` | string | |
+| `parser_type` | string | `"REGEX_LINE"` or `"JSON_PATH"` |
+| `parser_config_json` | string \| null | See `parsers::json_path`'s `$.`-prefixed selector format for `JSON_PATH` |
+| `max_age_days` | int \| null | Discards a record older than this many days; only meaningful with a `last_seen_at`/`timestamp` selector configured |
+| `skip_bogon_filtering` | bool \| null | `null` inherits the owning group's setting; non-`null` overrides it for this feed's own contribution |
+| `created_at` / `updated_at` | ISO-8601 datetime | |
 
 ### Request Payloads
 
-**`CreateExternalSourcePayload`** (`deny_unknown_fields`):
+**`CreateDestinationGroupPayload`** (`deny_unknown_fields`):
 
 | Field | Type | Required | Default | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | `name` | string | yes | — | Must be unique |
-| `source_url` | string | yes | — | |
-| `parser_type` | string | no | `"REGEX_LINE"` | Must be `REGEX_LINE` or `JSON_PATH` |
-| `parser_config_json` | string \| null | no | `null` | |
-| `cron_schedule` | string | yes | — | Validated before any DB write |
 | `target_group_name` | string | yes | — | |
+| `cron_schedule` | string | yes | — | Validated before any DB write |
 | `mode` | string | no | `"upsert"` | `upsert` or `full_replace` |
 | `is_active` | bool | no | `true` | |
+| `skip_bogon_filtering` | bool | no | `false` | |
 | `targets` | `TargetSpec[]` | no | `[]` | |
 
-**`UpdateExternalSourcePayload`** (`deny_unknown_fields`) — every field optional; `targets`, when
+**`UpdateDestinationGroupPayload`** (`deny_unknown_fields`) — every field optional; `targets`, when
 present, **replaces** the full set (delete-then-reinsert), not a merge:
 
 | Field | Type |
 | :--- | :--- |
-| `name`, `source_url`, `parser_type`, `parser_config_json`, `cron_schedule`, `target_group_name`, `mode` | string \| omitted |
-| `is_active` | bool \| omitted |
+| `name`, `target_group_name`, `cron_schedule`, `mode` | string \| omitted |
+| `is_active`, `skip_bogon_filtering` | bool \| omitted |
 | `targets` | `TargetSpec[]` \| omitted |
+
+**`CreateFeedPayload`** (`deny_unknown_fields`):
+
+| Field | Type | Required | Default | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `name` | string | yes | — | Must be unique across all feeds |
+| `source_url` | string | yes | — | |
+| `parser_type` | string | no | `"REGEX_LINE"` | Must be `REGEX_LINE` or `JSON_PATH` |
+| `parser_config_json` | string \| null | no | `null` | Mandatory (and validated) for `JSON_PATH` |
+| `max_age_days` | int \| null | no | `null` | Must be positive if set |
+| `skip_bogon_filtering` | bool \| null | no | `null` | `null` inherits the group's setting |
+
+**`UpdateFeedPayload`** (`deny_unknown_fields`) — every field optional:
+
+| Field | Type |
+| :--- | :--- |
+| `name`, `source_url`, `parser_type`, `parser_config_json` | string \| omitted |
+| `max_age_days` | int \| omitted (no way to *clear* an existing value back to `null` via update today — re-create the feed, or see `UpdateFeedPayload`'s own doc comment) |
+| `skip_bogon_filtering` | bool \| omitted |
 
 ---
 
@@ -306,7 +341,7 @@ right — see `RBAC_MODEL.md`'s terminology note). Handler file: `src/api/sync_t
 | `POST /api/sync-tasks` | `can_manage_vaults` or Master. | `CreateVaultSyncTaskPayload` | `200` `VaultSyncTaskResponse`. `400` on a malformed `cron_schedule`. `409` on duplicate `name`. `mode` is always `"upsert"` server-side — not settable, deliberately (see field notes below). |
 | `PATCH /api/sync-tasks/{id}` | RBAC R2 (`can_manage_keys` + `can_manage=true` on this task). | `UpdateVaultSyncTaskPayload`, all fields optional | `200` `VaultSyncTaskResponse` (updated). |
 | `DELETE /api/sync-tasks/{id}` | RBAC §3 (Master or owner only). | — | `204 No Content`. `404` on a lost TOCTOU race. |
-| `POST /api/sync-tasks/{id}/trigger` | `can_sync` on this task, or Master. | — | `200` — identical response shape to `POST /api/sources/{id}/trigger` (§5). `409` if a run for this task is already in progress. |
+| `POST /api/sync-tasks/{id}/trigger` | `can_sync` on this task, or Master. | — | `200` — identical response shape to `POST /api/destination-groups/{id}/trigger` (§5). `409` if a run for this task is already in progress. |
 
 ### Response Schema — `VaultSyncTaskResponse`
 
@@ -321,6 +356,7 @@ right — see `RBAC_MODEL.md`'s terminology note). Handler file: `src/api/sync_t
 | `last_sync_at` | ISO-8601 datetime \| null | High-water mark for `since=` delta queries |
 | `mode` | string | Always `"upsert"` — **not** exposed as a settable field on either payload; a delta batch is never the group's full authoritative content, so `full_replace` semantics don't apply here |
 | `is_active` | bool | |
+| `skip_bogon_filtering` | bool | `false` (default) sanitizes the source vault's delta records (loopback/unspecified/private-IPv4/link-local) before push; `true` bypasses it |
 | `owner_key_id` | UUID \| null | |
 | `targets` | `TargetSpec[]` | Same shape as §5 |
 | `created_at` / `updated_at` | ISO-8601 datetime | |
@@ -338,6 +374,7 @@ server always sets `"upsert"`:
 | `target_group_name` | string | yes | — |
 | `cron_schedule` | string | yes | — |
 | `is_active` | bool | no | `true` |
+| `skip_bogon_filtering` | bool | no | `false` |
 | `targets` | `TargetSpec[]` | no | `[]` |
 
 **`UpdateVaultSyncTaskPayload`** (`deny_unknown_fields`) — every field optional, no `mode` field here either:
@@ -346,7 +383,7 @@ server always sets `"upsert"`:
 | :--- | :--- |
 | `name`, `source_group_name`, `target_group_name`, `cron_schedule` | string \| omitted |
 | `source_vault_id` | UUID \| omitted |
-| `is_active` | bool \| omitted |
+| `is_active`, `skip_bogon_filtering` | bool \| omitted |
 | `targets` | `TargetSpec[]` \| omitted |
 
 ---
@@ -399,7 +436,7 @@ Resource model: `audit_logs` (read-only, Master-only). Handler: `src/api/audit.r
 
 | Name | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `action` | string | no | none (no filter) | Exact-match on the `action` column (e.g. `KEY_CREATE`, `VAULT_DELETE`, `SOURCE_TRIGGER`, `PERMISSION_GRANT` — see §9 for the full action taxonomy) |
+| `action` | string | no | none (no filter) | Exact-match on the `action` column (e.g. `KEY_CREATE`, `VAULT_DELETE`, `GROUP_TRIGGER`, `PERMISSION_GRANT` — see §9 for the full action taxonomy) |
 | `limit` | integer | no | `100` | Clamped to a maximum of `1000` |
 | `offset` | integer | no | `0` | |
 
@@ -423,10 +460,10 @@ Ordered by `timestamp` descending.
 
 Every mutating route above writes exactly one `audit_logs` row with one of these `action` values:
 `KEY_CREATE`, `KEY_UPDATE`, `KEY_DELETE`, `KEY_ROTATE`, `KEY_ROTATE_SECRET`, `PERMISSION_GRANT`,
-`PERMISSION_REVOKE`, `VAULT_CREATE`, `VAULT_UPDATE`, `VAULT_DELETE`, `SOURCE_CREATE`,
-`SOURCE_UPDATE`, `SOURCE_DELETE`, `SOURCE_TRIGGER`, `SYNC_TASK_CREATE`, `SYNC_TASK_UPDATE`,
-`SYNC_TASK_DELETE`, `SYNC_TASK_TRIGGER`. `GET`/list routes and the two public probes never write an
-audit entry.
+`PERMISSION_REVOKE`, `VAULT_CREATE`, `VAULT_UPDATE`, `VAULT_DELETE`, `GROUP_CREATE`,
+`GROUP_UPDATE`, `GROUP_DELETE`, `GROUP_TRIGGER`, `FEED_CREATE`, `FEED_UPDATE`, `FEED_DELETE`,
+`SYNC_TASK_CREATE`, `SYNC_TASK_UPDATE`, `SYNC_TASK_DELETE`, `SYNC_TASK_TRIGGER`. `GET`/list routes
+and the two public probes never write an audit entry.
 
 ---
 
@@ -454,13 +491,16 @@ audit entry.
 | GET | `/api/vaults/{id}` | scoped | `get_vault_endpoint` |
 | PATCH | `/api/vaults/{id}` | R2 | `update_vault_endpoint` |
 | DELETE | `/api/vaults/{id}` | §3 | `delete_vault_endpoint` |
-| GET | `/api/sources` | scoped | `list_external_sources` |
-| POST | `/api/sources` | `can_manage_sources`/Master | `create_external_source` |
+| GET | `/api/destination-groups` | scoped | `list_destination_groups` |
+| POST | `/api/destination-groups` | `can_manage_sources`/Master | `create_destination_group` |
 | POST | `/api/sources/test-fetch` | `can_manage_sources`/Master | `test_fetch_external_source` |
-| GET | `/api/sources/{id}` | scoped | `get_external_source` |
-| PATCH | `/api/sources/{id}` | R2 | `update_external_source` |
-| DELETE | `/api/sources/{id}` | §3 | `delete_external_source` |
-| POST | `/api/sources/{id}/trigger` | `can_sync`/Master | `trigger_external_source` |
+| GET | `/api/destination-groups/{id}` | scoped | `get_destination_group` |
+| PATCH | `/api/destination-groups/{id}` | R2 | `update_destination_group` |
+| DELETE | `/api/destination-groups/{id}` | §3 | `delete_destination_group` |
+| POST | `/api/destination-groups/{id}/trigger` | `can_sync`/Master | `trigger_destination_group` |
+| POST | `/api/destination-groups/{group_id}/feeds` | R2 on owning group | `create_feed` |
+| PATCH | `/api/destination-groups/{group_id}/feeds/{feed_id}` | R2 on owning group | `update_feed` |
+| DELETE | `/api/destination-groups/{group_id}/feeds/{feed_id}` | R2 on owning group | `delete_feed` |
 | GET | `/api/sync-tasks` | scoped | `list_vault_sync_tasks` |
 | POST | `/api/sync-tasks` | `can_manage_vaults`/Master | `create_vault_sync_task` |
 | GET | `/api/sync-tasks/{id}` | scoped | `get_vault_sync_task` |

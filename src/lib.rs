@@ -8,6 +8,7 @@
 //! (`crypto`, `middleware`, `replay`, `master`).
 
 pub mod api;
+pub mod bogon;
 pub mod client;
 pub mod config;
 pub mod crypto;
@@ -27,7 +28,7 @@ pub mod scheduler;
 pub mod state;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use sea_orm::DatabaseConnection;
 use tower_http::services::ServeDir;
@@ -68,13 +69,21 @@ pub fn create_app(state: AppState) -> Router {
             "/vaults/{id}",
             get(api::get_vault_endpoint).patch(api::update_vault_endpoint).delete(api::delete_vault_endpoint),
         )
-        .route("/sources", get(api::list_external_sources).post(api::create_external_source))
         .route("/sources/test-fetch", post(api::test_fetch_external_source))
         .route(
-            "/sources/{id}",
-            get(api::get_external_source).patch(api::update_external_source).delete(api::delete_external_source),
+            "/destination-groups",
+            get(api::list_destination_groups).post(api::create_destination_group),
         )
-        .route("/sources/{id}/trigger", post(api::trigger_external_source))
+        .route(
+            "/destination-groups/{id}",
+            get(api::get_destination_group).patch(api::update_destination_group).delete(api::delete_destination_group),
+        )
+        .route("/destination-groups/{id}/trigger", post(api::trigger_destination_group))
+        .route("/destination-groups/{group_id}/feeds", post(api::create_feed))
+        .route(
+            "/destination-groups/{group_id}/feeds/{feed_id}",
+            patch(api::update_feed).delete(api::delete_feed),
+        )
         .route("/sync-tasks", get(api::list_vault_sync_tasks).post(api::create_vault_sync_task))
         .route(
             "/sync-tasks/{id}",

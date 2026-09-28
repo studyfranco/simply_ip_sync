@@ -160,26 +160,27 @@ async fn a_malformed_id_and_a_nonexistent_id_are_indistinguishable() {
 // High-contention deletion: the TOCTOU class rows_affected-checking exists to close
 // ---------------------------------------------------------------------------------------------
 
+/// Inserts a `destination_groups` row — the resource `DELETE /api/destination-groups/{id}` now
+/// operates on (`delete_destination_group`, the same `rows_affected`-checking TOCTOU guard this
+/// test's own doc comment below describes, formerly on `delete_external_source`).
 async fn insert_source_for_deletion(conn: &sea_orm::DatabaseConnection, owner_key_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     let now = chrono::Utc::now();
-    let model = simply_ip_sync::entities::external_source::ActiveModel {
+    let model = simply_ip_sync::entities::destination_group::ActiveModel {
         id: sea_orm::Set(id),
-        name: sea_orm::Set(format!("contention-source-{id}")),
-        source_url: sea_orm::Set("http://127.0.0.1:1/unused".to_owned()),
-        parser_type: sea_orm::Set("REGEX_LINE".to_owned()),
-        parser_config_json: sea_orm::Set(None),
-        cron_schedule: sea_orm::Set("0 0 * * *".to_owned()),
+        name: sea_orm::Set(format!("contention-group-{id}")),
         target_group_name: sea_orm::Set("group".to_owned()),
+        cron_schedule: sea_orm::Set("0 0 * * *".to_owned()),
         mode: sea_orm::Set("upsert".to_owned()),
         is_active: sea_orm::Set(true),
+        skip_bogon_filtering: sea_orm::Set(false),
         last_run_at: sea_orm::Set(None),
         owner_key_id: sea_orm::Set(Some(owner_key_id)),
         created_at: sea_orm::Set(now),
         updated_at: sea_orm::Set(now),
     };
     use sea_orm::ActiveModelTrait as _;
-    model.insert(conn).await.expect("insert source");
+    model.insert(conn).await.expect("insert destination group");
     id
 }
 
@@ -211,7 +212,7 @@ fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestam
 /// hand-rolled lock — so `tokio::spawn` (real concurrent tasks, not a sequential `tokio::join!` of
 /// two) is the right tool: it genuinely interleaves many in-flight requests against the
 /// single-connection pool, which is exactly the scenario the `rows_affected` check must survive.
-/// Before that check was added to `delete_external_source` (and the equivalent three handlers),
+/// Before that check was added to `delete_destination_group` (and the equivalent three handlers),
 /// this test reproduced multiple `204`s for one row with a two-way race; at 16-way it would have
 /// done so far more reliably.
 #[tokio::test]
@@ -223,7 +224,7 @@ async fn sixteen_concurrent_deletes_of_the_same_resource_admit_exactly_one_succe
 
     let app = simply_ip_sync::create_app(state);
     let base_ts = chrono::Utc::now().timestamp();
-    let target = format!("/api/sources/{source_id}");
+    let target = format!("/api/destination-groups/{source_id}");
 
     let mut handles = Vec::with_capacity(CONCURRENCY as usize);
     for i in 0..CONCURRENCY {

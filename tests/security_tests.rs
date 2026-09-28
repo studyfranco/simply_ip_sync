@@ -472,8 +472,14 @@ async fn tampering_a_single_byte_deep_in_a_large_body_is_still_detected() {
     assert!(body_bytes.len() > 100_000, "the payload must be large enough that a prefix-only signature bug wouldn't be caught by chance");
 
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let valid_signature =
-        simply_ip_sync::crypto::compute_signature(&master.signing_secret, "POST", "/api/sources", &timestamp, &body_bytes).expect("sign");
+    let valid_signature = simply_ip_sync::crypto::compute_signature(
+        &master.signing_secret,
+        "POST",
+        "/api/destination-groups",
+        &timestamp,
+        &body_bytes,
+    )
+    .expect("sign");
 
     // Flip one byte at the exact midpoint of the body — deliberately far from both the start and
     // end, where a partial-coverage bug would be most likely to still (wrongly) verify.
@@ -483,7 +489,7 @@ async fn tampering_a_single_byte_deep_in_a_large_body_is_still_detected() {
 
     let mut req = Request::builder()
         .method("POST")
-        .uri("/api/sources")
+        .uri("/api/destination-groups")
         .header("X-API-Key", master.plaintext_key.clone())
         .header("X-Timestamp", timestamp)
         .header("X-Signature-256", valid_signature)

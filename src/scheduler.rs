@@ -1,6 +1,8 @@
-//! In-process cron scheduler, wrapping `tokio-cron-scheduler`. Loads active `external_sources`
+//! In-process cron scheduler, wrapping `tokio-cron-scheduler`. Loads active `destination_groups`
 //! and `vault_sync_tasks` at boot and keeps the live job set in sync with CRUD mutations, so a
-//! change to `cron_schedule` or `is_active` never requires a restart to take effect.
+//! change to `cron_schedule` or `is_active` never requires a restart to take effect. Scheduling
+//! keys off the destination group, not its individual child feeds — a group's 1-to-N feeds are
+//! always fetched together, as one execution (`jobs::external_ingestion::run`).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,7 +11,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 use uuid::Uuid;
 
-use crate::entities::{external_source, vault_sync_task};
+use crate::entities::{destination_group, vault_sync_task};
 use crate::state::AppState;
 
 /// Converts a conventional 5-field cron expression (`min hour dom month dow`, as documented in
@@ -65,15 +67,15 @@ impl SchedulerHandle {
         })
     }
 
-    /// Loads every `is_active = true` external source and sync task from the database and
+    /// Loads every `is_active = true` destination group and sync task from the database and
     /// registers a cron job for each. Called once at startup, after `AppState` is fully built.
     pub async fn boot(&self, state: &AppState) -> Result<(), sea_orm::DbErr> {
-        let sources = external_source::Entity::find()
-            .filter(external_source::Column::IsActive.eq(true))
+        let groups = destination_group::Entity::find()
+            .filter(destination_group::Column::IsActive.eq(true))
             .all(&state.db)
             .await?;
-        for source in &sources {
-            self.upsert_source(state, source).await;
+        for group in &groups {
+            self.upsert_source(state, group).await;
         }
 
         let tasks = vault_sync_task::Entity::find()
@@ -86,53 +88,57 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// (Re)registers the cron job for `source`. Removes any existing job for the same id first,
-    /// so this is safe to call on every create/update.
-    pub async fn upsert_source(&self, state: &AppState, source: &external_source::Model) {
-        self.remove_source(source.id).await;
-        if !source.is_active {
+    /// (Re)registers the cron job for destination group `group`. Removes any existing job for the
+    /// same id first, so this is safe to call on every create/update. Named `upsert_source`
+    /// (rather than `upsert_group`) for continuity with `remove_source`/`source_jobs` below and
+    /// with `upsert_task`/`remove_task`'s naming pattern for `vault_sync_tasks` — both name the
+    /// *kind of scheduled thing*, not the current entity name, and a destination group is still
+    /// "the external-source-ingestion side" of the scheduler as opposed to "the vault-sync side".
+    pub async fn upsert_source(&self, state: &AppState, group: &destination_group::Model) {
+        self.remove_source(group.id).await;
+        if !group.is_active {
             return;
         }
-        let cron = normalize_cron(&source.cron_schedule);
+        let cron = normalize_cron(&group.cron_schedule);
         let state = state.clone();
-        let source_id = source.id;
+        let group_id = group.id;
         let job = match Job::new_async(cron.as_str(), move |_uuid, _lock| {
             let state = state.clone();
             Box::pin(async move {
-                let Some(_guard) = crate::jobs::try_start_job(&state.running_jobs, source_id) else {
+                let Some(_guard) = crate::jobs::try_start_job(&state.running_jobs, group_id) else {
                     tracing::warn!(
-                        "skipping scheduled external ingestion for {source_id}: a run (manual trigger or a slow prior tick) is already in progress"
+                        "skipping scheduled external ingestion for {group_id}: a run (manual trigger or a slow prior tick) is already in progress"
                     );
                     return;
                 };
-                if let Err(e) = crate::jobs::external_ingestion::run(&state, source_id).await {
-                    tracing::error!("scheduled external ingestion job {source_id} failed: {e}");
+                if let Err(e) = crate::jobs::external_ingestion::run(&state, group_id).await {
+                    tracing::error!("scheduled external ingestion job {group_id} failed: {e}");
                 }
             })
         }) {
             Ok(job) => job,
             Err(e) => {
-                tracing::error!("invalid cron_schedule for external source {source_id}: {e}");
+                tracing::error!("invalid cron_schedule for destination group {group_id}: {e}");
                 return;
             }
         };
         match self.scheduler.add(job).await {
             Ok(job_id) => {
                 if let Ok(mut map) = self.source_jobs.lock() {
-                    map.insert(source_id, job_id);
+                    map.insert(group_id, job_id);
                 }
             }
-            Err(e) => tracing::error!("failed to schedule external source {source_id}: {e}"),
+            Err(e) => tracing::error!("failed to schedule destination group {group_id}: {e}"),
         }
     }
 
-    /// Removes the scheduled job for external source `id`, if one is registered.
+    /// Removes the scheduled job for destination group `id`, if one is registered.
     pub async fn remove_source(&self, id: Uuid) {
         let existing = self.source_jobs.lock().ok().and_then(|mut map| map.remove(&id));
         if let Some(job_id) = existing
             && let Err(e) = self.scheduler.remove(&job_id).await
         {
-            tracing::warn!("failed to remove scheduled job for external source {id}: {e}");
+            tracing::warn!("failed to remove scheduled job for destination group {id}: {e}");
         }
     }
 

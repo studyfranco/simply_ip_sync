@@ -72,28 +72,28 @@ async fn junction_table_rows_cascade_on_parent_delete() {
     .await
     .expect("insert vault endpoint");
     db.execute_unprepared(
-        "INSERT INTO external_sources (id, name, source_url, parser_type, cron_schedule, target_group_name, mode, is_active, owner_key_id, created_at, updated_at) \
-         VALUES ('00000000-0000-0000-0000-000000000003', 's1', 'http://feed', 'REGEX_LINE', '0 0 * * *', 'g', 'upsert', 1, NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+        "INSERT INTO destination_groups (id, name, target_group_name, cron_schedule, mode, is_active, skip_bogon_filtering, owner_key_id, created_at, updated_at) \
+         VALUES ('00000000-0000-0000-0000-000000000003', 'g1', 'g', '0 0 * * *', 'upsert', 1, 0, NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
     )
     .await
-    .expect("insert external source");
+    .expect("insert destination group");
     db.execute_unprepared(
-        "INSERT INTO external_source_vault_targets (external_source_id, vault_endpoint_id, target_group_name) \
+        "INSERT INTO destination_group_vault_targets (destination_group_id, vault_endpoint_id, target_group_name) \
          VALUES ('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000002', NULL)",
     )
     .await
     .expect("insert junction row");
 
-    db.execute_unprepared("DELETE FROM external_sources WHERE id = '00000000-0000-0000-0000-000000000003'")
+    db.execute_unprepared("DELETE FROM destination_groups WHERE id = '00000000-0000-0000-0000-000000000003'")
         .await
-        .expect("delete source");
+        .expect("delete destination group");
 
     let remaining = db
         .query_all_raw(Statement::from_string(
             db.get_database_backend(),
-            "SELECT * FROM external_source_vault_targets".to_owned(),
+            "SELECT * FROM destination_group_vault_targets".to_owned(),
         ))
         .await
         .expect("query junction table");
-    assert!(remaining.is_empty(), "junction row must cascade-delete with its parent source");
+    assert!(remaining.is_empty(), "junction row must cascade-delete with its parent destination group");
 }
