@@ -1069,3 +1069,84 @@ async fn test_inter_vault_sync_high_volume_partial_overlap() {
         "last_sync_at must move forward to this execution's start ({second_high_water} vs {first_high_water})"
     );
 }
+
+/// A task's very *first* sync (`last_sync_at` still `None`, so the delta fetch carries no `since`
+/// at all and asks the source for its whole group) fetching zero raw records is a much stronger
+/// signal than the same count on a later run — there is nothing for it to be incremental about.
+/// The most common real cause is `source_group_name` not actually matching anything on the source
+/// vault (a typo, or a case mismatch — group names are matched case-sensitively there), which
+/// otherwise produces an indistinguishable `SUCCESS`/`0 items_processed`/no error forever. This
+/// must surface as `PARTIAL` with an explanatory message instead of silently looking identical to
+/// "nothing new since last sync".
+#[tokio::test]
+async fn first_sync_fetching_zero_records_is_reported_as_partial_not_silently_successful() {
+    let (conn, state, _master) = common::setup().await;
+
+    let source_mock = MockServer::start().await;
+    let target_mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&source_mock)
+        .await;
+
+    let source_id = insert_vault(&conn, "empty-source", &source_mock.uri()).await;
+    let target_id = insert_vault(&conn, "empty-target", &target_mock.uri()).await;
+    let task_id = insert_task(&conn, source_id, target_id).await;
+
+    let before = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
+    assert!(before.last_sync_at.is_none(), "this must be the task's first sync");
+
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    assert_eq!(summary.status, "PARTIAL", "a first sync fetching nothing must not look identical to a routine empty delta");
+    assert_eq!(summary.items_processed, 0);
+    assert_eq!(summary.chunks_sent, 0, "nothing to push, so nothing is sent to the target");
+    let message = summary.error_message.expect("the anomaly must be explained, not left as a bare empty success");
+    assert!(message.contains("source-group"), "must name the group that returned nothing: {message}");
+    assert!(message.contains("empty-source"), "must name the source vault: {message}");
+    assert!(message.to_lowercase().contains("case"), "must point at the most likely cause (a case mismatch): {message}");
+
+    assert!(target_mock.received_requests().await.expect("recording enabled").is_empty(), "nothing should be pushed");
+
+    let after = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
+    assert!(after.last_sync_at.is_some(), "the warning does not block progress -- there was nothing to retry");
+}
+
+/// The companion case: once a task has already completed one successful sync (`last_sync_at` is
+/// `Some`), fetching zero *new* records on a later run is completely routine -- it just means
+/// nothing changed on the source since the last poll. This must stay a plain, silent `SUCCESS`
+/// exactly as before; only a *first* sync fetching nothing is anomalous (see the test above).
+#[tokio::test]
+async fn later_sync_fetching_zero_new_records_stays_a_silent_success() {
+    let (conn, state, _master) = common::setup().await;
+
+    let source_mock = MockServer::start().await;
+    let target_mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&source_mock)
+        .await;
+
+    let source_id = insert_vault(&conn, "steady-source", &source_mock.uri()).await;
+    let target_id = insert_vault(&conn, "steady-target", &target_mock.uri()).await;
+    let task_id = insert_task(&conn, source_id, target_id).await;
+
+    // Simulate a prior successful sync: a real production task would never still have
+    // `last_sync_at: None` the second time `run` is called against it.
+    let mut active: vault_sync_task::ActiveModel = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    active.last_sync_at = Set(Some(Utc::now() - chrono::Duration::hours(1)));
+    active.update(&conn).await.expect("seed a prior successful sync");
+
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    assert_eq!(summary.status, "SUCCESS");
+    assert_eq!(summary.items_processed, 0);
+    assert_eq!(summary.error_message, None, "a routine empty delta on a non-first sync must not be flagged");
+}

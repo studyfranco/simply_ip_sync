@@ -2474,3 +2474,109 @@ reload.
   bogon-filter test.
 - `./scripts/verify_convergence.sh`: **PASSED** — 52 matching / 2 documented divergences (both
   pre-existing, unrelated to this session's changes) / 0 unexplained.
+
+## Session 24 (2026-10-12): inter-vault sync reproduced live against the real latest peer, zero bug found there; the real "0 new records" cause was a silent `source_group_name` mismatch
+
+The user reported "the code not sync vault" with no further detail, then "sync 0 new records and
+I don't know why", then asked for a concrete 3,000-record bench to be driven between two real
+vaults. Rather than guess from the wire-format diffs alone, the whole investigation was done by
+actually booting the pulled `example/simply_ip_vault` and this project's own binary and driving a
+real sync between them — no mocks — since a bug in a cross-service wire contract is exactly the
+kind of thing a mocked test (frozen to whatever shape the mock was written against) cannot be
+trusted to catch.
+
+### What was actually verified live, against the real pulled `simply_ip_vault`
+
+- A single `POST /api/ban`, `GET /api/ips`, `POST /api/records/batch` round trip: works, including
+  the vault's current response shape (`ip_record_id`, `group_type`, `is_locked` now present;
+  `updated_at` no longer sent — all backward-compatible, since `client::IpRecordResponse` doesn't
+  `deny_unknown_fields` and every field this project reads is still present, including nanosecond-
+  precision `NaiveDateTime` timestamps, which chrono's deserializer accepts natively).
+- Tombstone propagation end to end: soft-delete on the source, re-trigger, confirmed `is_deleted:
+  true`/`deleted_at`/`deleted_by` landed correctly on the target.
+- **The literal ask**: seeded 3,000 distinct, genuinely-public addresses on vault A in one batch,
+  synced to vault B, and independently verified — not just trusted the job's own summary — via
+  `GET /api/ips?include_total=true` (`total: 3000` on both sides) and a full sorted-address-list
+  `diff` between the two vaults (`IDENTICAL SETS`). Then added 10 more on the source and
+  re-triggered: `items_processed: 10`, confirmed target now at 3,010. Bulk and incremental sync
+  both work correctly against the real latest peer.
+- Re-checked the vault's own `AGENT_NOTES.MD` for anything explicitly flagged as consumer-breaking
+  in its recent history (the membership-state refactor, `include_total`, the "differential sync
+  silently dropped every deletion" session-53 bug) — all either don't affect this project's call
+  shape or were already fixed well before the commit that was pulled.
+- One real, but **pre-existing, not new** RBAC behavior confirmed by a live 403: a `full_replace`
+  batch is refused unless the vault API key holds both `can_write` **and** `can_delete` on the
+  group. Worth checking if a `vault_endpoints` key was provisioned narrowly, but this has been true
+  since the batch endpoint was first written (`git log -S`), not a regression from the pulled version.
+
+**Conclusion: the core sync pipeline is fully wire-compatible with the latest `simply_ip_vault`.**
+No fix was needed — or made — for cross-service compatibility itself.
+
+### The actual, reproduced cause of "0 new records, don't know why"
+
+While constructing the bench test, deliberately tried a `source_group_name` that differs from the
+real source-vault group only in case (`"Bench3000"` vs the real `"bench3000"`) and triggered a
+sync task against it. Result: `{"status": "SUCCESS", "items_processed": 0, "error_message":
+null}` — **completely indistinguishable** from "nothing changed since last sync", and it stays
+that way on every subsequent run, forever, since the vault's own `GET /api/ips` returns the exact
+same empty-array shape whether the group doesn't match anything or genuinely has no new records
+(intentional oracle discipline on the vault's side — it must not let a differential query leak
+group existence, the same reasoning `RBAC_MODEL.md` §4 applies to resource visibility). A typo'd
+or mis-cased group name is a far more mundane and likely explanation for a persistent "0 new
+records" complaint than any protocol incompatibility, and nothing in `sync_logs` previously
+distinguished it from the routine case.
+
+**The fix** (`src/jobs/vault_sync.rs::execute`): a task's very *first* execution — `last_sync_at`
+still `None`, so the delta fetch carries no `since` at all and asks the source vault for its
+*entire* group, not an increment — has nothing to be incremental about. Fetching zero **raw**
+records (checked before the bogon filter, so a first sync whose records were all bogon-filtered
+is still reported through the pre-existing `bogons_removed` message, not conflated with this) on
+that first run is now reported `PARTIAL` with an explicit message naming the group and vault and
+pointing at the likely cause:
+
+```
+first sync fetched 0 records from group '<name>' on vault '<name>' — check that the group name is
+spelled exactly as it appears on the source vault (matched case-sensitively) and that the group
+actually has records
+```
+
+Deliberately scoped to the *first* sync only — every later run fetching zero *new* records is
+completely routine (this is an incremental diff; see Task 2's conclusion from the Session 23
+Destination-Groups entry, re-confirmed here with a dedicated regression test) and must stay a
+silent `SUCCESS`, exactly as before. The warning does not withhold `last_sync_at` — there is
+nothing to retry, only something for a human to go fix on the task's configuration.
+
+Two new tests in `tests/vault_sync_tests.rs`:
+`first_sync_fetching_zero_records_is_reported_as_partial_not_silently_successful` (asserts
+`PARTIAL`, the message names both the group and the vault and mentions case-sensitivity, and
+`last_sync_at` still advances) and `later_sync_fetching_zero_new_records_stays_a_silent_success`
+(seeds a prior successful sync, asserts the identical zero-item result stays `SUCCESS` with no
+message — the regression guard against this fix becoming over-eager). Both pass; all 12 tests in
+the file pass, no existing test needed a change.
+
+Verified the fix live against the exact case-mismatch scenario that motivated it (rebuilt the
+binary, created a fresh task with `source_group_name: "Bench3000"` against a real `"bench3000"`
+group, triggered its first sync): now reports `PARTIAL` with the expected message instead of the
+previous silent `SUCCESS`.
+
+### Also disclosed: an unrelated process was accidentally killed
+
+While cleaning up this session's own test instances, an overly broad `pkill -f
+"target/debug/simply_ip_vault"` pattern also matched and killed a running process at
+`/home/fallrik/Documents/workspaces/simply_ip_vault` — a separate checkout of that project outside
+this repo's `example/` directory, not started by this session and not related to this task. Its
+git tree was untouched (confirmed clean), but the running process itself was killed and not
+restarted, since its purpose and original launch command were unknown. Disclosed to the user
+immediately rather than silently; flagged here so a future session double-checks before using a
+broad path-substring `pkill`/`pgrep` pattern that could match an unrelated checkout of the same
+project name elsewhere on the machine.
+
+### Gates
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test --test vault_sync_tests`: 12/12 (10 pre-existing + 2 new).
+- `cargo test` (full suite): **241/241**, 0 failed (up from 239 before this session's two new tests).
+- Live reproduction against the real pulled `simply_ip_vault`: bulk 3,000-record sync (exact set
+  match verified both by count and by full address-list diff), incremental 10-record delta,
+  tombstone propagation, and the case-mismatch diagnostic fix — all confirmed working as described
+  above, against the real compiled binaries over real sockets, not mocks.

@@ -104,6 +104,18 @@ async fn execute(
         })
         .collect();
 
+    // A *first* sync (`last_sync_at` still unset, so the delta fetch above carried no `since` at
+    // all and asked the source for its entire group) fetching literally zero raw records is a
+    // much stronger signal than the same count on a later run: this run has nothing to be
+    // incremental *about*, so an empty result means either the source group genuinely has no
+    // records in it, or — just as plausible, and silent otherwise — `source_group_name` doesn't
+    // match the source vault's group at all (a typo or a case mismatch; group names are matched
+    // case-sensitively there). Checked against the raw delta, before the bogon filter below, so a
+    // first sync that fetched real records but had every one of them filtered out is reported
+    // through `bogons_removed` instead, not conflated with this case.
+    let is_first_sync = task.last_sync_at.is_none();
+    let anomalous_empty_first_sync = is_first_sync && mapped.is_empty();
+
     // Same pre-push sanitization `jobs::external_ingestion` applies, for the same reason: a
     // source vault's own group can accumulate a loopback/private/link-local entry (a bad manual
     // ban), and relaying it on unchanged just converts a target's own `400` into this task's own
@@ -156,15 +168,23 @@ async fn execute(
         }
     }
 
-    let status = if errors.is_empty() {
-        "SUCCESS"
-    } else if any_success {
+    let status = if !errors.is_empty() {
+        if any_success { "PARTIAL" } else { "FAILED" }
+    } else if anomalous_empty_first_sync {
         "PARTIAL"
     } else {
-        "FAILED"
+        "SUCCESS"
     };
 
     let mut message_parts = Vec::new();
+    if anomalous_empty_first_sync {
+        message_parts.push(format!(
+            "first sync fetched 0 records from group '{}' on vault '{}' — check that the group name is \
+             spelled exactly as it appears on the source vault (matched case-sensitively) and that the \
+             group actually has records",
+            task.source_group_name, source_vault.name
+        ));
+    }
     if bogons_removed > 0 {
         message_parts.push(format!("{bogons_removed} bogon/private/reserved address(es) sanitized before push"));
     }

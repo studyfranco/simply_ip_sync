@@ -341,7 +341,7 @@ right — see `RBAC_MODEL.md`'s terminology note). Handler file: `src/api/sync_t
 | `POST /api/sync-tasks` | `can_manage_vaults` or Master. | `CreateVaultSyncTaskPayload` | `200` `VaultSyncTaskResponse`. `400` on a malformed `cron_schedule`. `409` on duplicate `name`. `mode` is always `"upsert"` server-side — not settable, deliberately (see field notes below). |
 | `PATCH /api/sync-tasks/{id}` | RBAC R2 (`can_manage_keys` + `can_manage=true` on this task). | `UpdateVaultSyncTaskPayload`, all fields optional | `200` `VaultSyncTaskResponse` (updated). |
 | `DELETE /api/sync-tasks/{id}` | RBAC §3 (Master or owner only). | — | `204 No Content`. `404` on a lost TOCTOU race. |
-| `POST /api/sync-tasks/{id}/trigger` | `can_sync` on this task, or Master. | — | `200` — identical response shape to `POST /api/destination-groups/{id}/trigger` (§5). `409` if a run for this task is already in progress. |
+| `POST /api/sync-tasks/{id}/trigger` | `can_sync` on this task, or Master. | — | `200` — identical response shape to `POST /api/destination-groups/{id}/trigger` (§5). `409` if a run for this task is already in progress. **Special case:** this task's very first execution (`last_sync_at` still `null`, so the delta fetch carries no `since` and asks the source vault for its entire group) fetching zero raw records is reported as `"PARTIAL"` with an explanatory `error_message` (most often a `source_group_name` that doesn't match anything on the source — group names are matched case-sensitively there), not a bare `"SUCCESS"` — on every later execution the same zero-new-records result is routine and stays a silent `"SUCCESS"`. |
 
 ### Response Schema — `VaultSyncTaskResponse`
 
