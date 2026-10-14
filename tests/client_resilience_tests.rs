@@ -269,6 +269,97 @@ async fn a_413_on_a_single_record_cannot_be_split_further_and_fails() {
     assert!(result.is_err(), "a single record that is itself too large must fail, not split infinitely");
 }
 
+/// A target that keeps returning `503` for a large batch (sustained contention — a long-held
+/// write transaction proportional to batch size, not a one-off blip) but succeeds once the batch
+/// is small enough must have the batch adaptively split, the same way a `413` is handled — a `503`
+/// at a given size is retried first (per `OUTBOUND_MAX_RETRIES`), and only *after* that budget is
+/// exhausted at that size does the client shrink the batch rather than giving up.
+#[tokio::test]
+async fn persistent_503_at_a_given_size_triggers_an_adaptive_split() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("OUTBOUND_RETRY_BACKOFF_MS", "5");
+        std::env::set_var("OUTBOUND_MAX_RETRIES", "1");
+    }
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+            let count = body["records"].as_array().expect("records array").len() as u64;
+            if count > 1250 {
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({"error": "Database busy or query timeout, please retry"}))
+            } else {
+                ResponseTemplate::new(200).set_body_json(batch_response_with_created(count))
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let cipher = SecretCipher::Plaintext;
+    let endpoint = mock_endpoint(&cipher, &mock_server.uri());
+    let http = client::build_http_client().expect("client builds");
+
+    let result = client::post_batch(&http, &cipher, &endpoint, "group", &records(5000), BatchMode::Upsert).await;
+
+    unsafe {
+        std::env::remove_var("OUTBOUND_RETRY_BACKOFF_MS");
+        std::env::remove_var("OUTBOUND_MAX_RETRIES");
+    }
+
+    let response = result.expect("splitting on a persistent 503 must eventually deliver the whole batch");
+    assert_eq!(response.created, 5000, "the aggregated response must reflect all 5000 records");
+
+    let received = mock_server.received_requests().await.expect("recording enabled");
+    let mut delivered_total = 0usize;
+    let mut delivered_count = 0usize;
+    let mut oversized_attempts = 0usize;
+    for req in &received {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+        let count = body["records"].as_array().expect("records array").len();
+        if count <= 1250 {
+            delivered_total += count;
+            delivered_count += 1;
+        } else {
+            oversized_attempts += 1;
+        }
+    }
+    assert_eq!(delivered_count, 4, "5000 records split down to four delivered ≤1250-record sub-batches");
+    assert_eq!(delivered_total, 5000, "the delivered sub-batches must together cover every record exactly once");
+    assert!(
+        oversized_attempts > 2,
+        "each oversized chunk size must be genuinely retried (not just attempted once) before being split: got {oversized_attempts} oversized attempts"
+    );
+}
+
+/// The split-on-persistent-failure behavior still has a floor: a single record that itself always
+/// 503s cannot be split any further and must surface as a real error, not loop forever.
+#[tokio::test]
+async fn a_persistent_503_on_a_single_record_cannot_be_split_further_and_fails() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("OUTBOUND_RETRY_BACKOFF_MS", "5");
+        std::env::set_var("OUTBOUND_MAX_RETRIES", "1");
+    }
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/api/records/batch")).respond_with(ResponseTemplate::new(503)).mount(&mock_server).await;
+
+    let cipher = SecretCipher::Plaintext;
+    let endpoint = mock_endpoint(&cipher, &mock_server.uri());
+    let http = client::build_http_client().expect("client builds");
+
+    let result = client::post_batch(&http, &cipher, &endpoint, "group", &records(1), BatchMode::Upsert).await;
+
+    unsafe {
+        std::env::remove_var("OUTBOUND_RETRY_BACKOFF_MS");
+        std::env::remove_var("OUTBOUND_MAX_RETRIES");
+    }
+
+    assert!(result.is_err(), "a single record that never succeeds must fail, not split or retry infinitely");
+}
+
 /// Task 2, applied to the delta-fetch side: a transient failure on one page of `GET /api/ips`
 /// must be retried for that page alone, and the overall fetch still succeeds.
 #[tokio::test]

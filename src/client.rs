@@ -305,10 +305,17 @@ async fn post_batch_with_retry(
 /// Sends `records` to `POST {target_url}/api/records/batch` on `endpoint`, signed with
 /// `CANONICAL_V1`, transparently handling two failure modes a caller should never need to think
 /// about: transient upstream errors (retried with exponential backoff — see
-/// [`post_batch_with_retry`]) and an oversized payload (`413 Payload Too Large` — the batch is
-/// split in half and each half sent as its own request, recursively, until every sub-chunk fits).
+/// [`post_batch_with_retry`]) and a batch the target can't accept at its current size — either a
+/// `413 Payload Too Large`, or a transient status (`429`/`502`/`503`/`504`) that *survived*
+/// [`post_batch_with_retry`]'s own retry budget at this chunk size. Either way the batch is split
+/// in half and each half sent as its own request, recursively, until every sub-chunk succeeds (or
+/// is down to a single record and still fails, which bubbles up as a real error). A target
+/// returning `503`/`"database busy"` for a very large batch is characteristically a transaction
+/// held open for the whole batch's sequential per-record work contending with other writers —
+/// shortening the transaction by sending fewer records at a time is a direct fix for that, not
+/// just a size workaround the way it is for `413`.
 ///
-/// `mode` applies to `records` as a whole; if a `413` forces a split, only the *first* resulting
+/// `mode` applies to `records` as a whole; if a split happens, only the *first* resulting
 /// sub-chunk keeps `mode` — every subsequent piece is forced to [`BatchMode::Upsert`], for the
 /// same reason [`crate::jobs::mode_for_chunk_index`] downgrades every chunk after the first at
 /// the job layer: a second `full_replace` write against a target that already received the first
@@ -333,17 +340,27 @@ pub async fn post_batch(
     while let Some((chunk, chunk_mode)) = queue.pop_front() {
         match post_batch_with_retry(http, cipher, endpoint, group_name, &chunk, chunk_mode).await {
             Ok(resp) => aggregate.merge(resp),
-            Err(ClientError::RemoteError { status: 413, body }) if chunk.len() > 1 => {
+            Err(ClientError::RemoteError { status, body })
+                if chunk.len() > 1 && (status == 413 || crate::retry::is_transient_status(status)) =>
+            {
                 let mid = chunk.len() / 2;
                 let mut first_half = chunk;
                 let second_half = first_half.split_off(mid);
                 tracing::warn!(
-                    "vault '{}' returned 413 for a batch of {} record(s); splitting into {} + {} and retrying: {body}",
+                    "vault '{}' returned {status} for a batch of {} record(s); splitting into {} + {} and retrying: {body}",
                     endpoint.name,
                     first_half.len() + second_half.len(),
                     first_half.len(),
                     second_half.len()
                 );
+                // A 413 is purely a size problem -- splitting fixes it immediately, nothing to
+                // wait on. A transient status that already exhausted its own retry budget at
+                // this chunk size is much more likely sustained contention on the target (a
+                // backlog it's still draining), so pause briefly before hitting it again, on top
+                // of the chunk itself now being smaller.
+                if status != 413 {
+                    tokio::time::sleep(crate::retry::backoff_with_jitter(1)).await;
+                }
                 let second_mode = match chunk_mode {
                     BatchMode::FullReplace => BatchMode::Upsert,
                     BatchMode::Upsert => BatchMode::Upsert,
