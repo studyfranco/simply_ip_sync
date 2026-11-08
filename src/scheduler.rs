@@ -134,7 +134,11 @@ impl SchedulerHandle {
 
     /// Removes the scheduled job for destination group `id`, if one is registered.
     pub async fn remove_source(&self, id: Uuid) {
-        let existing = self.source_jobs.lock().ok().and_then(|mut map| map.remove(&id));
+        let existing = self
+            .source_jobs
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&id));
         if let Some(job_id) = existing
             && let Err(e) = self.scheduler.remove(&job_id).await
         {
@@ -184,7 +188,11 @@ impl SchedulerHandle {
 
     /// Removes the scheduled job for sync task `id`, if one is registered.
     pub async fn remove_task(&self, id: Uuid) {
-        let existing = self.task_jobs.lock().ok().and_then(|mut map| map.remove(&id));
+        let existing = self
+            .task_jobs
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&id));
         if let Some(job_id) = existing
             && let Err(e) = self.scheduler.remove(&job_id).await
         {

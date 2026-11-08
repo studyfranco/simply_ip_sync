@@ -38,7 +38,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use super::{normalize_ip_or_cidr, FeedParser, ParseError, ParsedRecord};
+use super::{FeedParser, ParseError, ParsedRecord, normalize_ip_or_cidr};
 
 fn ip_token_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -100,12 +100,18 @@ impl FeedParser for RegexLineParser {
                 continue;
             }
             if let Some(combined) = netblock_and_prefix(trimmed) {
-                results.push(ParsedRecord { address: combined, last_seen_at: None });
+                results.push(ParsedRecord {
+                    address: combined,
+                    last_seen_at: None,
+                });
                 continue;
             }
             for candidate in pattern.find_iter(trimmed) {
                 if let Some(normalized) = normalize_ip_or_cidr(candidate.as_str()) {
-                    results.push(ParsedRecord { address: normalized, last_seen_at: None });
+                    results.push(ParsedRecord {
+                        address: normalized,
+                        last_seen_at: None,
+                    });
                 }
             }
         }
@@ -118,7 +124,12 @@ mod tests {
     use super::*;
 
     fn addrs(parser: &RegexLineParser, body: &[u8]) -> Vec<String> {
-        parser.parse(body, None).expect("parse").into_iter().map(|r| r.address).collect()
+        parser
+            .parse(body, None)
+            .expect("parse")
+            .into_iter()
+            .map(|r| r.address)
+            .collect()
     }
 
     #[test]
@@ -132,7 +143,10 @@ mod tests {
     fn extracts_cidr_and_bare_ip() {
         let parser = RegexLineParser;
         let body = b"10.0.0.0/8\n192.168.1.1\n";
-        assert_eq!(addrs(&parser, body), vec!["10.0.0.0/8".to_owned(), "192.168.1.1".to_owned()]);
+        assert_eq!(
+            addrs(&parser, body),
+            vec!["10.0.0.0/8".to_owned(), "192.168.1.1".to_owned()]
+        );
     }
 
     #[test]
@@ -156,7 +170,12 @@ mod tests {
     fn non_utf8_body_degrades_to_zero_entries_instead_of_erroring() {
         let parser = RegexLineParser;
         let body: &[u8] = &[0xff, 0xfe, 0x00];
-        assert!(parser.parse(body, None).expect("must not error on invalid UTF-8").is_empty());
+        assert!(
+            parser
+                .parse(body, None)
+                .expect("must not error on invalid UTF-8")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -165,7 +184,10 @@ mod tests {
         let mut body = b"1.2.3.4\n".to_vec();
         body.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8, no line break around it
         body.extend_from_slice(b"\n5.6.7.8\n");
-        assert_eq!(addrs(&parser, &body), vec!["1.2.3.4".to_owned(), "5.6.7.8".to_owned()]);
+        assert_eq!(
+            addrs(&parser, &body),
+            vec!["1.2.3.4".to_owned(), "5.6.7.8".to_owned()]
+        );
     }
 
     #[test]
@@ -194,7 +216,10 @@ mod tests {
         let parser = RegexLineParser;
         let body = b"45.74.28.0\t45.74.28.255\t24\t345\tM247\tRO\tabuse@m247.com\n\
                      66.132.186.0\t66.132.186.255\t24\t345\t-\t-\t-\n";
-        assert_eq!(addrs(&parser, body), vec!["45.74.28.0/24".to_owned(), "66.132.186.0/24".to_owned()]);
+        assert_eq!(
+            addrs(&parser, body),
+            vec!["45.74.28.0/24".to_owned(), "66.132.186.0/24".to_owned()]
+        );
     }
 
     /// Task 5: an inline comment after real content (not just a full-line comment) is stripped.
@@ -202,7 +227,14 @@ mod tests {
     fn inline_comment_after_content_is_stripped() {
         let parser = RegexLineParser;
         let body = b"1.2.3.4 # known scanner\n5.6.7.8 ; also flagged\n9.9.9.9 // noted\n";
-        assert_eq!(addrs(&parser, body), vec!["1.2.3.4".to_owned(), "5.6.7.8".to_owned(), "9.9.9.9".to_owned()]);
+        assert_eq!(
+            addrs(&parser, body),
+            vec![
+                "1.2.3.4".to_owned(),
+                "5.6.7.8".to_owned(),
+                "9.9.9.9".to_owned()
+            ]
+        );
     }
 
     /// Two independent whitespace-separated addresses on one line (no bare-integer third/second
@@ -212,6 +244,9 @@ mod tests {
     fn two_independent_addresses_on_one_line_are_not_mistaken_for_netblock_plus_prefix() {
         let parser = RegexLineParser;
         let body = b"1.2.3.4 5.6.7.8\n";
-        assert_eq!(addrs(&parser, body), vec!["1.2.3.4".to_owned(), "5.6.7.8".to_owned()]);
+        assert_eq!(
+            addrs(&parser, body),
+            vec!["1.2.3.4".to_owned(), "5.6.7.8".to_owned()]
+        );
     }
 }

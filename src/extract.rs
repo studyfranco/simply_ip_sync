@@ -37,9 +37,9 @@ where
                 axum::extract::rejection::JsonRejection::MissingJsonContentType(e) => {
                     Err(AppError::InvalidInput(e.to_string()))
                 }
-                axum::extract::rejection::JsonRejection::BytesRejection(e) => {
-                    Err(AppError::BodyRejected(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()))
-                }
+                axum::extract::rejection::JsonRejection::BytesRejection(e) => Err(
+                    AppError::BodyRejected(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
+                ),
                 other => Err(AppError::InvalidInput(other.to_string())),
             },
         }
@@ -58,7 +58,8 @@ pub struct StrictPath<T>(pub T);
 
 impl<S, T> axum::extract::FromRequestParts<S> for StrictPath<T>
 where
-    axum::extract::Path<T>: axum::extract::FromRequestParts<S, Rejection = axum::extract::rejection::PathRejection>,
+    axum::extract::Path<T>:
+        axum::extract::FromRequestParts<S, Rejection = axum::extract::rejection::PathRejection>,
     T: Send,
     S: Send + Sync,
 {

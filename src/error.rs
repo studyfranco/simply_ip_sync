@@ -3,9 +3,9 @@
 //! A variant here is a status code plus a message shape, never domain logic. Handlers convert
 //! into this type via `?` (through `#[from]` impls) or by constructing a variant directly.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 /// Every failure a handler, job, or background worker in this crate can return.
@@ -65,7 +65,9 @@ impl IntoResponse for AppError {
             AppError::Conflict(msg) => (StatusCode::CONFLICT, json!({ "error": msg })),
             AppError::ConflictWithDetails { message, details } => {
                 let mut body = json!({ "error": message });
-                if let (Some(body_map), Some(details_map)) = (body.as_object_mut(), details.as_object()) {
+                if let (Some(body_map), Some(details_map)) =
+                    (body.as_object_mut(), details.as_object())
+                {
                     for (key, value) in details_map {
                         body_map.insert(key.clone(), value.clone());
                     }

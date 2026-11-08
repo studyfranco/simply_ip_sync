@@ -73,21 +73,31 @@ pub async fn insert_key(
     };
     model.insert(conn).await.expect("insert key");
 
-    TestKey { id, plaintext_key, signing_secret }
+    TestKey {
+        id,
+        plaintext_key,
+        signing_secret,
+    }
 }
 
 /// Computes the three `CANONICAL_V1` headers a real client would send for `method`/`target`/`body`.
 pub fn sign(key: &TestKey, method: &str, target: &str, body: &[u8]) -> (String, String, String) {
     let timestamp = Utc::now().timestamp().to_string();
     let signature =
-        crypto::compute_signature(&key.signing_secret, method, target, &timestamp, body).expect("sign");
+        crypto::compute_signature(&key.signing_secret, method, target, &timestamp, body)
+            .expect("sign");
     (key.plaintext_key.clone(), timestamp, signature)
 }
 
 /// Builds a fully signed request against `target` (path plus query string), ready for
 /// `tower::ServiceExt::oneshot` against the real router. Manually inserts a `ConnectInfo`
 /// extension since the test harness never binds a real listener.
-pub fn signed_request(key: &TestKey, method: &str, target: &str, body: Option<serde_json::Value>) -> axum::http::Request<axum::body::Body> {
+pub fn signed_request(
+    key: &TestKey,
+    method: &str,
+    target: &str,
+    body: Option<serde_json::Value>,
+) -> axum::http::Request<axum::body::Body> {
     let body_bytes = match &body {
         Some(v) => serde_json::to_vec(v).expect("serialize body"),
         None => Vec::new(),
@@ -103,9 +113,14 @@ pub fn signed_request(key: &TestKey, method: &str, target: &str, body: Option<se
     if body.is_some() {
         builder = builder.header("Content-Type", "application/json");
     }
-    let mut req = builder.body(axum::body::Body::from(body_bytes)).expect("build request");
+    let mut req = builder
+        .body(axum::body::Body::from(body_bytes))
+        .expect("build request");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
     req
 }
 
@@ -262,12 +277,19 @@ impl MockVault {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VaultData> {
-        self.data.lock().expect("mock vault state lock is never held across a panic")
+        self.data
+            .lock()
+            .expect("mock vault state lock is never held across a panic")
     }
 
     /// Inserts (or refreshes) `addresses` in `group`, stamped `seen_at`. Used both for initial
     /// seeding and for "new records appeared on the source" mutations.
-    pub fn seed(&self, group: &str, addresses: impl IntoIterator<Item = String>, seen_at: DateTime<Utc>) {
+    pub fn seed(
+        &self,
+        group: &str,
+        addresses: impl IntoIterator<Item = String>,
+        seen_at: DateTime<Utc>,
+    ) {
         let stamp = seen_at.naive_utc();
         let mut data = self.lock();
         let entries = data.groups.entry(group.to_owned()).or_default();
@@ -333,7 +355,12 @@ impl MockVault {
         self.lock()
             .groups
             .get(group)
-            .map(|g| g.values().filter(|r| r.is_deleted).map(|r| r.target_address.clone()).collect())
+            .map(|g| {
+                g.values()
+                    .filter(|r| r.is_deleted)
+                    .map(|r| r.target_address.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -342,7 +369,12 @@ impl MockVault {
         self.lock()
             .groups
             .get(group)
-            .map(|g| g.values().filter(|r| !r.is_deleted).map(|r| r.target_address.clone()).collect())
+            .map(|g| {
+                g.values()
+                    .filter(|r| !r.is_deleted)
+                    .map(|r| r.target_address.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -420,8 +452,11 @@ impl MockVault {
             Some(l) => start.saturating_add(l as usize).min(matched.len()),
             None => matched.len(),
         };
-        let page: Vec<serde_json::Value> =
-            if start >= matched.len() { Vec::new() } else { matched[start..end].to_vec() };
+        let page: Vec<serde_json::Value> = if start >= matched.len() {
+            Vec::new()
+        } else {
+            matched[start..end].to_vec()
+        };
 
         guard.gets.push(RecordedGet {
             group_name,
@@ -474,8 +509,16 @@ impl MockVault {
             group_name: payload.group_name.clone(),
             mode: mode.clone(),
             records: payload.records.len(),
-            addresses: payload.records.iter().map(|r| canonicalize_address(&r.target_address)).collect(),
-            tombstones: payload.records.iter().map(|r| r.is_deleted.unwrap_or(false)).collect(),
+            addresses: payload
+                .records
+                .iter()
+                .map(|r| canonicalize_address(&r.target_address))
+                .collect(),
+            tombstones: payload
+                .records
+                .iter()
+                .map(|r| r.is_deleted.unwrap_or(false))
+                .collect(),
         });
 
         let entries = guard.groups.entry(payload.group_name.clone()).or_default();
@@ -503,7 +546,11 @@ impl MockVault {
                         existing.cause = record.cause;
                     }
                     existing.is_deleted = is_deleted;
-                    existing.deleted_at = if is_deleted { record.deleted_at.or(Some(now)) } else { None };
+                    existing.deleted_at = if is_deleted {
+                        record.deleted_at.or(Some(now))
+                    } else {
+                        None
+                    };
                     existing.updated_at = record.updated_at.unwrap_or(now);
                     existing.last_seen_at = record.last_seen_at.unwrap_or(existing.last_seen_at);
                     updated += 1;
@@ -515,7 +562,11 @@ impl MockVault {
                             target_address: key,
                             cause: record.cause,
                             is_deleted,
-                            deleted_at: if is_deleted { record.deleted_at.or(Some(now)) } else { None },
+                            deleted_at: if is_deleted {
+                                record.deleted_at.or(Some(now))
+                            } else {
+                                None
+                            },
                             // `created_at` is honoured only for genuinely new rows.
                             created_at: record.created_at.unwrap_or(now),
                             updated_at: record.updated_at.unwrap_or(now),

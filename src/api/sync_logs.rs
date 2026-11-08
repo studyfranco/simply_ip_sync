@@ -3,14 +3,14 @@
 use axum::extract::State;
 
 use crate::extract::StrictQuery;
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::response::IntoResponse;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::support::{find_permission, RESOURCE_DESTINATION_GROUP, RESOURCE_SYNC_TASK};
 use super::guard_can_view_logs;
+use super::support::{RESOURCE_DESTINATION_GROUP, RESOURCE_SYNC_TASK, find_permission};
 use crate::entities::{api_key, sync_log};
 use crate::error::AppError;
 use crate::state::AppState;

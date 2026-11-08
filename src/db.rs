@@ -6,7 +6,9 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sea_orm::sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement};
 
 /// SQLite permits exactly one writer. A pool size of 2+ does not survive a DDL sequence spread
@@ -55,7 +57,10 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) {
     ];
     for stmt in statements {
         if let Err(e) = db
-            .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, stmt.to_owned()))
+            .execute_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                stmt.to_owned(),
+            ))
             .await
         {
             tracing::warn!("failed to (re)apply session pragma '{stmt}': {e}");
@@ -89,7 +94,11 @@ pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), DbErr> {
 /// corresponding `sqlx-*` feature is enabled on `sea-orm-migration`, and this crate does not
 /// enable every backend there, so the generic helper would answer "unsupported" against a
 /// database whose index is genuinely present.
-pub async fn has_index(db: &DatabaseConnection, table_name: &str, index_name: &str) -> Result<bool, DbErr> {
+pub async fn has_index(
+    db: &DatabaseConnection,
+    table_name: &str,
+    index_name: &str,
+) -> Result<bool, DbErr> {
     let backend = db.get_database_backend();
     let stmt = match backend {
         DatabaseBackend::Sqlite => Statement::from_sql_and_values(
@@ -108,7 +117,9 @@ pub async fn has_index(db: &DatabaseConnection, table_name: &str, index_name: &s
             [index_name.into(), table_name.into()],
         ),
         other => {
-            return Err(DbErr::Custom(format!("has_index: unsupported database backend {other:?}")));
+            return Err(DbErr::Custom(format!(
+                "has_index: unsupported database backend {other:?}"
+            )));
         }
     };
     Ok(db.query_one_raw(stmt).await?.is_some())

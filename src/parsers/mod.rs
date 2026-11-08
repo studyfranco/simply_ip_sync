@@ -64,6 +64,8 @@ pub fn for_type(parser_type: &str) -> Result<Box<dyn FeedParser + Send + Sync>, 
     match parser_type {
         "REGEX_LINE" => Ok(Box::new(regex_line::RegexLineParser)),
         "JSON_PATH" => Ok(Box::new(json_path::JsonPathParser)),
-        other => Err(ParseError::InvalidConfig(format!("unknown parser_type '{other}'"))),
+        other => Err(ParseError::InvalidConfig(format!(
+            "unknown parser_type '{other}'"
+        ))),
     }
 }

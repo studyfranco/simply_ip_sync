@@ -52,7 +52,10 @@ pub fn try_start_job(set: &RunningJobs, id: Uuid) -> Option<JobGuard> {
         return None;
     }
     drop(guard);
-    Some(JobGuard { set: set.clone(), id })
+    Some(JobGuard {
+        set: set.clone(),
+        id,
+    })
 }
 
 /// Maximum number of records sent in a single `POST /api/records/batch` chunk. Below
@@ -86,7 +89,10 @@ pub fn chunk_records<T>(items: Vec<T>, max: usize) -> Vec<Vec<T>> {
 /// that rule is expressed, called identically by `external_ingestion.rs` and `vault_sync.rs`, and
 /// mirrored inside `client::post_batch` for the sub-chunks a `413` response splits a single chunk
 /// into.
-pub fn mode_for_chunk_index(base_mode: crate::client::BatchMode, chunk_index: usize) -> crate::client::BatchMode {
+pub fn mode_for_chunk_index(
+    base_mode: crate::client::BatchMode,
+    chunk_index: usize,
+) -> crate::client::BatchMode {
     if chunk_index == 0 {
         base_mode
     } else {
@@ -174,15 +180,30 @@ mod tests {
     #[test]
     fn only_the_first_chunk_keeps_full_replace() {
         use crate::client::BatchMode;
-        assert_eq!(mode_for_chunk_index(BatchMode::FullReplace, 0), BatchMode::FullReplace);
-        assert_eq!(mode_for_chunk_index(BatchMode::FullReplace, 1), BatchMode::Upsert);
-        assert_eq!(mode_for_chunk_index(BatchMode::FullReplace, 3), BatchMode::Upsert);
+        assert_eq!(
+            mode_for_chunk_index(BatchMode::FullReplace, 0),
+            BatchMode::FullReplace
+        );
+        assert_eq!(
+            mode_for_chunk_index(BatchMode::FullReplace, 1),
+            BatchMode::Upsert
+        );
+        assert_eq!(
+            mode_for_chunk_index(BatchMode::FullReplace, 3),
+            BatchMode::Upsert
+        );
     }
 
     #[test]
     fn upsert_stays_upsert_for_every_chunk() {
         use crate::client::BatchMode;
-        assert_eq!(mode_for_chunk_index(BatchMode::Upsert, 0), BatchMode::Upsert);
-        assert_eq!(mode_for_chunk_index(BatchMode::Upsert, 5), BatchMode::Upsert);
+        assert_eq!(
+            mode_for_chunk_index(BatchMode::Upsert, 0),
+            BatchMode::Upsert
+        );
+        assert_eq!(
+            mode_for_chunk_index(BatchMode::Upsert, 5),
+            BatchMode::Upsert
+        );
     }
 }

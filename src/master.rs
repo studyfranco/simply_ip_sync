@@ -47,7 +47,9 @@ pub struct MasterPin {
 impl MasterPin {
     /// An unpinned handle.
     pub fn new() -> Self {
-        Self { cell: OnceLock::new() }
+        Self {
+            cell: OnceLock::new(),
+        }
     }
 
     /// Test-only: builds a handle already pinned to `id`, without a database query.

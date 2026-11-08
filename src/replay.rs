@@ -82,7 +82,9 @@ impl ReplayGuard {
             .lock()
             .map(|seen| seen.len() >= MAX_TRACKED_SIGNATURES)
             .unwrap_or(false);
-        if (due || over_capacity) && let Ok(mut seen) = self.seen.lock() {
+        if (due || over_capacity)
+            && let Ok(mut seen) = self.seen.lock()
+        {
             // Saturation is never flushed wholesale — clearing would let every currently
             // valid signature replay at once. Only truly expired entries are removed.
             seen.retain(|_, expires_at| *expires_at > now);

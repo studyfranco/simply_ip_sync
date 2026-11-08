@@ -27,9 +27,9 @@ pub mod retry;
 pub mod scheduler;
 pub mod state;
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post};
-use axum::Router;
 use sea_orm::DatabaseConnection;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -58,16 +58,30 @@ pub fn create_app(state: AppState) -> Router {
         .route("/keys", get(api::list_api_keys).post(api::create_api_key))
         .route(
             "/keys/{id}",
-            get(api::get_api_key).patch(api::update_api_key).delete(api::delete_api_key),
+            get(api::get_api_key)
+                .patch(api::update_api_key)
+                .put(api::update_api_key)
+                .delete(api::delete_api_key),
         )
         .route("/keys/{id}/rotate", post(api::rotate_api_key))
         .route("/keys/{id}/rotate-secret", post(api::rotate_signing_secret))
-        .route("/keys/{id}/permissions", get(api::list_key_permissions).put(api::grant_key_permission))
-        .route("/keys/{id}/permissions/{permission_id}", delete(api::revoke_key_permission))
-        .route("/vaults", get(api::list_vault_endpoints).post(api::create_vault_endpoint))
+        .route(
+            "/keys/{id}/permissions",
+            get(api::list_key_permissions).put(api::grant_key_permission),
+        )
+        .route(
+            "/keys/{id}/permissions/{permission_id}",
+            delete(api::revoke_key_permission),
+        )
+        .route(
+            "/vaults",
+            get(api::list_vault_endpoints).post(api::create_vault_endpoint),
+        )
         .route(
             "/vaults/{id}",
-            get(api::get_vault_endpoint).patch(api::update_vault_endpoint).delete(api::delete_vault_endpoint),
+            get(api::get_vault_endpoint)
+                .patch(api::update_vault_endpoint)
+                .delete(api::delete_vault_endpoint),
         )
         .route("/sources/test-fetch", post(api::test_fetch_external_source))
         .route(
@@ -76,23 +90,42 @@ pub fn create_app(state: AppState) -> Router {
         )
         .route(
             "/destination-groups/{id}",
-            get(api::get_destination_group).patch(api::update_destination_group).delete(api::delete_destination_group),
+            get(api::get_destination_group)
+                .patch(api::update_destination_group)
+                .delete(api::delete_destination_group),
         )
-        .route("/destination-groups/{id}/trigger", post(api::trigger_destination_group))
-        .route("/destination-groups/{group_id}/feeds", post(api::create_feed))
+        .route(
+            "/destination-groups/{id}/trigger",
+            post(api::trigger_destination_group),
+        )
+        .route(
+            "/destination-groups/{group_id}/feeds",
+            post(api::create_feed),
+        )
         .route(
             "/destination-groups/{group_id}/feeds/{feed_id}",
             patch(api::update_feed).delete(api::delete_feed),
         )
-        .route("/sync-tasks", get(api::list_vault_sync_tasks).post(api::create_vault_sync_task))
+        .route(
+            "/sync-tasks",
+            get(api::list_vault_sync_tasks).post(api::create_vault_sync_task),
+        )
         .route(
             "/sync-tasks/{id}",
-            get(api::get_vault_sync_task).patch(api::update_vault_sync_task).delete(api::delete_vault_sync_task),
+            get(api::get_vault_sync_task)
+                .patch(api::update_vault_sync_task)
+                .delete(api::delete_vault_sync_task),
         )
-        .route("/sync-tasks/{id}/trigger", post(api::trigger_vault_sync_task))
+        .route(
+            "/sync-tasks/{id}/trigger",
+            post(api::trigger_vault_sync_task),
+        )
         .route("/sync-logs", get(api::list_sync_logs))
         .route("/audit-logs", get(api::list_audit_logs))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), middleware::auth_middleware));
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ));
 
     Router::new()
         .route("/health", get(api::health_check))

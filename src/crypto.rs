@@ -60,7 +60,8 @@ pub fn generate_signing_secret() -> String {
 /// Builds the `CANONICAL_V1` byte string: `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`, newline
 /// delimited, no trailing newline. `TARGET` must be the full request path plus query string.
 pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(method.len() + target.len() + timestamp.len() + body.len() + 3);
+    let mut message =
+        Vec::with_capacity(method.len() + target.len() + timestamp.len() + body.len() + 3);
     message.extend_from_slice(method.as_bytes());
     message.push(b'\n');
     message.extend_from_slice(target.as_bytes());
@@ -84,7 +85,10 @@ pub fn compute_signature(
         CryptoError::EncryptionFailed
     })?;
     mac.update(&canonical_v1_payload(method, target, timestamp, body));
-    Ok(format!("{SIGNATURE_PREFIX}{}", hex::encode(mac.finalize().into_bytes())))
+    Ok(format!(
+        "{SIGNATURE_PREFIX}{}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
 }
 
 /// Verifies a provided `X-Signature-256` value in constant time. Returns the raw decoded digest
@@ -99,7 +103,8 @@ pub fn verify_signature(
     body: &[u8],
     provided: &str,
 ) -> Option<Vec<u8>> {
-    let provided_bytes = hex::decode(provided.trim().strip_prefix(SIGNATURE_PREFIX)?.trim()).ok()?;
+    let provided_bytes =
+        hex::decode(provided.trim().strip_prefix(SIGNATURE_PREFIX)?.trim()).ok()?;
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(&canonical_v1_payload(method, target, timestamp, body));
     mac.verify_slice(&provided_bytes).ok()?;
@@ -134,7 +139,8 @@ impl SecretCipher {
         if bytes.len() != KEY_LEN {
             return Err(CryptoError::InvalidKey);
         }
-        let key = chacha20poly1305::Key::try_from(bytes.as_slice()).map_err(|_| CryptoError::InvalidKey)?;
+        let key = chacha20poly1305::Key::try_from(bytes.as_slice())
+            .map_err(|_| CryptoError::InvalidKey)?;
         Ok(Self::Sealed(Box::new(XChaCha20Poly1305::new(&key))))
     }
 
@@ -170,18 +176,21 @@ impl SecretCipher {
             return String::from_utf8(bytes).map_err(|_| CryptoError::MalformedCiphertext);
         }
         if let Some(body) = stored.strip_prefix(SEALED_PREFIX) {
-            let (nonce_hex, ciphertext_hex) =
-                body.split_once('.').ok_or(CryptoError::MalformedCiphertext)?;
-            let nonce_bytes = hex::decode(nonce_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
+            let (nonce_hex, ciphertext_hex) = body
+                .split_once('.')
+                .ok_or(CryptoError::MalformedCiphertext)?;
+            let nonce_bytes =
+                hex::decode(nonce_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
             if nonce_bytes.len() != NONCE_LEN {
                 return Err(CryptoError::MalformedCiphertext);
             }
-            let ciphertext = hex::decode(ciphertext_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
+            let ciphertext =
+                hex::decode(ciphertext_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
             let Self::Sealed(cipher) = self else {
                 return Err(CryptoError::DecryptionFailed);
             };
-            let nonce =
-                XNonce::try_from(nonce_bytes.as_slice()).map_err(|_| CryptoError::MalformedCiphertext)?;
+            let nonce = XNonce::try_from(nonce_bytes.as_slice())
+                .map_err(|_| CryptoError::MalformedCiphertext)?;
             let plaintext = cipher
                 .decrypt(&nonce, ciphertext.as_ref())
                 .map_err(|_| CryptoError::DecryptionFailed)?;
@@ -212,7 +221,10 @@ pub enum KeyCanary {
 /// `sample` is any stored envelope (`api_key.signing_secret`); `None` means the database holds no
 /// sealed secrets yet. Pure and infallible-by-inspection so it can be unit-tested without a
 /// database.
-pub fn check_key_canary(cipher: &SecretCipher, sample: Option<&str>) -> Result<KeyCanary, CryptoError> {
+pub fn check_key_canary(
+    cipher: &SecretCipher,
+    sample: Option<&str>,
+) -> Result<KeyCanary, CryptoError> {
     let Some(stored) = sample else {
         return Ok(KeyCanary::NoSealedSecrets);
     };
@@ -277,7 +289,14 @@ mod tests {
         let sig = compute_signature(secret, "POST", "/api/records/batch", "1700000000", b"{}")
             .expect("compute");
         assert!(sig.starts_with(SIGNATURE_PREFIX));
-        let digest = verify_signature(secret, "POST", "/api/records/batch", "1700000000", b"{}", &sig);
+        let digest = verify_signature(
+            secret,
+            "POST",
+            "/api/records/batch",
+            "1700000000",
+            b"{}",
+            &sig,
+        );
         assert!(digest.is_some());
     }
 
@@ -318,17 +337,25 @@ mod tests {
         let timestamp = "1700000000";
         let body = b"{\"records\":[]}";
 
-        let valid_sig = compute_signature(secret, method, target, timestamp, body).expect("compute");
-        let valid_hex = valid_sig.strip_prefix(SIGNATURE_PREFIX).expect("has prefix");
+        let valid_sig =
+            compute_signature(secret, method, target, timestamp, body).expect("compute");
+        let valid_hex = valid_sig
+            .strip_prefix(SIGNATURE_PREFIX)
+            .expect("has prefix");
         let valid_bytes = hex::decode(valid_hex).expect("valid hex");
-        assert_eq!(valid_bytes.len(), 32, "HMAC-SHA256 tag must be exactly 32 bytes");
+        assert_eq!(
+            valid_bytes.len(),
+            32,
+            "HMAC-SHA256 tag must be exactly 32 bytes"
+        );
 
         for byte_index in 0..valid_bytes.len() {
             for bit in 0..8u8 {
                 let mut mutated = valid_bytes.clone();
                 mutated[byte_index] ^= 1 << bit;
                 let mutated_sig = format!("{SIGNATURE_PREFIX}{}", hex::encode(&mutated));
-                let digest = verify_signature(secret, method, target, timestamp, body, &mutated_sig);
+                let digest =
+                    verify_signature(secret, method, target, timestamp, body, &mutated_sig);
                 assert!(
                     digest.is_none(),
                     "flipping bit {bit} of byte {byte_index} produced a tag that still verified — constant-time comparison bug?"
@@ -354,16 +381,22 @@ mod tests {
                 continue; // the one correct length, covered by the round-trip test separately
             }
             let wrong_length_bytes = vec![0xABu8; len];
-            let wrong_length_sig = format!("{SIGNATURE_PREFIX}{}", hex::encode(&wrong_length_bytes));
-            let digest = verify_signature(secret, method, target, timestamp, body, &wrong_length_sig);
-            assert!(digest.is_none(), "a {len}-byte tag must never verify (only 32 bytes is a valid HMAC-SHA256 length)");
+            let wrong_length_sig =
+                format!("{SIGNATURE_PREFIX}{}", hex::encode(&wrong_length_bytes));
+            let digest =
+                verify_signature(secret, method, target, timestamp, body, &wrong_length_sig);
+            assert!(
+                digest.is_none(),
+                "a {len}-byte tag must never verify (only 32 bytes is a valid HMAC-SHA256 length)"
+            );
         }
     }
 
     #[test]
     fn canary_reports_no_sealed_secrets_on_an_empty_database() {
         let cipher = SecretCipher::from_hex_key(&generate_signing_secret()).expect("valid key");
-        let result = check_key_canary(&cipher, None).expect("infallible on the empty-database branch");
+        let result =
+            check_key_canary(&cipher, None).expect("infallible on the empty-database branch");
         assert!(matches!(result, KeyCanary::NoSealedSecrets));
     }
 
@@ -373,7 +406,8 @@ mod tests {
         let cipher = SecretCipher::from_hex_key(&key).expect("valid key");
         let sealed = cipher.seal("vault-signing-secret").expect("seal");
 
-        let result = check_key_canary(&cipher, Some(&sealed)).expect("the same key must open its own ciphertext");
+        let result = check_key_canary(&cipher, Some(&sealed))
+            .expect("the same key must open its own ciphertext");
         assert!(matches!(result, KeyCanary::Verified));
     }
 
@@ -381,12 +415,17 @@ mod tests {
     /// at this check, not open (or worse, silently corrupt) a secret sealed under a different key.
     #[test]
     fn canary_fails_closed_when_the_configured_key_does_not_match_the_sealed_secret() {
-        let original_cipher = SecretCipher::from_hex_key(&generate_signing_secret()).expect("valid key");
+        let original_cipher =
+            SecretCipher::from_hex_key(&generate_signing_secret()).expect("valid key");
         let sealed = original_cipher.seal("vault-signing-secret").expect("seal");
 
-        let wrong_cipher = SecretCipher::from_hex_key(&generate_signing_secret()).expect("valid key");
+        let wrong_cipher =
+            SecretCipher::from_hex_key(&generate_signing_secret()).expect("valid key");
         let result = check_key_canary(&wrong_cipher, Some(&sealed));
-        assert!(result.is_err(), "a wrong-but-well-formed key must fail the canary, not silently pass");
+        assert!(
+            result.is_err(),
+            "a wrong-but-well-formed key must fail the canary, not silently pass"
+        );
     }
 
     /// A plaintext-mode deployment (no `SYNC_ENCRYPTION_KEY` configured) has no key to be wrong
@@ -396,7 +435,8 @@ mod tests {
     fn canary_passes_trivially_in_plaintext_mode() {
         let cipher = SecretCipher::Plaintext;
         let sealed = cipher.seal("vault-signing-secret").expect("seal");
-        let result = check_key_canary(&cipher, Some(&sealed)).expect("plaintext mode has no key to mismatch");
+        let result = check_key_canary(&cipher, Some(&sealed))
+            .expect("plaintext mode has no key to mismatch");
         assert!(matches!(result, KeyCanary::Verified));
     }
 }

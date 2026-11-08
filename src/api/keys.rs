@@ -5,8 +5,8 @@
 use axum::extract::State;
 
 use crate::extract::StrictPath;
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::response::IntoResponse;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
@@ -14,8 +14,13 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::support::{create_audit_log, generate_random_key, hash_key, key_prefix};
-use super::{guard_delegated_grant, guard_manage_keys, guard_master_immutable, guard_revocation, guard_rotation_allowed, guard_scope_elevation};
-use crate::entities::{api_key, api_key_sync_permission, destination_group, vault_endpoint, vault_sync_task};
+use super::{
+    guard_delegated_grant, guard_manage_keys, guard_master_immutable, guard_revocation,
+    guard_rotation_allowed, guard_scope_elevation,
+};
+use crate::entities::{
+    api_key, api_key_sync_permission, destination_group, vault_endpoint, vault_sync_task,
+};
 use crate::error::AppError;
 use crate::extract::StrictJson;
 use crate::middleware::ClientIp;
@@ -85,11 +90,19 @@ pub async fn list_api_keys(
         api_key::Entity::find().all(&state.db).await?
     } else {
         api_key::Entity::find()
-            .filter(api_key::Column::Id.eq(caller.id).or(api_key::Column::ParentKeyId.eq(caller.id)))
+            .filter(
+                api_key::Column::Id
+                    .eq(caller.id)
+                    .or(api_key::Column::ParentKeyId.eq(caller.id)),
+            )
             .all(&state.db)
             .await?
     };
-    Ok(Json(keys.into_iter().map(ApiKeyResponse::from).collect::<Vec<_>>()))
+    Ok(Json(
+        keys.into_iter()
+            .map(ApiKeyResponse::from)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// `GET /api/keys/{id}`.
@@ -98,7 +111,10 @@ pub async fn get_api_key(
     axum::Extension(caller): axum::Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = api_key::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !(caller.is_master || target.id == caller.id || target.parent_key_id == Some(caller.id)) {
         return Err(AppError::NotFound);
     }
@@ -135,7 +151,12 @@ pub async fn create_api_key(
     StrictJson(payload): StrictJson<CreateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
-    guard_scope_elevation(&caller, payload.can_manage_keys, payload.can_manage_sources, payload.can_manage_vaults)?;
+    guard_scope_elevation(
+        &caller,
+        payload.can_manage_keys,
+        payload.can_manage_sources,
+        payload.can_manage_vaults,
+    )?;
 
     let plaintext_key = generate_random_key();
     let plaintext_secret = crate::crypto::generate_signing_secret();
@@ -157,9 +178,19 @@ pub async fn create_api_key(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    let inserted = api_key::Entity::insert(model).exec_with_returning(&state.db).await?;
+    let inserted = api_key::Entity::insert(model)
+        .exec_with_returning(&state.db)
+        .await?;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "KEY_CREATE", Some(inserted.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_CREATE",
+        Some(inserted.name.clone()),
+        None,
+    )
+    .await?;
 
     Ok(Json(json!({
         "key": ApiKeyResponse::from(inserted),
@@ -199,12 +230,19 @@ pub async fn update_api_key(
     StrictJson(payload): StrictJson<UpdateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
-    let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = api_key::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !can_administer(&caller, &target) {
-        return Err(AppError::Forbidden("no administrative authority over this key".to_owned()));
+        return Err(AppError::Forbidden(
+            "no administrative authority over this key".to_owned(),
+        ));
     }
-    let touches_non_bound_ips =
-        payload.name.is_some() || payload.can_manage_keys.is_some() || payload.can_manage_sources.is_some() || payload.can_manage_vaults.is_some();
+    let touches_non_bound_ips = payload.name.is_some()
+        || payload.can_manage_keys.is_some()
+        || payload.can_manage_sources.is_some()
+        || payload.can_manage_vaults.is_some();
     guard_master_immutable(target.is_master, touches_non_bound_ips)?;
     guard_scope_elevation(
         &caller,
@@ -232,11 +270,22 @@ pub async fn update_api_key(
     active.updated_at = Set(Utc::now());
     let updated = active.update(&state.db).await?;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "KEY_UPDATE", Some(updated.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_UPDATE",
+        Some(updated.name.clone()),
+        None,
+    )
+    .await?;
     Ok(Json(ApiKeyResponse::from(updated)))
 }
 
-async fn collect_subtree(db: &sea_orm::DatabaseConnection, root: api_key::Model) -> Result<Vec<api_key::Model>, AppError> {
+async fn collect_subtree(
+    db: &sea_orm::DatabaseConnection,
+    root: api_key::Model,
+) -> Result<Vec<api_key::Model>, AppError> {
     let mut result = vec![root.clone()];
     let mut frontier = vec![root.id];
     while !frontier.is_empty() {
@@ -287,12 +336,19 @@ pub async fn delete_api_key(
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
-    let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = api_key::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if target.is_master {
-        return Err(AppError::Forbidden("the Master key cannot be deleted through the API (RBAC §5)".to_owned()));
+        return Err(AppError::Forbidden(
+            "the Master key cannot be deleted through the API (RBAC §5)".to_owned(),
+        ));
     }
     if !can_administer(&caller, &target) {
-        return Err(AppError::Forbidden("no administrative authority over this key".to_owned()));
+        return Err(AppError::Forbidden(
+            "no administrative authority over this key".to_owned(),
+        ));
     }
 
     let name = target.name.clone();
@@ -313,12 +369,22 @@ pub async fn delete_api_key(
     // `delete_many` matching zero rows is not an error, so without this check the loser would also
     // answer `204` and write a second KEY_DELETE audit entry for a deletion it did not perform.
     // Whoever removes rows owns the outcome; everyone else gets `NotFound`.
-    let result =
-        api_key::Entity::delete_many().filter(api_key::Column::Id.is_in(subtree_ids)).exec(&state.db).await?;
+    let result = api_key::Entity::delete_many()
+        .filter(api_key::Column::Id.is_in(subtree_ids))
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
-    create_audit_log(&state.db, &caller, client_ip.0, "KEY_DELETE", Some(name), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_DELETE",
+        Some(name),
+        None,
+    )
+    .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -331,10 +397,15 @@ pub async fn rotate_api_key(
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
-    let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = api_key::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     guard_rotation_allowed(target.is_master)?;
     if !can_administer(&caller, &target) {
-        return Err(AppError::Forbidden("no administrative authority over this key".to_owned()));
+        return Err(AppError::Forbidden(
+            "no administrative authority over this key".to_owned(),
+        ));
     }
 
     let plaintext_key = generate_random_key();
@@ -344,7 +415,15 @@ pub async fn rotate_api_key(
     active.updated_at = Set(Utc::now());
     let updated = active.update(&state.db).await?;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "KEY_ROTATE", Some(updated.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_ROTATE",
+        Some(updated.name.clone()),
+        None,
+    )
+    .await?;
     Ok(Json(json!({ "plaintext_key": plaintext_key })))
 }
 
@@ -357,10 +436,15 @@ pub async fn rotate_signing_secret(
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
-    let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = api_key::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     guard_rotation_allowed(target.is_master)?;
     if !can_administer(&caller, &target) {
-        return Err(AppError::Forbidden("no administrative authority over this key".to_owned()));
+        return Err(AppError::Forbidden(
+            "no administrative authority over this key".to_owned(),
+        ));
     }
 
     let plaintext_secret = crate::crypto::generate_signing_secret();
@@ -369,8 +453,18 @@ pub async fn rotate_signing_secret(
     active.updated_at = Set(Utc::now());
     let updated = active.update(&state.db).await?;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "KEY_ROTATE_SECRET", Some(updated.name.clone()), None).await?;
-    Ok(Json(json!({ "plaintext_signing_secret": plaintext_secret })))
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_ROTATE_SECRET",
+        Some(updated.name.clone()),
+        None,
+    )
+    .await?;
+    Ok(Json(
+        json!({ "plaintext_signing_secret": plaintext_secret }),
+    ))
 }
 
 /// Body of `PUT /api/keys/{id}/permissions`: grants or updates a permission row for `id` on a
@@ -399,7 +493,10 @@ pub async fn list_key_permissions(
     axum::Extension(caller): axum::Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = api_key::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !(caller.is_master || target.id == caller.id || target.parent_key_id == Some(caller.id)) {
         return Err(AppError::NotFound);
     }
@@ -420,17 +517,41 @@ pub async fn grant_key_permission(
     StrictJson(payload): StrictJson<GrantPermissionPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
-    let target = api_key::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    if payload.resource_type != "destination_group" && payload.resource_type != "sync_task" && payload.resource_type != "vault_endpoint" {
-        return Err(AppError::InvalidInput("resource_type must be destination_group, sync_task, or vault_endpoint".to_owned()));
+    let target = api_key::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if payload.resource_type != "destination_group"
+        && payload.resource_type != "sync_task"
+        && payload.resource_type != "vault_endpoint"
+    {
+        return Err(AppError::InvalidInput(
+            "resource_type must be destination_group, sync_task, or vault_endpoint".to_owned(),
+        ));
     }
 
-    let caller_permission =
-        super::support::find_permission(&state.db, caller.id, &payload.resource_type, payload.resource_id).await?;
-    guard_delegated_grant(&caller, caller_permission.as_ref(), payload.can_sync, payload.can_manage, payload.can_view_logs)?;
+    let caller_permission = super::support::find_permission(
+        &state.db,
+        caller.id,
+        &payload.resource_type,
+        payload.resource_id,
+    )
+    .await?;
+    guard_delegated_grant(
+        &caller,
+        caller_permission.as_ref(),
+        payload.can_sync,
+        payload.can_manage,
+        payload.can_view_logs,
+    )?;
 
-    let existing =
-        super::support::find_permission(&state.db, target.id, &payload.resource_type, payload.resource_id).await?;
+    let existing = super::support::find_permission(
+        &state.db,
+        target.id,
+        &payload.resource_type,
+        payload.resource_id,
+    )
+    .await?;
     let row = match existing {
         Some(existing) => {
             let mut active: api_key_sync_permission::ActiveModel = existing.into();
@@ -459,7 +580,10 @@ pub async fn grant_key_permission(
         &caller,
         client_ip.0,
         "PERMISSION_GRANT",
-        Some(format!("{} on {}:{}", target.name, payload.resource_type, payload.resource_id)),
+        Some(format!(
+            "{} on {}:{}",
+            target.name, payload.resource_type, payload.resource_id
+        )),
         None,
     )
     .await?;
@@ -482,17 +606,31 @@ pub async fn revoke_key_permission(
     if permission.api_key_id != id {
         return Err(AppError::NotFound);
     }
-    let caller_permission =
-        super::support::find_permission(&state.db, caller.id, &permission.resource_type, permission.resource_id).await?;
+    let caller_permission = super::support::find_permission(
+        &state.db,
+        caller.id,
+        &permission.resource_type,
+        permission.resource_id,
+    )
+    .await?;
     guard_revocation(&caller, caller_permission.as_ref())?;
 
     // See `sources.rs::delete_external_source`'s identical comment: two concurrent revokes of the
     // same permission id can both pass the lookup above before either `DELETE` runs.
-    let result = api_key_sync_permission::Entity::delete_by_id(permission_id).exec(&state.db).await?;
+    let result = api_key_sync_permission::Entity::delete_by_id(permission_id)
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
-    create_audit_log(&state.db, &caller, client_ip.0, "PERMISSION_REVOKE", Some(format!("permission {permission_id}")), None)
-        .await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "PERMISSION_REVOKE",
+        Some(format!("permission {permission_id}")),
+        None,
+    )
+    .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

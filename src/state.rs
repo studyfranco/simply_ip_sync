@@ -88,7 +88,9 @@ impl AppState {
     /// integration tests under `tests/`, which link against this crate as an ordinary dependency,
     /// can use it too.
     pub async fn for_tests(db: DatabaseConnection, master_id: uuid::Uuid) -> Self {
-        let scheduler = SchedulerHandle::new().await.expect("scheduler starts in tests");
+        let scheduler = SchedulerHandle::new()
+            .await
+            .expect("scheduler starts in tests");
         Self {
             db,
             cipher: Arc::new(SecretCipher::Plaintext),

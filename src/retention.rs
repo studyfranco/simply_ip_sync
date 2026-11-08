@@ -66,7 +66,9 @@ fn retention_days_from_env(env_var: &str, default_days: i64) -> i64 {
         Ok(raw) => match raw.trim().parse::<i64>() {
             Ok(days) if days >= 0 => days,
             _ => {
-                tracing::warn!("Invalid {env_var} value {raw:?} — falling back to {default_days} days.");
+                tracing::warn!(
+                    "Invalid {env_var} value {raw:?} — falling back to {default_days} days."
+                );
                 default_days
             }
         },
@@ -77,30 +79,46 @@ fn retention_days_from_env(env_var: &str, default_days: i64) -> i64 {
 /// Reads the configured sweep interval, clamped to at least one second.
 fn sweep_seconds_from_env() -> u64 {
     match std::env::var(RETENTION_SWEEP_ENV) {
-        Ok(raw) => raw.trim().parse::<u64>().unwrap_or(DEFAULT_SWEEP_SECONDS).max(1),
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_SWEEP_SECONDS)
+            .max(1),
         Err(_) => DEFAULT_SWEEP_SECONDS,
     }
 }
 
 /// Permanently deletes `sync_logs` rows older than `retention_days`. Returns the number of rows
 /// removed. A non-positive `retention_days` disables purging and is a no-op.
-pub async fn purge_expired_sync_logs(db: &DatabaseConnection, retention_days: i64) -> Result<u64, DbErr> {
+pub async fn purge_expired_sync_logs(
+    db: &DatabaseConnection,
+    retention_days: i64,
+) -> Result<u64, DbErr> {
     if retention_days <= 0 {
         return Ok(0);
     }
     let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
-    let result = sync_log::Entity::delete_many().filter(sync_log::Column::Timestamp.lt(threshold)).exec(db).await?;
+    let result = sync_log::Entity::delete_many()
+        .filter(sync_log::Column::Timestamp.lt(threshold))
+        .exec(db)
+        .await?;
     Ok(result.rows_affected)
 }
 
 /// Permanently deletes `audit_logs` rows older than `retention_days`. Returns the number of rows
 /// removed. A non-positive `retention_days` disables purging and is a no-op.
-pub async fn purge_expired_audit_logs(db: &DatabaseConnection, retention_days: i64) -> Result<u64, DbErr> {
+pub async fn purge_expired_audit_logs(
+    db: &DatabaseConnection,
+    retention_days: i64,
+) -> Result<u64, DbErr> {
     if retention_days <= 0 {
         return Ok(0);
     }
     let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
-    let result = audit_log::Entity::delete_many().filter(audit_log::Column::Timestamp.lt(threshold)).exec(db).await?;
+    let result = audit_log::Entity::delete_many()
+        .filter(audit_log::Column::Timestamp.lt(threshold))
+        .exec(db)
+        .await?;
     Ok(result.rows_affected)
 }
 
@@ -113,8 +131,12 @@ pub async fn purge_expired_audit_logs(db: &DatabaseConnection, retention_days: i
 /// drain. The first tick fires immediately, so a process restarted more often than the sweep
 /// interval still clears its backlog rather than never running.
 pub async fn run_retention_worker(db: DatabaseConnection) {
-    let sync_log_days = retention_days_from_env(SYNC_LOG_RETENTION_DAYS_ENV, DEFAULT_SYNC_LOG_RETENTION_DAYS);
-    let audit_log_days = retention_days_from_env(AUDIT_LOG_RETENTION_DAYS_ENV, DEFAULT_AUDIT_LOG_RETENTION_DAYS);
+    let sync_log_days =
+        retention_days_from_env(SYNC_LOG_RETENTION_DAYS_ENV, DEFAULT_SYNC_LOG_RETENTION_DAYS);
+    let audit_log_days = retention_days_from_env(
+        AUDIT_LOG_RETENTION_DAYS_ENV,
+        DEFAULT_AUDIT_LOG_RETENTION_DAYS,
+    );
 
     if sync_log_days <= 0 && audit_log_days <= 0 {
         tracing::info!(
@@ -160,7 +182,9 @@ mod tests {
     use super::*;
 
     async fn memory_db() -> DatabaseConnection {
-        let db = sea_orm::Database::connect("sqlite::memory:").await.expect("connect");
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
         crate::db::run_migrations(&db).await.expect("migrate");
         db
     }
@@ -208,7 +232,10 @@ mod tests {
         insert_sync_log(&db, now - chrono::Duration::days(10)).await;
 
         let purged = purge_expired_sync_logs(&db, 92).await.expect("purge");
-        assert_eq!(purged, 1, "only the 100-day-old row is past a 92-day window");
+        assert_eq!(
+            purged, 1,
+            "only the 100-day-old row is past a 92-day window"
+        );
 
         let remaining = sync_log::Entity::find().all(&db).await.expect("list");
         assert_eq!(remaining.len(), 1, "the 10-day-old row must survive");
@@ -222,7 +249,10 @@ mod tests {
         insert_audit_log(&db, now - chrono::Duration::days(30)).await;
 
         let purged = purge_expired_audit_logs(&db, 365).await.expect("purge");
-        assert_eq!(purged, 1, "only the 400-day-old row is past a 365-day window");
+        assert_eq!(
+            purged, 1,
+            "only the 400-day-old row is past a 365-day window"
+        );
 
         let remaining = audit_log::Entity::find().all(&db).await.expect("list");
         assert_eq!(remaining.len(), 1, "the 30-day-old row must survive");
@@ -238,8 +268,18 @@ mod tests {
         assert_eq!(purge_expired_sync_logs(&db, 0).await.expect("purge"), 0);
         assert_eq!(purge_expired_audit_logs(&db, 0).await.expect("purge"), 0);
 
-        assert_eq!(sync_log::Entity::find().all(&db).await.expect("list").len(), 1);
-        assert_eq!(audit_log::Entity::find().all(&db).await.expect("list").len(), 1);
+        assert_eq!(
+            sync_log::Entity::find().all(&db).await.expect("list").len(),
+            1
+        );
+        assert_eq!(
+            audit_log::Entity::find()
+                .all(&db)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -249,7 +289,8 @@ mod tests {
         unsafe {
             std::env::set_var(SYNC_LOG_RETENTION_DAYS_ENV, "not-a-number");
         }
-        let days = retention_days_from_env(SYNC_LOG_RETENTION_DAYS_ENV, DEFAULT_SYNC_LOG_RETENTION_DAYS);
+        let days =
+            retention_days_from_env(SYNC_LOG_RETENTION_DAYS_ENV, DEFAULT_SYNC_LOG_RETENTION_DAYS);
         unsafe {
             std::env::remove_var(SYNC_LOG_RETENTION_DAYS_ENV);
         }

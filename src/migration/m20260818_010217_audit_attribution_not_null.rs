@@ -98,7 +98,12 @@ fn table_definition(table: TableRef, attribution_not_null: bool) -> TableCreateS
 
     let mut stmt = Table::create();
     stmt.table(table)
-        .col(ColumnDef::new(AuditLogs::Id).uuid().not_null().primary_key())
+        .col(
+            ColumnDef::new(AuditLogs::Id)
+                .uuid()
+                .not_null()
+                .primary_key(),
+        )
         .col(ColumnDef::new(AuditLogs::ApiKeyId).uuid())
         .col(attribution(AuditLogs::ApiKeyName))
         .col(attribution(AuditLogs::ApiKeyPrefix))
@@ -106,7 +111,11 @@ fn table_definition(table: TableRef, attribution_not_null: bool) -> TableCreateS
         .col(ColumnDef::new(AuditLogs::Action).string().not_null())
         .col(ColumnDef::new(AuditLogs::TargetResource).string())
         .col(ColumnDef::new(AuditLogs::Details).text())
-        .col(ColumnDef::new(AuditLogs::Timestamp).timestamp_with_time_zone().not_null())
+        .col(
+            ColumnDef::new(AuditLogs::Timestamp)
+                .timestamp_with_time_zone()
+                .not_null(),
+        )
         .foreign_key(
             ForeignKey::create()
                 .name("fk-audit_logs-api_key")
@@ -145,7 +154,10 @@ async fn rebuild(manager: &SchemaManager<'_>, attribution_not_null: bool) -> Res
     let db = manager.get_connection();
 
     manager
-        .create_table(table_definition(AuditLogsRebuild::Table.into_table_ref(), attribution_not_null))
+        .create_table(table_definition(
+            AuditLogsRebuild::Table.into_table_ref(),
+            attribution_not_null,
+        ))
         .await?;
 
     let columns = [
@@ -161,11 +173,21 @@ async fn rebuild(manager: &SchemaManager<'_>, attribution_not_null: bool) -> Res
     ]
     .join(", ");
 
-    db.execute_unprepared(&format!("INSERT INTO audit_logs_rebuild ({columns}) SELECT {columns} FROM audit_logs"))
-        .await?;
+    db.execute_unprepared(&format!(
+        "INSERT INTO audit_logs_rebuild ({columns}) SELECT {columns} FROM audit_logs"
+    ))
+    .await?;
 
-    manager.drop_table(Table::drop().table(AuditLogs::Table).to_owned()).await?;
-    manager.rename_table(Table::rename().table(AuditLogsRebuild::Table, AuditLogs::Table).to_owned()).await?;
+    manager
+        .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
+        .await?;
+    manager
+        .rename_table(
+            Table::rename()
+                .table(AuditLogsRebuild::Table, AuditLogs::Table)
+                .to_owned(),
+        )
+        .await?;
 
     recreate_index(manager).await
 }
@@ -174,8 +196,10 @@ async fn rebuild(manager: &SchemaManager<'_>, attribution_not_null: bool) -> Res
 async fn backfill(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let db = manager.get_connection();
     for column in ATTRIBUTION_COLUMNS {
-        db.execute_unprepared(&format!("UPDATE audit_logs SET {column} = '{UNRECORDED}' WHERE {column} IS NULL"))
-            .await?;
+        db.execute_unprepared(&format!(
+            "UPDATE audit_logs SET {column} = '{UNRECORDED}' WHERE {column} IS NULL"
+        ))
+        .await?;
     }
     Ok(())
 }
@@ -191,10 +215,17 @@ impl MigrationTrait for Migration {
             return rebuild(manager, true).await;
         }
 
-        for column in [AuditLogs::ApiKeyName, AuditLogs::ApiKeyPrefix, AuditLogs::ClientIp] {
+        for column in [
+            AuditLogs::ApiKeyName,
+            AuditLogs::ApiKeyPrefix,
+            AuditLogs::ClientIp,
+        ] {
             manager
                 .alter_table(
-                    Table::alter().table(AuditLogs::Table).modify_column(ColumnDef::new(column).string().not_null()).to_owned(),
+                    Table::alter()
+                        .table(AuditLogs::Table)
+                        .modify_column(ColumnDef::new(column).string().not_null())
+                        .to_owned(),
                 )
                 .await?;
         }
@@ -207,10 +238,17 @@ impl MigrationTrait for Migration {
             return rebuild(manager, false).await;
         }
 
-        for column in [AuditLogs::ApiKeyName, AuditLogs::ApiKeyPrefix, AuditLogs::ClientIp] {
+        for column in [
+            AuditLogs::ApiKeyName,
+            AuditLogs::ApiKeyPrefix,
+            AuditLogs::ClientIp,
+        ] {
             manager
                 .alter_table(
-                    Table::alter().table(AuditLogs::Table).modify_column(ColumnDef::new(column).string().null()).to_owned(),
+                    Table::alter()
+                        .table(AuditLogs::Table)
+                        .modify_column(ColumnDef::new(column).string().null())
+                        .to_owned(),
                 )
                 .await?;
         }
@@ -229,9 +267,19 @@ mod tests {
     /// tell "not recorded" from "recorded as this".
     #[test]
     fn the_backfill_value_cannot_be_confused_with_a_real_one() {
-        assert!(UNRECORDED.starts_with('('), "{UNRECORDED} must not look like a key name or address");
-        assert!(!UNRECORDED.chars().any(|c| c.is_ascii_alphanumeric() && c.is_uppercase()));
-        assert!(UNRECORDED.parse::<std::net::IpAddr>().is_err(), "must not parse as an address");
+        assert!(
+            UNRECORDED.starts_with('('),
+            "{UNRECORDED} must not look like a key name or address"
+        );
+        assert!(
+            !UNRECORDED
+                .chars()
+                .any(|c| c.is_ascii_alphanumeric() && c.is_uppercase())
+        );
+        assert!(
+            UNRECORDED.parse::<std::net::IpAddr>().is_err(),
+            "must not parse as an address"
+        );
     }
 
     /// Both table definitions must agree on everything except the three columns under test.
@@ -252,10 +300,19 @@ mod tests {
             "exactly the three attribution columns gain NOT NULL:\n  {strict}\n  {loose}"
         );
         for column in ATTRIBUTION_COLUMNS {
-            assert!(strict.contains(column), "{column} missing from the strict definition");
-            assert!(loose.contains(column), "{column} missing from the loose definition");
+            assert!(
+                strict.contains(column),
+                "{column} missing from the strict definition"
+            );
+            assert!(
+                loose.contains(column),
+                "{column} missing from the loose definition"
+            );
         }
         // The cascade that makes the denormalized columns necessary must survive a rebuild.
-        assert!(strict.contains("SET NULL"), "the ON DELETE SET NULL cascade is preserved");
+        assert!(
+            strict.contains("SET NULL"),
+            "the ON DELETE SET NULL cascade is preserved"
+        );
     }
 }

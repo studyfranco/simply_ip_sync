@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-use simply_ip_sync::entities::{destination_group, destination_group_vault_target, external_source, vault_endpoint};
+use simply_ip_sync::entities::{
+    destination_group, destination_group_vault_target, external_source, vault_endpoint,
+};
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -18,7 +20,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn insert_vault(conn: &sea_orm::DatabaseConnection, name: &str, target_url: &str) -> Uuid {
     let id = Uuid::new_v4();
     let now = Utc::now();
-    let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext.seal("shared-secret").unwrap();
+    let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext
+        .seal("shared-secret")
+        .unwrap();
     let model = vault_endpoint::ActiveModel {
         id: Set(id),
         name: Set(name.to_owned()),
@@ -36,7 +40,11 @@ async fn insert_vault(conn: &sea_orm::DatabaseConnection, name: &str, target_url
 
 /// Inserts a `destination_groups` row with one child feed pointed at `source_url`, and returns the
 /// *group's* id — `jobs::external_ingestion::run` operates on groups, never on a bare feed.
-async fn insert_source(conn: &sea_orm::DatabaseConnection, source_url: &str, default_group: &str) -> Uuid {
+async fn insert_source(
+    conn: &sea_orm::DatabaseConnection,
+    source_url: &str,
+    default_group: &str,
+) -> Uuid {
     insert_source_with_mode(conn, source_url, default_group, "upsert").await
 }
 
@@ -121,23 +129,49 @@ async fn per_target_group_name_override_is_honored_independently_of_the_default(
             .await;
     }
 
-    let source_id = insert_source(&conn, &format!("{}/feed.txt", feed_mock.uri()), "DEFAULT_GROUP").await;
+    let source_id = insert_source(
+        &conn,
+        &format!("{}/feed.txt", feed_mock.uri()),
+        "DEFAULT_GROUP",
+    )
+    .await;
     let default_vault_id = insert_vault(&conn, "default-target", &default_target_mock.uri()).await;
-    let override_vault_id = insert_vault(&conn, "override-target", &override_target_mock.uri()).await;
+    let override_vault_id =
+        insert_vault(&conn, "override-target", &override_target_mock.uri()).await;
     insert_target(&conn, source_id, default_vault_id, None).await;
-    insert_target(&conn, source_id, override_vault_id, Some("OVERRIDDEN_GROUP")).await;
+    insert_target(
+        &conn,
+        source_id,
+        override_vault_id,
+        Some("OVERRIDDEN_GROUP"),
+    )
+    .await;
 
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
 
-    let default_received = default_target_mock.received_requests().await.expect("recording enabled");
+    let default_received = default_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
     assert_eq!(default_received.len(), 1);
-    let default_body: serde_json::Value = serde_json::from_slice(&default_received[0].body).expect("json");
-    assert_eq!(default_body["group_name"], serde_json::json!("DEFAULT_GROUP"), "no override falls back to the source's default group");
+    let default_body: serde_json::Value =
+        serde_json::from_slice(&default_received[0].body).expect("json");
+    assert_eq!(
+        default_body["group_name"],
+        serde_json::json!("DEFAULT_GROUP"),
+        "no override falls back to the source's default group"
+    );
 
-    let override_received = override_target_mock.received_requests().await.expect("recording enabled");
+    let override_received = override_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
     assert_eq!(override_received.len(), 1);
-    let override_body: serde_json::Value = serde_json::from_slice(&override_received[0].body).expect("json");
+    let override_body: serde_json::Value =
+        serde_json::from_slice(&override_received[0].body).expect("json");
     assert_eq!(
         override_body["group_name"],
         serde_json::json!("OVERRIDDEN_GROUP"),
@@ -189,20 +223,37 @@ async fn mixed_notation_duplicate_addresses_canonicalize_and_dedupe_to_one_recor
     let vault_id = insert_vault(&conn, "target", &target_mock.uri()).await;
     insert_target(&conn, source_id, vault_id, None).await;
 
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
-    assert_eq!(summary.items_processed, 2, "four lines naming only two distinct addresses (in different notations) must dedupe to 2, not 4");
+    assert_eq!(
+        summary.items_processed, 2,
+        "four lines naming only two distinct addresses (in different notations) must dedupe to 2, not 4"
+    );
 
-    let received = target_mock.received_requests().await.expect("recording enabled");
+    let received = target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
     assert_eq!(received.len(), 1);
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
     let addresses: Vec<String> = body["records"]
         .as_array()
         .expect("records array")
         .iter()
-        .map(|r| r["target_address"].as_str().expect("target_address").to_owned())
+        .map(|r| {
+            r["target_address"]
+                .as_str()
+                .expect("target_address")
+                .to_owned()
+        })
         .collect();
-    assert_eq!(addresses, vec!["93.184.216.60".to_owned(), "2606:4700:4700::1".to_owned()], "each pair must collapse to its single canonical form");
+    assert_eq!(
+        addresses,
+        vec!["93.184.216.60".to_owned(), "2606:4700:4700::1".to_owned()],
+        "each pair must collapse to its single canonical form"
+    );
 }
 
 /// Task 4: a `full_replace` source whose feed is large enough to need multiple chunks (12,000
@@ -215,7 +266,10 @@ async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_repl
     let (conn, state, _master) = common::setup().await;
 
     const TOTAL_RECORDS: u32 = 12_000;
-    let feed_body: String = (0..TOTAL_RECORDS).map(synth_ip).collect::<Vec<_>>().join("\n");
+    let feed_body: String = (0..TOTAL_RECORDS)
+        .map(synth_ip)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -231,16 +285,33 @@ async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_repl
         .mount(&target_mock)
         .await;
 
-    let source_id = insert_source_with_mode(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group", "full_replace").await;
+    let source_id = insert_source_with_mode(
+        &conn,
+        &format!("{}/feed.txt", feed_mock.uri()),
+        "group",
+        "full_replace",
+    )
+    .await;
     let vault_id = insert_vault(&conn, "full-replace-target", &target_mock.uri()).await;
     insert_target(&conn, source_id, vault_id, None).await;
 
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
-    assert_eq!(summary.items_processed, TOTAL_RECORDS as i32, "every record from the feed must be processed, none dropped mid-chunking");
-    assert_eq!(summary.chunks_sent, 3, "12,000 records at MAX_BATCH_SIZE=5,000 must split into exactly 3 chunks (5000/5000/2000)");
+    assert_eq!(
+        summary.items_processed, TOTAL_RECORDS as i32,
+        "every record from the feed must be processed, none dropped mid-chunking"
+    );
+    assert_eq!(
+        summary.chunks_sent, 3,
+        "12,000 records at MAX_BATCH_SIZE=5,000 must split into exactly 3 chunks (5000/5000/2000)"
+    );
 
-    let received = target_mock.received_requests().await.expect("recording enabled");
+    let received = target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
     assert_eq!(received.len(), 3);
 
     let mut total_delivered = 0usize;
@@ -250,10 +321,22 @@ async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_repl
         total_delivered += body["records"].as_array().expect("records array").len();
         modes.push(body["mode"].as_str().expect("mode field").to_owned());
     }
-    assert_eq!(total_delivered, TOTAL_RECORDS as usize, "all 12,000 records must land on the target, none lost across chunks");
-    assert_eq!(modes[0], "full_replace", "only the first chunk of the run may carry full_replace");
-    assert_eq!(modes[1], "upsert", "chunk 2 must already be downgraded to upsert");
-    assert_eq!(modes[2], "upsert", "chunk 3 must also be upsert, not just chunk 2");
+    assert_eq!(
+        total_delivered, TOTAL_RECORDS as usize,
+        "all 12,000 records must land on the target, none lost across chunks"
+    );
+    assert_eq!(
+        modes[0], "full_replace",
+        "only the first chunk of the run may carry full_replace"
+    );
+    assert_eq!(
+        modes[1], "upsert",
+        "chunk 2 must already be downgraded to upsert"
+    );
+    assert_eq!(
+        modes[2], "upsert",
+        "chunk 3 must also be upsert, not just chunk 2"
+    );
 }
 
 /// Task 2: the literal scenario this task describes — chunk 1 of a `full_replace` run (which
@@ -271,7 +354,10 @@ async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_par
     let (conn, state, _master) = common::setup().await;
 
     const TOTAL_RECORDS: u32 = 12_000;
-    let feed_body: String = (0..TOTAL_RECORDS).map(synth_ip).collect::<Vec<_>>().join("\n");
+    let feed_body: String = (0..TOTAL_RECORDS)
+        .map(synth_ip)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -307,13 +393,21 @@ async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_par
         .mount(&bad_target_mock)
         .await;
 
-    let source_id = insert_source_with_mode(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group", "full_replace").await;
+    let source_id = insert_source_with_mode(
+        &conn,
+        &format!("{}/feed.txt", feed_mock.uri()),
+        "group",
+        "full_replace",
+    )
+    .await;
     let good_vault_id = insert_vault(&conn, "good-target", &good_target_mock.uri()).await;
     let bad_vault_id = insert_vault(&conn, "bad-target", &bad_target_mock.uri()).await;
     insert_target(&conn, source_id, good_vault_id, None).await;
     insert_target(&conn, source_id, bad_vault_id, None).await;
 
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs");
 
     assert_eq!(
         summary.status, "PARTIAL",
@@ -324,8 +418,15 @@ async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_par
         "good_target's 3 successful chunks + bad_target's 1 successful chunk (before failing on chunk 2) = 4"
     );
 
-    let good_requests = good_target_mock.received_requests().await.expect("recording enabled");
-    assert_eq!(good_requests.len(), 3, "good_target must still receive its full 3-chunk sequence regardless of bad_target's failure");
+    let good_requests = good_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(
+        good_requests.len(),
+        3,
+        "good_target must still receive its full 3-chunk sequence regardless of bad_target's failure"
+    );
     let good_modes: Vec<String> = good_requests
         .iter()
         .map(|r| {
@@ -333,20 +434,34 @@ async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_par
             body["mode"].as_str().expect("mode field").to_owned()
         })
         .collect();
-    assert_eq!(good_modes, vec!["full_replace", "upsert", "upsert"], "good_target's own chunk sequence still follows the chunk-0-only rule");
-
-    let bad_requests = bad_target_mock.received_requests().await.expect("recording enabled");
     assert_eq!(
-        bad_requests.len(), 2,
+        good_modes,
+        vec!["full_replace", "upsert", "upsert"],
+        "good_target's own chunk sequence still follows the chunk-0-only rule"
+    );
+
+    let bad_requests = bad_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(
+        bad_requests.len(),
+        2,
         "bad_target must receive exactly chunk 1 (succeeded) + chunk 2 (failed) — chunk 3 must never be attempted once chunk 2 failed"
     );
-    let bad_chunk1_body: serde_json::Value = serde_json::from_slice(&bad_requests[0].body).expect("json");
+    let bad_chunk1_body: serde_json::Value =
+        serde_json::from_slice(&bad_requests[0].body).expect("json");
     assert_eq!(
-        bad_chunk1_body["mode"], serde_json::json!("full_replace"),
+        bad_chunk1_body["mode"],
+        serde_json::json!("full_replace"),
         "bad_target's own chunk 1 legitimately carried full_replace before the run failed on chunk 2"
     );
 
-    let group = destination_group::Entity::find_by_id(source_id).one(&conn).await.expect("query").expect("group exists");
+    let group = destination_group::Entity::find_by_id(source_id)
+        .one(&conn)
+        .await
+        .expect("query")
+        .expect("group exists");
     assert!(
         group.last_run_at.is_some(),
         "last_run_at is unconditional by design — it means 'the job executed', not 'the job succeeded'; \
@@ -385,13 +500,27 @@ async fn html_response_masquerading_as_200_yields_zero_items_and_partial_status_
 
     // No panic across the full pipeline is the primary assertion here — a panicking job would
     // unwind through `.await` and this test would fail with a panic message, not a clean assert.
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs without panicking");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs without panicking");
 
-    assert_eq!(summary.items_processed, 0, "an HTML error page must yield zero IP-shaped matches");
-    assert_eq!(summary.status, "PARTIAL", "a zero-item successful fetch must be flagged, not silently SUCCESS");
-    assert!(summary.error_message.is_some(), "the zero-items case must explain itself in sync_logs");
+    assert_eq!(
+        summary.items_processed, 0,
+        "an HTML error page must yield zero IP-shaped matches"
+    );
+    assert_eq!(
+        summary.status, "PARTIAL",
+        "a zero-item successful fetch must be flagged, not silently SUCCESS"
+    );
+    assert!(
+        summary.error_message.is_some(),
+        "the zero-items case must explain itself in sync_logs"
+    );
 
-    let logs = simply_ip_sync::entities::sync_log::Entity::find().all(&conn).await.expect("query logs");
+    let logs = simply_ip_sync::entities::sync_log::Entity::find()
+        .all(&conn)
+        .await
+        .expect("query logs");
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].status, "PARTIAL");
     assert_eq!(logs[0].items_processed, 0);
@@ -407,7 +536,9 @@ async fn html_response_via_json_path_parser_is_a_hard_parse_failure() {
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/feed.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("<html><body>404 Not Found</body></html>"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("<html><body>404 Not Found</body></html>"),
+        )
         .mount(&feed_mock)
         .await;
 
@@ -442,7 +573,9 @@ async fn html_response_via_json_path_parser_is_a_hard_parse_failure() {
     };
     source.insert(&conn).await.expect("insert source");
 
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id).await.expect("job runs without panicking");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id)
+        .await
+        .expect("job runs without panicking");
     assert_eq!(summary.status, "FAILED");
     assert_eq!(summary.items_processed, 0);
     assert!(summary.error_message.is_some());
@@ -473,10 +606,15 @@ async fn gzip_compressed_feed_response_is_transparently_decompressed() {
         .await;
 
     let source_id = insert_source(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group").await;
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs");
 
     assert_eq!(summary.status, "SUCCESS");
-    assert_eq!(summary.items_processed, 2, "both addresses must survive gzip decompression before parsing");
+    assert_eq!(
+        summary.items_processed, 2,
+        "both addresses must survive gzip decompression before parsing"
+    );
 }
 
 /// Task 1: a `Content-Encoding: gzip` response that decompresses to well over
@@ -489,9 +627,12 @@ async fn gzip_compressed_feed_response_is_transparently_decompressed() {
 async fn oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buffering_it_fully() {
     let (conn, state, _master) = common::setup().await;
 
-    let oversized = vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES as usize + 1024];
+    let oversized =
+        vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES as usize + 1024];
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&oversized).expect("write to gzip encoder");
+    encoder
+        .write_all(&oversized)
+        .expect("write to gzip encoder");
     let compressed = encoder.finish().expect("finish gzip stream");
     assert!(
         compressed.len() < oversized.len() / 100,
@@ -512,9 +653,14 @@ async fn oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buf
         .await;
 
     let source_id = insert_source(&conn, &format!("{}/feed.txt", feed_mock.uri()), "group").await;
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs without panicking");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs without panicking");
 
-    assert_eq!(summary.status, "FAILED", "an oversized decompressed body must fail the job, not succeed with truncated data");
+    assert_eq!(
+        summary.status, "FAILED",
+        "an oversized decompressed body must fail the job, not succeed with truncated data"
+    );
     assert_eq!(summary.items_processed, 0);
     let message = summary.error_message.expect("must explain the failure");
     assert!(
@@ -522,7 +668,10 @@ async fn oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buf
         "error message should explain this is the decompression-bomb guard, got: {message}"
     );
 
-    let logs = simply_ip_sync::entities::sync_log::Entity::find().all(&conn).await.expect("query logs");
+    let logs = simply_ip_sync::entities::sync_log::Entity::find()
+        .all(&conn)
+        .await
+        .expect("query logs");
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].status, "FAILED");
 }
@@ -535,7 +684,8 @@ async fn oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buf
 async fn oversized_zip_member_is_rejected_as_a_decompression_bomb() {
     let (conn, state, _master) = common::setup().await;
 
-    let oversized = vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES as usize + 1024];
+    let oversized =
+        vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES as usize + 1024];
     let mut zip_buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut zip_buf);
@@ -561,9 +711,14 @@ async fn oversized_zip_member_is_rejected_as_a_decompression_bomb() {
         .await;
 
     let source_id = insert_source(&conn, &format!("{}/feed.zip", feed_mock.uri()), "group").await;
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs without panicking");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs without panicking");
 
-    assert_eq!(summary.status, "FAILED", "a zip member that decompresses past the limit must fail the job");
+    assert_eq!(
+        summary.status, "FAILED",
+        "a zip member that decompresses past the limit must fail the job"
+    );
     assert_eq!(summary.items_processed, 0);
     let message = summary.error_message.expect("must explain the failure");
     assert!(
@@ -604,21 +759,37 @@ async fn non_utf8_feed_body_does_not_crash_the_job_and_extracts_the_valid_ips() 
     let vault_id = insert_vault(&conn, "target", &target_mock.uri()).await;
     insert_target(&conn, source_id, vault_id, None).await;
 
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id).await.expect("job runs without panicking");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
+        .await
+        .expect("job runs without panicking");
 
     assert_eq!(summary.status, "SUCCESS");
-    assert_eq!(summary.items_processed, 2, "both valid IPs must survive despite the Latin-1 bytes elsewhere in the body");
+    assert_eq!(
+        summary.items_processed, 2,
+        "both valid IPs must survive despite the Latin-1 bytes elsewhere in the body"
+    );
 
-    let received = target_mock.received_requests().await.expect("recording enabled");
+    let received = target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
     assert_eq!(received.len(), 1);
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
     let addresses: Vec<String> = body["records"]
         .as_array()
         .expect("records array")
         .iter()
-        .map(|r| r["target_address"].as_str().expect("target_address").to_owned())
+        .map(|r| {
+            r["target_address"]
+                .as_str()
+                .expect("target_address")
+                .to_owned()
+        })
         .collect();
-    assert_eq!(addresses, vec!["93.184.216.44".to_owned(), "2606:4700:4700::44".to_owned()]);
+    assert_eq!(
+        addresses,
+        vec!["93.184.216.44".to_owned(), "2606:4700:4700::44".to_owned()]
+    );
 }
 
 /// Task 3: a remote target that accepts the TCP connection but never responds (or responds far
@@ -641,7 +812,11 @@ async fn slow_target_vault_is_aborted_by_the_client_timeout_not_left_hanging() {
         .and(path("/api/records/batch"))
         // Responds, but only after a delay several times longer than the client's own timeout
         // below — proving the client gives up on its own schedule rather than waiting it out.
-        .respond_with(ResponseTemplate::new(200).set_body_json(batch_response()).set_delay(Duration::from_secs(5)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(batch_response())
+                .set_delay(Duration::from_secs(5)),
+        )
         .mount(&slow_target_mock)
         .await;
 
@@ -664,7 +839,10 @@ async fn slow_target_vault_is_aborted_by_the_client_timeout_not_left_hanging() {
         .expect("job completes rather than hanging");
     let elapsed = start.elapsed();
 
-    assert_eq!(summary.status, "FAILED", "a target that never responds in time must fail the job, not hang it");
+    assert_eq!(
+        summary.status, "FAILED",
+        "a target that never responds in time must fail the job, not hang it"
+    );
     assert!(summary.error_message.is_some());
     assert!(
         elapsed < Duration::from_secs(2),
@@ -687,12 +865,145 @@ fn job_guard_refuses_concurrent_claims_on_the_same_id_and_releases_on_drop() {
     assert!(first.is_some(), "the first claim on a free id must succeed");
 
     let second = simply_ip_sync::jobs::try_start_job(&running_jobs, id);
-    assert!(second.is_none(), "a second concurrent claim on the same id must be refused");
+    assert!(
+        second.is_none(),
+        "a second concurrent claim on the same id must be refused"
+    );
 
     let unrelated = simply_ip_sync::jobs::try_start_job(&running_jobs, other_id);
-    assert!(unrelated.is_some(), "a different id must never be blocked by an unrelated in-flight job");
+    assert!(
+        unrelated.is_some(),
+        "a different id must never be blocked by an unrelated in-flight job"
+    );
 
     drop(first);
     let after_release = simply_ip_sync::jobs::try_start_job(&running_jobs, id);
-    assert!(after_release.is_some(), "dropping the guard must release the slot for a subsequent claim");
+    assert!(
+        after_release.is_some(),
+        "dropping the guard must release the slot for a subsequent claim"
+    );
+}
+
+/// Phase 1.4 Verification: End-to-end AbuseIPDB v2 JSON ingestion with authenticated custom
+/// headers (`Key`, `Accept: application/json`), `JSON_PATH` extraction (`array_path: "data"`,
+/// `target_address: "$.ipAddress"`, `last_seen_at: "$.lastReportedAt"`), bogon filtering, URL
+/// whitespace trimming, and batch push to `simply_ip_vault`.
+#[tokio::test]
+async fn abuseipdb_v2_json_feed_with_authenticated_headers_ingests_and_pushes_to_vault() {
+    use wiremock::matchers::header;
+
+    let (conn, state, _master) = common::setup().await;
+
+    let abuseipdb_payload = serde_json::json!({
+        "meta": {
+            "generatedAt": "2026-11-08T01:00:00+00:00"
+        },
+        "data": [
+            {
+                "ipAddress": "93.184.216.34",
+                "countryCode": "US",
+                "abuseConfidenceScore": 100,
+                "lastReportedAt": "2026-11-08T00:45:00+00:00"
+            },
+            {
+                "ipAddress": "2606:4700:4700::1111",
+                "countryCode": "US",
+                "abuseConfidenceScore": 98,
+                "lastReportedAt": "2026-11-08T00:50:00+00:00"
+            },
+            {
+                "ipAddress": "192.168.1.50",
+                "countryCode": "ZZ",
+                "abuseConfidenceScore": 100,
+                "lastReportedAt": "2026-11-08T00:55:00+00:00"
+            }
+        ]
+    });
+
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/blacklist"))
+        .and(header("Key", "abuseipdb-secret-token-xyz"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(abuseipdb_payload))
+        .mount(&feed_mock)
+        .await;
+
+    let vault_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_response()))
+        .mount(&vault_mock)
+        .await;
+
+    let group_id = Uuid::new_v4();
+    let now = Utc::now();
+    let group = destination_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("AbuseIPDB Feed Group".to_owned()),
+        target_group_name: Set("abuseipdb".to_owned()),
+        cron_schedule: Set("0 */6 * * *".to_owned()),
+        mode: Set("full_replace".to_owned()),
+        is_active: Set(true),
+        skip_bogon_filtering: Set(false),
+        last_run_at: Set(None),
+        owner_key_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    group.insert(&conn).await.expect("insert destination group");
+
+    let feed_id = Uuid::new_v4();
+    let parser_cfg = serde_json::json!({
+        "array_path": "data",
+        "target_address": "$.ipAddress",
+        "last_seen_at": "$.lastReportedAt",
+        "headers": {
+            "Key": "abuseipdb-secret-token-xyz",
+            "Accept": "application/json"
+        }
+    })
+    .to_string();
+
+    // Intentionally include leading/trailing whitespace in source_url to verify trimming
+    let feed = external_source::ActiveModel {
+        id: Set(feed_id),
+        destination_group_id: Set(group_id),
+        name: Set("AbuseIPDB v2 Blacklist".to_owned()),
+        source_url: Set(format!(
+            " \t{}/api/v2/blacklist?confidenceMinimum=90 ",
+            feed_mock.uri()
+        )),
+        parser_type: Set("JSON_PATH".to_owned()),
+        parser_config_json: Set(Some(parser_cfg)),
+        max_age_days: Set(None),
+        skip_bogon_filtering: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    feed.insert(&conn).await.expect("insert AbuseIPDB feed");
+
+    let vault_id = insert_vault(&conn, "MainVault", &vault_mock.uri()).await;
+    insert_target(&conn, group_id, vault_id, None).await;
+
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id)
+        .await
+        .expect("AbuseIPDB ingestion job runs");
+    assert_eq!(summary.status, "SUCCESS");
+    assert_eq!(
+        summary.items_processed, 2,
+        "2 public IPs (IPv4 + IPv6) should be ingested and 1 RFC1918 bogon filtered out"
+    );
+
+    let received = vault_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(received.len(), 1);
+    let pushed_body: serde_json::Value =
+        serde_json::from_slice(&received[0].body).expect("json body");
+    assert_eq!(pushed_body["group_name"], serde_json::json!("abuseipdb"));
+    assert_eq!(pushed_body["mode"], serde_json::json!("full_replace"));
+    let records = pushed_body["records"].as_array().expect("records array");
+    assert_eq!(records.len(), 2);
 }

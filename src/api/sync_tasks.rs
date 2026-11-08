@@ -3,16 +3,20 @@
 use axum::extract::State;
 
 use crate::extract::StrictPath;
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::response::IntoResponse;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::sources::TargetSpec;
-use super::support::{create_audit_log, find_permission, grant_full_permission, RESOURCE_SYNC_TASK};
-use super::{guard_can_sync, guard_resource_creation, guard_resource_lifecycle, guard_resource_manage};
+use super::support::{
+    RESOURCE_SYNC_TASK, create_audit_log, find_permission, grant_full_permission,
+};
+use super::{
+    guard_can_sync, guard_resource_creation, guard_resource_lifecycle, guard_resource_manage,
+};
 use crate::entities::{api_key, vault_sync_task, vault_sync_task_target};
 use crate::error::AppError;
 use crate::extract::StrictJson;
@@ -54,7 +58,10 @@ pub struct VaultSyncTaskResponse {
     pub updated_at: chrono::DateTime<Utc>,
 }
 
-async fn load_targets(db: &sea_orm::DatabaseConnection, task_id: Uuid) -> Result<Vec<TargetSpec>, AppError> {
+async fn load_targets(
+    db: &sea_orm::DatabaseConnection,
+    task_id: Uuid,
+) -> Result<Vec<TargetSpec>, AppError> {
     let rows = vault_sync_task_target::Entity::find()
         .filter(vault_sync_task_target::Column::VaultSyncTaskId.eq(task_id))
         .all(db)
@@ -147,10 +154,16 @@ pub struct UpdateVaultSyncTaskPayload {
     pub targets: Option<Vec<TargetSpec>>,
 }
 
-async fn visible_to(state: &AppState, caller: &api_key::Model, task: &vault_sync_task::Model) -> Result<bool, AppError> {
+async fn visible_to(
+    state: &AppState,
+    caller: &api_key::Model,
+    task: &vault_sync_task::Model,
+) -> Result<bool, AppError> {
     Ok(caller.is_master
         || task.owner_key_id == Some(caller.id)
-        || find_permission(&state.db, caller.id, RESOURCE_SYNC_TASK, task.id).await?.is_some())
+        || find_permission(&state.db, caller.id, RESOURCE_SYNC_TASK, task.id)
+            .await?
+            .is_some())
 }
 
 /// `GET /api/sync-tasks`.
@@ -175,7 +188,10 @@ pub async fn get_vault_sync_task(
     axum::Extension(caller): axum::Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let task = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let task = vault_sync_task::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !visible_to(&state, &caller, &task).await? {
         return Err(AppError::NotFound);
     }
@@ -214,13 +230,22 @@ pub async fn create_vault_sync_task(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    let inserted = vault_sync_task::Entity::insert(model).exec_with_returning(&txn).await.map_err(|e| {
-        if matches!(e.sql_err(), Some(sea_orm::SqlErr::UniqueConstraintViolation(_))) {
-            AppError::Conflict(format!("a sync task named '{}' already exists", payload.name))
-        } else {
-            AppError::DbError(e)
-        }
-    })?;
+    let inserted = vault_sync_task::Entity::insert(model)
+        .exec_with_returning(&txn)
+        .await
+        .map_err(|e| {
+            if matches!(
+                e.sql_err(),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+            ) {
+                AppError::Conflict(format!(
+                    "a sync task named '{}' already exists",
+                    payload.name
+                ))
+            } else {
+                AppError::DbError(e)
+            }
+        })?;
 
     for target in &payload.targets {
         let row = vault_sync_task_target::ActiveModel {
@@ -228,11 +253,21 @@ pub async fn create_vault_sync_task(
             target_vault_id: Set(target.vault_endpoint_id),
             target_group_name: Set(target.target_group_name.clone()),
         };
-        vault_sync_task_target::Entity::insert(row).exec(&txn).await?;
+        vault_sync_task_target::Entity::insert(row)
+            .exec(&txn)
+            .await?;
     }
 
     grant_full_permission(&txn, caller.id, RESOURCE_SYNC_TASK, id).await?;
-    create_audit_log(&txn, &caller, client_ip.0, "SYNC_TASK_CREATE", Some(inserted.name.clone()), None).await?;
+    create_audit_log(
+        &txn,
+        &caller,
+        client_ip.0,
+        "SYNC_TASK_CREATE",
+        Some(inserted.name.clone()),
+        None,
+    )
+    .await?;
     txn.commit().await?;
 
     state.scheduler.upsert_task(&state, &inserted).await;
@@ -248,7 +283,10 @@ pub async fn update_vault_sync_task(
     StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateVaultSyncTaskPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = vault_sync_task::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let permission = find_permission(&state.db, caller.id, RESOURCE_SYNC_TASK, id).await?;
     guard_resource_manage(&caller, permission.as_ref())?;
 
@@ -294,11 +332,21 @@ pub async fn update_vault_sync_task(
                 target_vault_id: Set(target.vault_endpoint_id),
                 target_group_name: Set(target.target_group_name.clone()),
             };
-            vault_sync_task_target::Entity::insert(row).exec(&txn).await?;
+            vault_sync_task_target::Entity::insert(row)
+                .exec(&txn)
+                .await?;
         }
     }
 
-    create_audit_log(&txn, &caller, client_ip.0, "SYNC_TASK_UPDATE", Some(updated.name.clone()), None).await?;
+    create_audit_log(
+        &txn,
+        &caller,
+        client_ip.0,
+        "SYNC_TASK_UPDATE",
+        Some(updated.name.clone()),
+        None,
+    )
+    .await?;
     txn.commit().await?;
 
     state.scheduler.upsert_task(&state, &updated).await;
@@ -314,18 +362,31 @@ pub async fn delete_vault_sync_task(
     axum::Extension(client_ip): axum::Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = vault_sync_task::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     guard_resource_lifecycle(&caller, existing.owner_key_id)?;
 
     let name = existing.name.clone();
     // See `sources.rs::delete_external_source`'s identical comment: two concurrent deletes of the
     // same id can both pass `find_by_id` before either `DELETE` runs.
-    let result = vault_sync_task::Entity::delete_by_id(id).exec(&state.db).await?;
+    let result = vault_sync_task::Entity::delete_by_id(id)
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
     state.scheduler.remove_task(id).await;
-    create_audit_log(&state.db, &caller, client_ip.0, "SYNC_TASK_DELETE", Some(name), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "SYNC_TASK_DELETE",
+        Some(name),
+        None,
+    )
+    .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -336,16 +397,28 @@ pub async fn trigger_vault_sync_task(
     axum::Extension(client_ip): axum::Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = vault_sync_task::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = vault_sync_task::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let permission = find_permission(&state.db, caller.id, RESOURCE_SYNC_TASK, id).await?;
     guard_can_sync(&caller, permission.as_ref())?;
 
     // See api/sources.rs::trigger_external_source for why this guard exists: refuses a second
     // concurrent run of the same task rather than racing two overlapping executions.
-    let _job_guard = crate::jobs::try_start_job(&state.running_jobs, id)
-        .ok_or_else(|| AppError::Conflict("a sync for this task is already in progress".to_owned()))?;
+    let _job_guard = crate::jobs::try_start_job(&state.running_jobs, id).ok_or_else(|| {
+        AppError::Conflict("a sync for this task is already in progress".to_owned())
+    })?;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "SYNC_TASK_TRIGGER", Some(existing.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "SYNC_TASK_TRIGGER",
+        Some(existing.name.clone()),
+        None,
+    )
+    .await?;
     let summary = crate::jobs::vault_sync::run(&state, id).await?;
     Ok(Json(serde_json::json!({
         "status": summary.status,

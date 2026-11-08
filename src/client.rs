@@ -221,7 +221,8 @@ async fn post_batch_once(
     records: &[BatchRecordInput],
     mode: BatchMode,
 ) -> Result<BatchRecordsResponse, ClientError> {
-    let base = Url::parse(&endpoint.target_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    let base =
+        Url::parse(&endpoint.target_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
     // `target_url` may carry its own reverse-proxy subpath (e.g. `https://host/direct/ip_vault/`),
     // which `simply_ip_vault`'s own router has no awareness of: it mounts everything under a
     // literal `.nest("/api", ...)` at its own root, so the *only* deployment that can work at all
@@ -241,7 +242,11 @@ async fn post_batch_once(
         mode: BatchMode,
         records: &'a [BatchRecordInput],
     }
-    let payload = Payload { group_name, mode, records };
+    let payload = Payload {
+        group_name,
+        mode,
+        records,
+    };
     let body = serde_json::to_vec(&payload).map_err(|_| ClientError::Signing)?;
 
     // Signed fresh on every attempt — not just because CANONICAL_V1 covers the body (unchanged
@@ -264,7 +269,10 @@ async fn post_batch_once(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         let truncated: String = body.chars().take(500).collect();
-        return Err(ClientError::RemoteError { status: status.as_u16(), body: truncated });
+        return Err(ClientError::RemoteError {
+            status: status.as_u16(),
+            body: truncated,
+        });
     }
     Ok(response.json::<BatchRecordsResponse>().await?)
 }
@@ -287,7 +295,9 @@ async fn post_batch_with_retry(
     loop {
         match post_batch_once(http, cipher, endpoint, group_name, records, mode).await {
             Ok(resp) => return Ok(resp),
-            Err(ClientError::RemoteError { status, body }) if crate::retry::is_transient_status(status) && attempt < max_retries => {
+            Err(ClientError::RemoteError { status, body })
+                if crate::retry::is_transient_status(status) && attempt < max_retries =>
+            {
                 attempt += 1;
                 let delay = crate::retry::backoff_with_jitter(attempt);
                 tracing::warn!(
@@ -332,7 +342,8 @@ pub async fn post_batch(
     // future, and a queue makes the "only the very first piece keeps `mode`" rule easy to state
     // correctly (push the tail piece back deliberately downgraded, regardless of how many times a
     // given chunk has already been re-split).
-    let mut queue: std::collections::VecDeque<(Vec<BatchRecordInput>, BatchMode)> = std::collections::VecDeque::new();
+    let mut queue: std::collections::VecDeque<(Vec<BatchRecordInput>, BatchMode)> =
+        std::collections::VecDeque::new();
     queue.push_back((records.to_vec(), mode));
 
     let mut aggregate = BatchRecordsResponse::default();
@@ -341,7 +352,8 @@ pub async fn post_batch(
         match post_batch_with_retry(http, cipher, endpoint, group_name, &chunk, chunk_mode).await {
             Ok(resp) => aggregate.merge(resp),
             Err(ClientError::RemoteError { status, body })
-                if chunk.len() > 1 && (status == 413 || crate::retry::is_transient_status(status)) =>
+                if chunk.len() > 1
+                    && (status == 413 || crate::retry::is_transient_status(status)) =>
             {
                 let mid = chunk.len() / 2;
                 let mut first_half = chunk;
@@ -405,7 +417,10 @@ async fn get_ips_page(
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("group_name", group_name);
-        pairs.append_pair("include_deleted", if include_deleted { "true" } else { "false" });
+        pairs.append_pair(
+            "include_deleted",
+            if include_deleted { "true" } else { "false" },
+        );
         pairs.append_pair("limit", &DELTA_PAGE_SIZE.to_string());
         pairs.append_pair("offset", &offset.to_string());
         if let Some(since) = since {
@@ -433,7 +448,10 @@ async fn get_ips_page(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         let truncated: String = body.chars().take(500).collect();
-        return Err(ClientError::RemoteError { status: status.as_u16(), body: truncated });
+        return Err(ClientError::RemoteError {
+            status: status.as_u16(),
+            body: truncated,
+        });
     }
     Ok(response.json::<Vec<IpRecordResponse>>().await?)
 }
@@ -455,9 +473,22 @@ async fn get_ips_page_with_retry(
     let max_retries = crate::config::outbound_max_retries();
     let mut attempt: u32 = 0;
     loop {
-        match get_ips_page(http, cipher, endpoint, base, group_name, since, include_deleted, offset).await {
+        match get_ips_page(
+            http,
+            cipher,
+            endpoint,
+            base,
+            group_name,
+            since,
+            include_deleted,
+            offset,
+        )
+        .await
+        {
             Ok(page) => return Ok(page),
-            Err(ClientError::RemoteError { status, body }) if crate::retry::is_transient_status(status) && attempt < max_retries => {
+            Err(ClientError::RemoteError { status, body })
+                if crate::retry::is_transient_status(status) && attempt < max_retries =>
+            {
                 attempt += 1;
                 let delay = crate::retry::backoff_with_jitter(attempt);
                 tracing::warn!(
@@ -485,14 +516,23 @@ pub async fn get_ips_delta(
     since: Option<DateTime<Utc>>,
     include_deleted: bool,
 ) -> Result<Vec<IpRecordResponse>, ClientError> {
-    let base = Url::parse(&endpoint.target_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    let base =
+        Url::parse(&endpoint.target_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
     let mut all_records = Vec::new();
     let mut offset: u64 = 0;
 
     loop {
-        let page =
-            get_ips_page_with_retry(http, cipher, endpoint, &base, group_name, since, include_deleted, offset)
-                .await?;
+        let page = get_ips_page_with_retry(
+            http,
+            cipher,
+            endpoint,
+            &base,
+            group_name,
+            since,
+            include_deleted,
+            offset,
+        )
+        .await?;
         let page_len = page.len() as u64;
         all_records.extend(page);
         if page_len < DELTA_PAGE_SIZE {

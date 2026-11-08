@@ -6,7 +6,7 @@ use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use uuid::Uuid;
 
-use super::{chunk_records, JobSummary, MAX_BATCH_SIZE};
+use super::{JobSummary, MAX_BATCH_SIZE, chunk_records};
 use crate::client::{self, BatchMode, BatchRecordInput};
 use crate::entities::{vault_endpoint, vault_sync_task, vault_sync_task_target};
 use crate::error::AppError;
@@ -24,7 +24,9 @@ pub async fn run(state: &AppState, task_id: Uuid) -> Result<JobSummary, AppError
         .await?
         .ok_or(AppError::NotFound)?;
 
-    let source_vault = vault_endpoint::Entity::find_by_id(task.source_vault_id).one(&state.db).await?;
+    let source_vault = vault_endpoint::Entity::find_by_id(task.source_vault_id)
+        .one(&state.db)
+        .await?;
 
     let targets = vault_sync_task_target::Entity::find()
         .filter(vault_sync_task_target::Column::VaultSyncTaskId.eq(task_id))
@@ -32,9 +34,18 @@ pub async fn run(state: &AppState, task_id: Uuid) -> Result<JobSummary, AppError
         .all(&state.db)
         .await?;
 
-    let (summary, all_targets_succeeded) = execute(state, &task, source_vault.as_ref(), &targets).await;
+    let (summary, all_targets_succeeded) =
+        execute(state, &task, source_vault.as_ref(), &targets).await;
 
-    super::write_sync_log(&state.db, "VAULT_SYNC", task_id, &task.name, &summary, started_at).await?;
+    super::write_sync_log(
+        &state.db,
+        "VAULT_SYNC",
+        task_id,
+        &task.name,
+        &summary,
+        started_at,
+    )
+    .await?;
 
     if all_targets_succeeded {
         let mut active: vault_sync_task::ActiveModel = task.into();
@@ -84,7 +95,10 @@ async fn execute(
                     items_processed: 0,
                     chunks_sent: 0,
                     duration_ms: start.elapsed().as_millis() as i32,
-                    error_message: Some(format!("delta fetch from '{}' failed: {e}", source_vault.name)),
+                    error_message: Some(format!(
+                        "delta fetch from '{}' failed: {e}",
+                        source_vault.name
+                    )),
                 },
                 false,
             );
@@ -127,7 +141,10 @@ async fn execute(
         let addresses: Vec<String> = mapped.iter().map(|r| r.target_address.clone()).collect();
         let (kept, removed) = crate::bogon::sanitize(addresses);
         let kept: std::collections::HashSet<&str> = kept.iter().map(String::as_str).collect();
-        let filtered = mapped.into_iter().filter(|r| kept.contains(r.target_address.as_str())).collect();
+        let filtered = mapped
+            .into_iter()
+            .filter(|r| kept.contains(r.target_address.as_str()))
+            .collect();
         (filtered, removed)
     };
     let items_processed = mapped.len();
@@ -140,7 +157,10 @@ async fn execute(
 
     for (target, vault) in targets {
         let Some(vault) = vault else {
-            errors.push(format!("target vault {} no longer exists", target.target_vault_id));
+            errors.push(format!(
+                "target vault {} no longer exists",
+                target.target_vault_id
+            ));
             all_succeeded = false;
             continue;
         };
@@ -151,7 +171,15 @@ async fn execute(
 
         let mut target_ok = true;
         for chunk in &chunks {
-            match client::post_batch(&state.http, &state.cipher, vault, &group_name, chunk, BatchMode::Upsert).await
+            match client::post_batch(
+                &state.http,
+                &state.cipher,
+                vault,
+                &group_name,
+                chunk,
+                BatchMode::Upsert,
+            )
+            .await
             {
                 Ok(_) => chunks_sent += 1,
                 Err(e) => {
@@ -186,7 +214,9 @@ async fn execute(
         ));
     }
     if bogons_removed > 0 {
-        message_parts.push(format!("{bogons_removed} bogon/private/reserved address(es) sanitized before push"));
+        message_parts.push(format!(
+            "{bogons_removed} bogon/private/reserved address(es) sanitized before push"
+        ));
     }
     message_parts.extend(errors);
 
@@ -196,7 +226,11 @@ async fn execute(
             items_processed: items_processed as i32,
             chunks_sent,
             duration_ms: start.elapsed().as_millis() as i32,
-            error_message: if message_parts.is_empty() { None } else { Some(message_parts.join("; ")) },
+            error_message: if message_parts.is_empty() {
+                None
+            } else {
+                Some(message_parts.join("; "))
+            },
         },
         all_succeeded,
     )

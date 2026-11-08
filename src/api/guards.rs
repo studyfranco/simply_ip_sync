@@ -17,7 +17,9 @@ pub fn guard_resource_creation(caller: &api_key::Model, has_right: bool) -> Resu
     if caller.is_master || has_right {
         Ok(())
     } else {
-        Err(forbidden("missing the resource-creation right for this action"))
+        Err(forbidden(
+            "missing the resource-creation right for this action",
+        ))
     }
 }
 
@@ -30,7 +32,9 @@ pub fn guard_scope_elevation(
     wants_can_manage_sources: bool,
     wants_can_manage_vaults: bool,
 ) -> Result<(), AppError> {
-    if (wants_can_manage_keys || wants_can_manage_sources || wants_can_manage_vaults) && !caller.is_master {
+    if (wants_can_manage_keys || wants_can_manage_sources || wants_can_manage_vaults)
+        && !caller.is_master
+    {
         return Err(forbidden(
             "only the Master key may grant can_manage_keys, can_manage_sources, or can_manage_vaults",
         ));
@@ -61,18 +65,26 @@ pub fn guard_resource_manage(
 /// §3: resource lifecycle actions (delete, rename) are restricted to Master and the resource's
 /// designated `owner_key_id`. Holding manage rights or any operational verb confers no lifecycle
 /// authority.
-pub fn guard_resource_lifecycle(caller: &api_key::Model, owner_key_id: Option<Uuid>) -> Result<(), AppError> {
+pub fn guard_resource_lifecycle(
+    caller: &api_key::Model,
+    owner_key_id: Option<Uuid>,
+) -> Result<(), AppError> {
     if caller.is_master || owner_key_id == Some(caller.id) {
         Ok(())
     } else {
-        Err(forbidden("only the Master key or this resource's owner may delete or rename it (RBAC §3)"))
+        Err(forbidden(
+            "only the Master key or this resource's owner may delete or rename it (RBAC §3)",
+        ))
     }
 }
 
 /// Gate for `POST /api/sources/{id}/trigger` and `POST /api/sync-tasks/{id}/trigger`: the
 /// caller's operational verb for this service (`can_sync`). Master bypasses; absence of a
 /// permission row is a default-deny, not an implicit grant.
-pub fn guard_can_sync(caller: &api_key::Model, permission: Option<&api_key_sync_permission::Model>) -> Result<(), AppError> {
+pub fn guard_can_sync(
+    caller: &api_key::Model,
+    permission: Option<&api_key_sync_permission::Model>,
+) -> Result<(), AppError> {
     if caller.is_master || permission.is_some_and(|p| p.can_sync) {
         Ok(())
     } else {
@@ -82,7 +94,10 @@ pub fn guard_can_sync(caller: &api_key::Model, permission: Option<&api_key_sync_
 
 /// Visibility gate for a resource's `sync_logs`. Default-deny: no permission row means no
 /// visibility, except for Master.
-pub fn guard_can_view_logs(caller: &api_key::Model, permission: Option<&api_key_sync_permission::Model>) -> bool {
+pub fn guard_can_view_logs(
+    caller: &api_key::Model,
+    permission: Option<&api_key_sync_permission::Model>,
+) -> bool {
     caller.is_master || permission.is_some_and(|p| p.can_view_logs)
 }
 
@@ -101,15 +116,22 @@ pub fn guard_delegated_grant(
         return Ok(());
     }
     guard_resource_manage(caller, caller_permission)?;
-    let caller_has = |get: fn(&api_key_sync_permission::Model) -> bool| caller_permission.is_some_and(get);
+    let caller_has =
+        |get: fn(&api_key_sync_permission::Model) -> bool| caller_permission.is_some_and(get);
     if grant_can_sync && !caller_has(|p| p.can_sync) {
-        return Err(forbidden("cannot grant can_sync without holding it yourself on this resource (RBAC R1)"));
+        return Err(forbidden(
+            "cannot grant can_sync without holding it yourself on this resource (RBAC R1)",
+        ));
     }
     if grant_can_view_logs && !caller_has(|p| p.can_view_logs) {
-        return Err(forbidden("cannot grant can_view_logs without holding it yourself on this resource (RBAC R1)"));
+        return Err(forbidden(
+            "cannot grant can_view_logs without holding it yourself on this resource (RBAC R1)",
+        ));
     }
     if grant_can_manage && !caller_has(|p| p.can_manage) {
-        return Err(forbidden("cannot grant can_manage without holding it yourself on this resource (RBAC R1)"));
+        return Err(forbidden(
+            "cannot grant can_manage without holding it yourself on this resource (RBAC R1)",
+        ));
     }
     Ok(())
 }
@@ -127,9 +149,14 @@ pub fn guard_revocation(
 /// §5: the Master key is immutable through the API except for its own `bound_ips`. Called with
 /// `changing_non_bound_ips_field = true` whenever an update payload touches anything besides
 /// `bound_ips`.
-pub fn guard_master_immutable(target_is_master: bool, changing_non_bound_ips_field: bool) -> Result<(), AppError> {
+pub fn guard_master_immutable(
+    target_is_master: bool,
+    changing_non_bound_ips_field: bool,
+) -> Result<(), AppError> {
     if target_is_master && changing_non_bound_ips_field {
-        Err(forbidden("the Master key is immutable through the API except for its own bound_ips (RBAC §5)"))
+        Err(forbidden(
+            "the Master key is immutable through the API except for its own bound_ips (RBAC §5)",
+        ))
     } else {
         Ok(())
     }
@@ -139,7 +166,9 @@ pub fn guard_master_immutable(target_is_master: bool, changing_non_bound_ips_fie
 /// fresh plaintext credential.
 pub fn guard_rotation_allowed(target_is_master: bool) -> Result<(), AppError> {
     if target_is_master {
-        Err(forbidden("the Master key's credentials cannot be rotated through the API (RBAC §5)"))
+        Err(forbidden(
+            "the Master key's credentials cannot be rotated through the API (RBAC §5)",
+        ))
     } else {
         Ok(())
     }

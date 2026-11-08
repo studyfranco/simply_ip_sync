@@ -42,7 +42,10 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .alter_table(
-                Table::alter().table(VaultSyncTasks::Table).drop_column(VaultSyncTasks::SkipBogonFiltering).to_owned(),
+                Table::alter()
+                    .table(VaultSyncTasks::Table)
+                    .drop_column(VaultSyncTasks::SkipBogonFiltering)
+                    .to_owned(),
             )
             .await
     }

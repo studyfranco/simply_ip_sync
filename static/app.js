@@ -770,7 +770,10 @@ function showFeedForm(group, existing, vaults) {
         <label>Custom Headers (e.g. an API key some feeds require)</label>
         <!-- Rows are built by JS (renderFeedHeaderRows). -->
         <div id="feed-headers-list" class="kv-editor" role="group" aria-label="Custom headers"></div>
-        <button type="button" id="feed-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
+        <div class="row-actions mt-2">
+          <button type="button" id="feed-headers-add" class="btn btn-secondary btn-sm">+ Add Header</button>
+          <button type="button" id="feed-preset-abuseipdb" class="btn btn-secondary btn-sm">Preset: AbuseIPDB v2 JSON</button>
+        </div>
         <small class="field-hint">Sent verbatim on every fetch of this feed. Rows with an empty name are ignored.</small>
       </div>
       <div class="form-group form-group-grow" id="feed-parser-config-group">
@@ -847,6 +850,31 @@ function showFeedForm(group, existing, vaults) {
     renderFeedHeaderRows();
     const inputs = document.querySelectorAll("#feed-headers-list .kv-name");
     inputs[inputs.length - 1]?.focus();
+  });
+  document.getElementById("feed-preset-abuseipdb").addEventListener("click", () => {
+    const urlInput = document.querySelector('#feed-form [name="source_url"]');
+    if (!urlInput.value.trim()) {
+      urlInput.value = "https://api.abuseipdb.com/api/v2/blacklist?confidenceMinimum=90";
+    }
+    document.getElementById("feed-parser-type").value = "JSON_PATH";
+    const configTextarea = document.querySelector('#feed-form [name="parser_config_json"]');
+    configTextarea.value = JSON.stringify(
+      {
+        array_path: "data",
+        target_address: "$.ipAddress",
+        last_seen_at: "$.lastReportedAt",
+      },
+      null,
+      2
+    );
+    if (!rows.some((r) => r.name.toLowerCase() === "key")) {
+      rows.push({ name: "Key", value: "" });
+    }
+    if (!rows.some((r) => r.name.toLowerCase() === "accept")) {
+      rows.push({ name: "Accept", value: "application/json" });
+    }
+    renderFeedHeaderRows();
+    syncReactiveFieldVisibility();
   });
   renderFeedHeaderRows();
 
@@ -1158,8 +1186,11 @@ async function renderKeys() {
     </section>`;
 
   if (document.getElementById("new-key-btn")) {
-    document.getElementById("new-key-btn").addEventListener("click", () => showKeyForm());
+    document.getElementById("new-key-btn").addEventListener("click", () => showKeyForm(null));
   }
+  panel.querySelectorAll("[data-edit-key]").forEach((btn) =>
+    btn.addEventListener("click", () => showKeyForm(keys.find((k) => k.id === btn.dataset.editKey)))
+  );
   panel.querySelectorAll("[data-rotate-key]").forEach((btn) =>
     btn.addEventListener("click", () => rotateKey(btn.dataset.rotateKey))
   );
@@ -1182,11 +1213,14 @@ function keyRow(k) {
     .filter(Boolean)
     .map((s) => `<span class="badge badge-scope">${escapeHtml(s)}</span>`)
     .join(" ");
-  // The Master key is neither deletable nor rotatable through the API (RBAC §5), so it gets no
-  // action buttons at all rather than buttons that would only ever return 403.
+  // The Master key is neither deletable nor rotatable through the API (RBAC §5), but its bound_ips
+  // may be updated by Master.
   const actions = k.is_master
-    ? ""
-    : `<button class="btn btn-sm" data-rotate-key="${k.id}">Rotate Key</button>
+    ? me.is_master
+      ? `<button class="btn btn-sm" data-edit-key="${k.id}">Edit Bound IPs</button>`
+      : ""
+    : `<button class="btn btn-sm" data-edit-key="${k.id}">Edit</button>
+       <button class="btn btn-sm" data-rotate-key="${k.id}">Rotate Key</button>
        <button class="btn btn-sm" data-rotate-secret="${k.id}">Rotate Secret</button>
        <button class="btn btn-sm btn-danger" data-delete-key="${k.id}">Delete</button>`;
   return `<tr>
@@ -1199,19 +1233,20 @@ function keyRow(k) {
   </tr>`;
 }
 
-function showKeyForm() {
+function showKeyForm(existing) {
   const slot = document.getElementById("key-form-slot");
+  const isEditingMaster = Boolean(existing?.is_master);
   slot.innerHTML = `
     <form class="form-grid" id="key-form">
-      <label class="form-group"><span>Name</span><input class="input-field" name="name" required></label>
-      <label class="form-group"><span>Bound IPs (CIDR, comma-separated)</span><input class="input-field" name="bound_ips" placeholder="0.0.0.0/0,::/0"></label>
-      ${me.is_master ? `
-      <label class="checkbox-container"><input type="checkbox" name="can_manage_keys"><span>can_manage_keys</span></label>
-      <label class="checkbox-container"><input type="checkbox" name="can_manage_sources"><span>can_manage_sources</span></label>
-      <label class="checkbox-container"><input type="checkbox" name="can_manage_vaults"><span>can_manage_vaults</span></label>
+      <label class="form-group"><span>Name</span><input class="input-field" name="name" ${isEditingMaster ? "disabled" : "required"} value="${escapeHtml(existing?.name || "")}"></label>
+      <label class="form-group"><span>Bound IPs (CIDR, comma-separated)</span><input class="input-field" name="bound_ips" placeholder="0.0.0.0/0,::/0" value="${escapeHtml(existing?.bound_ips || "")}"></label>
+      ${me.is_master && !isEditingMaster ? `
+      <label class="checkbox-container"><input type="checkbox" name="can_manage_keys" ${existing?.can_manage_keys ? "checked" : ""}><span>can_manage_keys</span></label>
+      <label class="checkbox-container"><input type="checkbox" name="can_manage_sources" ${existing?.can_manage_sources ? "checked" : ""}><span>can_manage_sources</span></label>
+      <label class="checkbox-container"><input type="checkbox" name="can_manage_vaults" ${existing?.can_manage_vaults ? "checked" : ""}><span>can_manage_vaults</span></label>
       ` : ""}
       <div class="form-actions">
-        <button type="submit" class="btn btn-primary">Create</button>
+        <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create"}</button>
         <button type="button" class="btn btn-cancel" id="key-form-cancel">Cancel</button>
       </div>
     </form>`;
@@ -1220,22 +1255,42 @@ function showKeyForm() {
   document.getElementById("key-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const payload = {
-      name: fd.get("name"),
-      bound_ips: fd.get("bound_ips") || null,
-      can_manage_keys: fd.get("can_manage_keys") === "on",
-      can_manage_sources: fd.get("can_manage_sources") === "on",
-      can_manage_vaults: fd.get("can_manage_vaults") === "on",
-    };
     try {
-      const result = await client.post("/api/keys", payload);
-      await renderKeys();
-      revealCredentials("Key created — save these now, they are not recoverable", [
-        ["API key", result.plaintext_key],
-        ["Signing secret", result.plaintext_signing_secret],
-      ]);
+      if (existing) {
+        const payload = isEditingMaster
+          ? { bound_ips: fd.get("bound_ips") || "" }
+          : {
+              name: fd.get("name"),
+              bound_ips: fd.get("bound_ips") || "",
+              ...(me.is_master
+                ? {
+                    can_manage_keys: fd.get("can_manage_keys") === "on",
+                    can_manage_sources: fd.get("can_manage_sources") === "on",
+                    can_manage_vaults: fd.get("can_manage_vaults") === "on",
+                  }
+                : {}),
+            };
+        await client.put("/api/keys/" + existing.id, payload);
+        toast("API key updated", "success");
+        slot.innerHTML = "";
+        await renderKeys();
+      } else {
+        const payload = {
+          name: fd.get("name"),
+          bound_ips: fd.get("bound_ips") || null,
+          can_manage_keys: fd.get("can_manage_keys") === "on",
+          can_manage_sources: fd.get("can_manage_sources") === "on",
+          can_manage_vaults: fd.get("can_manage_vaults") === "on",
+        };
+        const result = await client.post("/api/keys", payload);
+        await renderKeys();
+        revealCredentials("Key created — save these now, they are not recoverable", [
+          ["API key", result.plaintext_key],
+          ["Signing secret", result.plaintext_signing_secret],
+        ]);
+      }
     } catch (err) {
-      toast("Create failed: " + err.message, "error");
+      toast((existing ? "Update" : "Create") + " failed: " + err.message, "error");
     }
   });
 }
@@ -1342,34 +1397,63 @@ function logRow(l) {
   </tr>`;
 }
 
+let auditFilterState = { action: "", client_ip: "", api_key: "" };
+
 async function renderAuditLogs() {
   const panel = document.getElementById("tab-audit-logs");
   if (!me.is_master) {
     panel.innerHTML = '<section class="card"><p class="empty-state">Audit logs are visible to the Master key only.</p></section>';
     return;
   }
-  const logs = await client.get("/api/audit-logs?limit=100");
+  const params = new URLSearchParams({ limit: "100" });
+  if (auditFilterState.action) params.set("action", auditFilterState.action);
+  if (auditFilterState.client_ip) params.set("client_ip", auditFilterState.client_ip);
+  if (auditFilterState.api_key) params.set("api_key", auditFilterState.api_key);
+  const logs = await client.get("/api/audit-logs?" + params.toString());
   panel.innerHTML = `
     <section class="card">
-      <div class="list-header"><h2>Audit Logs</h2></div>
+      <div class="list-header">
+        <h2>Audit Logs</h2>
+        <div class="row-actions">
+          <input type="text" id="audit-action-filter" class="input-field font-mono" placeholder="Filter by action..." value="${escapeHtml(auditFilterState.action)}">
+          <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP..." value="${escapeHtml(auditFilterState.client_ip)}">
+          <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key..." value="${escapeHtml(auditFilterState.api_key)}">
+          <button type="button" id="audit-search-btn" class="btn btn-secondary btn-sm">Filter</button>
+          <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
+        </div>
+      </div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Timestamp</th><th>Actor</th><th>Client IP</th><th>Action</th><th>Target</th></tr></thead>
+        <thead><tr><th>Timestamp</th><th>API Key</th><th>Client IP</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
         <tbody>
-          ${logs.length ? logs.map(auditRow).join("") : '<tr><td colspan="5" class="empty-state">No audit entries yet.</td></tr>'}
+          ${logs.length ? logs.map(auditRow).join("") : '<tr><td colspan="6" class="empty-state">No audit entries yet.</td></tr>'}
         </tbody>
       </table>
       </div>
     </section>`;
+
+  document.getElementById("audit-search-btn").addEventListener("click", async () => {
+    auditFilterState = {
+      action: document.getElementById("audit-action-filter").value.trim(),
+      client_ip: document.getElementById("audit-ip-filter").value.trim(),
+      api_key: document.getElementById("audit-key-filter").value.trim(),
+    };
+    await renderAuditLogs();
+  });
+  document.getElementById("audit-clear-btn").addEventListener("click", async () => {
+    auditFilterState = { action: "", client_ip: "", api_key: "" };
+    await renderAuditLogs();
+  });
 }
 
 function auditRow(a) {
   return `<tr>
-    <td>${escapeHtml(a.timestamp)}</td>
-    <td>${escapeHtml(a.api_key_name || "")} <span class="font-mono">${escapeHtml(a.api_key_prefix || "")}</span></td>
+    <td class="font-mono text-sm">${escapeHtml(a.timestamp)}</td>
+    <td>${escapeHtml(a.api_key_name || "")} <span class="font-mono text-muted text-sm">(${escapeHtml(a.api_key_prefix || "")})</span></td>
     <td class="font-mono">${escapeHtml(a.client_ip || "")}</td>
-    <td>${escapeHtml(a.action)}</td>
-    <td>${escapeHtml(a.target_resource || "")}</td>
+    <td class="font-mono">${escapeHtml(a.action)}</td>
+    <td>${escapeHtml(a.target_resource || "—")}</td>
+    <td class="text-muted text-sm">${escapeHtml(a.details || "—")}</td>
   </tr>`;
 }
 

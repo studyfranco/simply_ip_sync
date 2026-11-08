@@ -75,7 +75,9 @@ pub async fn grant_full_permission<C: ConnectionTrait>(
         can_view_logs: Set(true),
         created_at: Set(Utc::now()),
     };
-    api_key_sync_permission::Entity::insert(row).exec(db).await?;
+    api_key_sync_permission::Entity::insert(row)
+        .exec(db)
+        .await?;
     Ok(())
 }
 

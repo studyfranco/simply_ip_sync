@@ -10,9 +10,11 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{chunk_records, JobSummary, MAX_BATCH_SIZE};
+use super::{JobSummary, MAX_BATCH_SIZE, chunk_records};
 use crate::client::{self, BatchMode, BatchRecordInput};
-use crate::entities::{destination_group, destination_group_vault_target, external_source, vault_endpoint};
+use crate::entities::{
+    destination_group, destination_group_vault_target, external_source, vault_endpoint,
+};
 use crate::error::AppError;
 use crate::parsers::{self, ParsedRecord};
 use crate::state::AppState;
@@ -24,7 +26,10 @@ use crate::state::AppState;
 pub async fn run(state: &AppState, group_id: Uuid) -> Result<JobSummary, AppError> {
     let started_at = Utc::now();
 
-    let group = destination_group::Entity::find_by_id(group_id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let group = destination_group::Entity::find_by_id(group_id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     let feeds = external_source::Entity::find()
         .filter(external_source::Column::DestinationGroupId.eq(group_id))
@@ -39,7 +44,15 @@ pub async fn run(state: &AppState, group_id: Uuid) -> Result<JobSummary, AppErro
 
     let summary = execute(state, &group, &feeds, &targets).await;
 
-    super::write_sync_log(&state.db, "EXTERNAL_FEED", group_id, &group.name, &summary, started_at).await?;
+    super::write_sync_log(
+        &state.db,
+        "EXTERNAL_FEED",
+        group_id,
+        &group.name,
+        &summary,
+        started_at,
+    )
+    .await?;
 
     let mut active: destination_group::ActiveModel = group.into();
     active.last_run_at = Set(Some(started_at));
@@ -64,6 +77,7 @@ pub(crate) async fn fetch_and_parse(
     parser_type: &str,
     parser_config_json: Option<&str>,
 ) -> Result<Vec<ParsedRecord>, String> {
+    let source_url = source_url.trim();
     let fetch_options = FetchOptions::from_config(parser_config_json);
     let build_request = |http: &reqwest::Client| {
         let mut request = http.get(source_url);
@@ -85,7 +99,10 @@ pub(crate) async fn fetch_and_parse(
     let response = loop {
         match build_request(http).send().await {
             Ok(r) if r.status().is_success() => break r,
-            Ok(r) if crate::retry::is_transient_status(r.status().as_u16()) && attempt < max_retries => {
+            Ok(r)
+                if crate::retry::is_transient_status(r.status().as_u16())
+                    && attempt < max_retries =>
+            {
                 attempt += 1;
                 let delay = crate::retry::backoff_with_jitter(attempt);
                 tracing::warn!(
@@ -111,11 +128,13 @@ pub(crate) async fn fetch_and_parse(
     // downloads) is decompressed here, before any parser ever sees it. Same byte ceiling applied
     // again — independently — since a ZIP archive's internal members can expand far beyond the
     // (already-capped) compressed archive bytes that got us here.
-    let body =
-        super::decompress::decompress_if_zip(&body, max_decompressed_bytes).map_err(|e| e.to_string())?;
+    let body = super::decompress::decompress_if_zip(&body, max_decompressed_bytes)
+        .map_err(|e| e.to_string())?;
 
     let parser = parsers::for_type(parser_type).map_err(|e| e.to_string())?;
-    parser.parse(&body, parser_config_json).map_err(|e| e.to_string())
+    parser
+        .parse(&body, parser_config_json)
+        .map_err(|e| e.to_string())
 }
 
 /// The outcome of fetching+parsing one child feed, kept per-feed until the aggregation step below
@@ -129,7 +148,10 @@ struct FeedResult {
 /// sequentially) — the whole point of grouping several feeds under one destination group is that
 /// their fetch latency overlaps instead of stacking, and one feed's slow host doesn't gate every
 /// other feed's already-available response.
-async fn fetch_all_feeds_concurrently(state: &AppState, feeds: &[external_source::Model]) -> Vec<FeedResult> {
+async fn fetch_all_feeds_concurrently(
+    state: &AppState,
+    feeds: &[external_source::Model],
+) -> Vec<FeedResult> {
     let handles: Vec<_> = feeds
         .iter()
         .map(|feed| {
@@ -139,7 +161,13 @@ async fn fetch_all_feeds_concurrently(state: &AppState, feeds: &[external_source
             let parser_type = feed.parser_type.clone();
             let parser_config_json = feed.parser_config_json.clone();
             tokio::spawn(async move {
-                let records = fetch_and_parse(&http, &source_url, &parser_type, parser_config_json.as_deref()).await;
+                let records = fetch_and_parse(
+                    &http,
+                    &source_url,
+                    &parser_type,
+                    parser_config_json.as_deref(),
+                )
+                .await;
                 FeedResult { feed_name, records }
             })
         })
@@ -165,7 +193,10 @@ async fn fetch_all_feeds_concurrently(state: &AppState, feeds: &[external_source
 /// parser configuration supplied one) — a record with no `last_seen_at` at all is always kept
 /// (nothing to judge staleness by), and a record whose `last_seen_at` predates
 /// `now - max_age_days` is dropped.
-fn apply_temporal_filter(records: Vec<ParsedRecord>, max_age_days: Option<i32>) -> Vec<ParsedRecord> {
+fn apply_temporal_filter(
+    records: Vec<ParsedRecord>,
+    max_age_days: Option<i32>,
+) -> Vec<ParsedRecord> {
     let Some(max_age_days) = max_age_days else {
         return records;
     };
@@ -180,7 +211,10 @@ async fn execute(
     state: &AppState,
     group: &destination_group::Model,
     feeds: &[external_source::Model],
-    targets: &[(destination_group_vault_target::Model, Option<vault_endpoint::Model>)],
+    targets: &[(
+        destination_group_vault_target::Model,
+        Option<vault_endpoint::Model>,
+    )],
 ) -> JobSummary {
     let start = std::time::Instant::now();
 
@@ -203,10 +237,13 @@ async fn execute(
             Ok(records) => {
                 let feed = feeds.iter().find(|f| f.name == feed_name);
                 let max_age_days = feed.and_then(|f| f.max_age_days);
-                let skip_bogon_filtering = feed.and_then(|f| f.skip_bogon_filtering).unwrap_or(group.skip_bogon_filtering);
+                let skip_bogon_filtering = feed
+                    .and_then(|f| f.skip_bogon_filtering)
+                    .unwrap_or(group.skip_bogon_filtering);
 
                 let temporally_filtered = apply_temporal_filter(records, max_age_days);
-                let addresses: Vec<String> = temporally_filtered.into_iter().map(|r| r.address).collect();
+                let addresses: Vec<String> =
+                    temporally_filtered.into_iter().map(|r| r.address).collect();
                 let sanitized = if skip_bogon_filtering {
                     addresses
                 } else {
@@ -238,16 +275,25 @@ async fn execute(
     // choice rather than silently defaulting to full_replace's delete-anything-unmentioned
     // behavior on a misread.
     let base_mode = BatchMode::parse(&group.mode).unwrap_or_else(|| {
-        tracing::warn!("destination_groups.mode '{}' is not a recognised value; treating as upsert", group.mode);
+        tracing::warn!(
+            "destination_groups.mode '{}' is not a recognised value; treating as upsert",
+            group.mode
+        );
         BatchMode::Upsert
     });
 
     for (target, vault) in targets {
         let Some(vault) = vault else {
-            errors.push(format!("target vault {} no longer exists", target.vault_endpoint_id));
+            errors.push(format!(
+                "target vault {} no longer exists",
+                target.vault_endpoint_id
+            ));
             continue;
         };
-        let group_name = target.target_group_name.clone().unwrap_or_else(|| group.target_group_name.clone());
+        let group_name = target
+            .target_group_name
+            .clone()
+            .unwrap_or_else(|| group.target_group_name.clone());
 
         let mut target_ok = true;
         for (chunk_index, chunk) in chunks.iter().enumerate() {
@@ -267,7 +313,16 @@ async fn execute(
             // `jobs::mode_for_chunk_index`'s doc comment for why every later chunk must downgrade
             // to `upsert` regardless of the group's configured mode.
             let chunk_mode = super::mode_for_chunk_index(base_mode, chunk_index);
-            match client::post_batch(&state.http, &state.cipher, vault, &group_name, &batch, chunk_mode).await {
+            match client::post_batch(
+                &state.http,
+                &state.cipher,
+                vault,
+                &group_name,
+                &batch,
+                chunk_mode,
+            )
+            .await
+            {
                 Ok(_) => chunks_sent += 1,
                 Err(e) => {
                     target_ok = false;
@@ -313,7 +368,9 @@ async fn execute(
     };
     let mut error_parts = Vec::new();
     if bogons_removed > 0 {
-        error_parts.push(format!("{bogons_removed} bogon/private/reserved address(es) sanitized before push"));
+        error_parts.push(format!(
+            "{bogons_removed} bogon/private/reserved address(es) sanitized before push"
+        ));
     }
     if items_processed == 0 && errors.is_empty() {
         error_parts.push(
@@ -323,7 +380,11 @@ async fn execute(
         );
     }
     error_parts.extend(errors);
-    let error_message = if error_parts.is_empty() { None } else { Some(error_parts.join("; ")) };
+    let error_message = if error_parts.is_empty() {
+        None
+    } else {
+        Some(error_parts.join("; "))
+    };
 
     JobSummary {
         status,
@@ -352,7 +413,10 @@ impl FetchOptions {
         let Ok(Value::Object(map)) = serde_json::from_str::<Value>(config) else {
             return Self::default();
         };
-        let user_agent = map.get("user_agent").and_then(Value::as_str).map(str::to_owned);
+        let user_agent = map
+            .get("user_agent")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let headers = map
             .get("headers")
             .and_then(Value::as_object)
@@ -362,6 +426,9 @@ impl FetchOptions {
                     .collect()
             })
             .unwrap_or_default();
-        Self { user_agent, headers }
+        Self {
+            user_agent,
+            headers,
+        }
     }
 }

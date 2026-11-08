@@ -38,10 +38,16 @@ mod tests {
     #[test]
     fn transient_statuses_are_exactly_the_documented_set() {
         for status in [429, 502, 503, 504] {
-            assert!(is_transient_status(status), "{status} must be treated as transient");
+            assert!(
+                is_transient_status(status),
+                "{status} must be treated as transient"
+            );
         }
         for status in [400, 401, 403, 404, 409, 413, 500, 501] {
-            assert!(!is_transient_status(status), "{status} must NOT be treated as transient");
+            assert!(
+                !is_transient_status(status),
+                "{status} must NOT be treated as transient"
+            );
         }
     }
 
@@ -54,10 +60,22 @@ mod tests {
         let second = backoff_with_jitter(2);
         let far_future = backoff_with_jitter(50);
 
-        assert!(first >= std::time::Duration::from_millis(100), "attempt 1 must be at least the base backoff");
-        assert!(first < std::time::Duration::from_millis(200), "attempt 1 must not already include a doubling");
-        assert!(second >= std::time::Duration::from_millis(200), "attempt 2 must have backed off further than attempt 1's minimum");
-        assert!(far_future <= std::time::Duration::from_secs(30) + std::time::Duration::from_secs(15), "backoff must stay bounded even for a very high attempt count");
+        assert!(
+            first >= std::time::Duration::from_millis(100),
+            "attempt 1 must be at least the base backoff"
+        );
+        assert!(
+            first < std::time::Duration::from_millis(200),
+            "attempt 1 must not already include a doubling"
+        );
+        assert!(
+            second >= std::time::Duration::from_millis(200),
+            "attempt 2 must have backed off further than attempt 1's minimum"
+        );
+        assert!(
+            far_future <= std::time::Duration::from_secs(30) + std::time::Duration::from_secs(15),
+            "backoff must stay bounded even for a very high attempt count"
+        );
         unsafe {
             std::env::remove_var("OUTBOUND_RETRY_BACKOFF_MS");
         }

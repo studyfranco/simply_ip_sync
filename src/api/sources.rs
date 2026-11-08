@@ -6,16 +6,22 @@
 use axum::extract::State;
 
 use crate::extract::StrictPath;
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::response::IntoResponse;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::support::{create_audit_log, find_permission, grant_full_permission, RESOURCE_DESTINATION_GROUP};
-use super::{guard_can_sync, guard_resource_creation, guard_resource_lifecycle, guard_resource_manage};
-use crate::entities::{api_key, destination_group, destination_group_vault_target, external_source};
+use super::support::{
+    RESOURCE_DESTINATION_GROUP, create_audit_log, find_permission, grant_full_permission,
+};
+use super::{
+    guard_can_sync, guard_resource_creation, guard_resource_lifecycle, guard_resource_manage,
+};
+use crate::entities::{
+    api_key, destination_group, destination_group_vault_target, external_source,
+};
 use crate::error::AppError;
 use crate::extract::StrictJson;
 use crate::middleware::ClientIp;
@@ -107,7 +113,10 @@ pub struct DestinationGroupResponse {
     pub updated_at: chrono::DateTime<Utc>,
 }
 
-async fn load_targets(db: &sea_orm::DatabaseConnection, group_id: Uuid) -> Result<Vec<TargetSpec>, AppError> {
+async fn load_targets(
+    db: &sea_orm::DatabaseConnection,
+    group_id: Uuid,
+) -> Result<Vec<TargetSpec>, AppError> {
     let rows = destination_group_vault_target::Entity::find()
         .filter(destination_group_vault_target::Column::DestinationGroupId.eq(group_id))
         .all(db)
@@ -121,7 +130,10 @@ async fn load_targets(db: &sea_orm::DatabaseConnection, group_id: Uuid) -> Resul
         .collect())
 }
 
-async fn load_feeds(db: &sea_orm::DatabaseConnection, group_id: Uuid) -> Result<Vec<FeedResponse>, AppError> {
+async fn load_feeds(
+    db: &sea_orm::DatabaseConnection,
+    group_id: Uuid,
+) -> Result<Vec<FeedResponse>, AppError> {
     let rows = external_source::Entity::find()
         .filter(external_source::Column::DestinationGroupId.eq(group_id))
         .all(db)
@@ -215,15 +227,23 @@ pub struct UpdateDestinationGroupPayload {
 
 fn validate_mode(mode: &str) -> Result<(), AppError> {
     if crate::client::BatchMode::parse(mode).is_none() {
-        return Err(AppError::InvalidInput("mode must be upsert or full_replace".to_owned()));
+        return Err(AppError::InvalidInput(
+            "mode must be upsert or full_replace".to_owned(),
+        ));
     }
     Ok(())
 }
 
-async fn group_visible_to(state: &AppState, caller: &api_key::Model, group: &destination_group::Model) -> Result<bool, AppError> {
+async fn group_visible_to(
+    state: &AppState,
+    caller: &api_key::Model,
+    group: &destination_group::Model,
+) -> Result<bool, AppError> {
     Ok(caller.is_master
         || group.owner_key_id == Some(caller.id)
-        || find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, group.id).await?.is_some())
+        || find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, group.id)
+            .await?
+            .is_some())
 }
 
 /// `GET /api/destination-groups`.
@@ -249,7 +269,10 @@ pub async fn get_destination_group(
     axum::Extension(caller): axum::Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let group = destination_group::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let group = destination_group::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !group_visible_to(&state, &caller, &group).await? {
         return Err(AppError::NotFound);
     }
@@ -287,13 +310,22 @@ pub async fn create_destination_group(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    let inserted = destination_group::Entity::insert(model).exec_with_returning(&txn).await.map_err(|e| {
-        if matches!(e.sql_err(), Some(sea_orm::SqlErr::UniqueConstraintViolation(_))) {
-            AppError::Conflict(format!("a destination group named '{}' already exists", payload.name))
-        } else {
-            AppError::DbError(e)
-        }
-    })?;
+    let inserted = destination_group::Entity::insert(model)
+        .exec_with_returning(&txn)
+        .await
+        .map_err(|e| {
+            if matches!(
+                e.sql_err(),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+            ) {
+                AppError::Conflict(format!(
+                    "a destination group named '{}' already exists",
+                    payload.name
+                ))
+            } else {
+                AppError::DbError(e)
+            }
+        })?;
 
     for target in &payload.targets {
         let row = destination_group_vault_target::ActiveModel {
@@ -301,16 +333,30 @@ pub async fn create_destination_group(
             vault_endpoint_id: Set(target.vault_endpoint_id),
             target_group_name: Set(target.target_group_name.clone()),
         };
-        destination_group_vault_target::Entity::insert(row).exec(&txn).await?;
+        destination_group_vault_target::Entity::insert(row)
+            .exec(&txn)
+            .await?;
     }
 
     grant_full_permission(&txn, caller.id, RESOURCE_DESTINATION_GROUP, id).await?;
-    create_audit_log(&txn, &caller, client_ip.0, "GROUP_CREATE", Some(inserted.name.clone()), None).await?;
+    create_audit_log(
+        &txn,
+        &caller,
+        client_ip.0,
+        "GROUP_CREATE",
+        Some(inserted.name.clone()),
+        None,
+    )
+    .await?;
     txn.commit().await?;
 
     state.scheduler.upsert_source(&state, &inserted).await;
 
-    Ok(Json(to_group_response(inserted, payload.targets, Vec::new())))
+    Ok(Json(to_group_response(
+        inserted,
+        payload.targets,
+        Vec::new(),
+    )))
 }
 
 /// `PATCH /api/destination-groups/{id}`. Requires RBAC R2.
@@ -321,7 +367,10 @@ pub async fn update_destination_group(
     StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateDestinationGroupPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = destination_group::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = destination_group::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let permission = find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, id).await?;
     guard_resource_manage(&caller, permission.as_ref())?;
 
@@ -367,11 +416,21 @@ pub async fn update_destination_group(
                 vault_endpoint_id: Set(target.vault_endpoint_id),
                 target_group_name: Set(target.target_group_name.clone()),
             };
-            destination_group_vault_target::Entity::insert(row).exec(&txn).await?;
+            destination_group_vault_target::Entity::insert(row)
+                .exec(&txn)
+                .await?;
         }
     }
 
-    create_audit_log(&txn, &caller, client_ip.0, "GROUP_UPDATE", Some(updated.name.clone()), None).await?;
+    create_audit_log(
+        &txn,
+        &caller,
+        client_ip.0,
+        "GROUP_UPDATE",
+        Some(updated.name.clone()),
+        None,
+    )
+    .await?;
     txn.commit().await?;
 
     state.scheduler.upsert_source(&state, &updated).await;
@@ -389,19 +448,32 @@ pub async fn delete_destination_group(
     axum::Extension(client_ip): axum::Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = destination_group::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = destination_group::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     guard_resource_lifecycle(&caller, existing.owner_key_id)?;
 
     let name = existing.name.clone();
     // Two concurrent deletes of the same id can both pass the `find_by_id` check above before
     // either's `DELETE` runs; checking `rows_affected` is what keeps only the one that actually
     // removed a row from reporting success — the other must see 404, not a second, empty 204.
-    let result = destination_group::Entity::delete_by_id(id).exec(&state.db).await?;
+    let result = destination_group::Entity::delete_by_id(id)
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
     state.scheduler.remove_source(id).await;
-    create_audit_log(&state.db, &caller, client_ip.0, "GROUP_DELETE", Some(name), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "GROUP_DELETE",
+        Some(name),
+        None,
+    )
+    .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -412,7 +484,10 @@ pub async fn trigger_destination_group(
     axum::Extension(client_ip): axum::Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = destination_group::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = destination_group::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let permission = find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, id).await?;
     guard_can_sync(&caller, permission.as_ref())?;
 
@@ -420,10 +495,19 @@ pub async fn trigger_destination_group(
     // executions race — e.g. a manual trigger landing while a cron tick for the same group is
     // still fetching. The guard is released automatically when `_job_guard` drops at the end of
     // this function, on every exit path including the `?` below.
-    let _job_guard = crate::jobs::try_start_job(&state.running_jobs, id)
-        .ok_or_else(|| AppError::Conflict("a sync for this group is already in progress".to_owned()))?;
+    let _job_guard = crate::jobs::try_start_job(&state.running_jobs, id).ok_or_else(|| {
+        AppError::Conflict("a sync for this group is already in progress".to_owned())
+    })?;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "GROUP_TRIGGER", Some(existing.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "GROUP_TRIGGER",
+        Some(existing.name.clone()),
+        None,
+    )
+    .await?;
     let summary = crate::jobs::external_ingestion::run(&state, id).await?;
     Ok(Json(serde_json::json!({
         "status": summary.status,
@@ -439,9 +523,14 @@ pub async fn trigger_destination_group(
 /// Validates `parser_type`, and — for `JSON_PATH` — the `parser_config_json` shape itself
 /// (`target_address` selector present and `$.`-prefixed), so a malformed feed configuration is
 /// rejected with `400` at save time rather than discovered later as a `FAILED` sync log entry.
-fn validate_feed_parser(parser_type: &str, parser_config_json: Option<&str>) -> Result<(), AppError> {
+fn validate_feed_parser(
+    parser_type: &str,
+    parser_config_json: Option<&str>,
+) -> Result<(), AppError> {
     if parser_type != "REGEX_LINE" && parser_type != "JSON_PATH" {
-        return Err(AppError::InvalidInput("parser_type must be REGEX_LINE or JSON_PATH".to_owned()));
+        return Err(AppError::InvalidInput(
+            "parser_type must be REGEX_LINE or JSON_PATH".to_owned(),
+        ));
     }
     if parser_type == "JSON_PATH" {
         crate::parsers::json_path::validate_config(parser_config_json)
@@ -454,7 +543,9 @@ fn validate_max_age_days(max_age_days: Option<i32>) -> Result<(), AppError> {
     if let Some(n) = max_age_days
         && n <= 0
     {
-        return Err(AppError::InvalidInput("max_age_days must be a positive integer".to_owned()));
+        return Err(AppError::InvalidInput(
+            "max_age_days must be a positive integer".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -523,7 +614,10 @@ async fn load_feed_in_group(
     group_id: Uuid,
     feed_id: Uuid,
 ) -> Result<external_source::Model, AppError> {
-    let feed = external_source::Entity::find_by_id(feed_id).one(db).await?.ok_or(AppError::NotFound)?;
+    let feed = external_source::Entity::find_by_id(feed_id)
+        .one(db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if feed.destination_group_id != group_id {
         return Err(AppError::NotFound);
     }
@@ -539,8 +633,12 @@ pub async fn create_feed(
     StrictPath(group_id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<CreateFeedPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    destination_group::Entity::find_by_id(group_id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    let permission = find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, group_id).await?;
+    destination_group::Entity::find_by_id(group_id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let permission =
+        find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, group_id).await?;
     guard_resource_manage(&caller, permission.as_ref())?;
 
     validate_feed_parser(&payload.parser_type, payload.parser_config_json.as_deref())?;
@@ -551,8 +649,8 @@ pub async fn create_feed(
     let model = external_source::ActiveModel {
         id: Set(id),
         destination_group_id: Set(group_id),
-        name: Set(payload.name.clone()),
-        source_url: Set(payload.source_url),
+        name: Set(payload.name.trim().to_owned()),
+        source_url: Set(payload.source_url.trim().to_owned()),
         parser_type: Set(payload.parser_type),
         parser_config_json: Set(payload.parser_config_json),
         max_age_days: Set(payload.max_age_days),
@@ -560,15 +658,29 @@ pub async fn create_feed(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    let inserted = external_source::Entity::insert(model).exec_with_returning(&state.db).await.map_err(|e| {
-        if matches!(e.sql_err(), Some(sea_orm::SqlErr::UniqueConstraintViolation(_))) {
-            AppError::Conflict(format!("a feed named '{}' already exists", payload.name))
-        } else {
-            AppError::DbError(e)
-        }
-    })?;
+    let inserted = external_source::Entity::insert(model)
+        .exec_with_returning(&state.db)
+        .await
+        .map_err(|e| {
+            if matches!(
+                e.sql_err(),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+            ) {
+                AppError::Conflict(format!("a feed named '{}' already exists", payload.name))
+            } else {
+                AppError::DbError(e)
+            }
+        })?;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "FEED_CREATE", Some(inserted.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "FEED_CREATE",
+        Some(inserted.name.clone()),
+        None,
+    )
+    .await?;
 
     Ok(Json(to_feed_response(inserted)))
 }
@@ -583,20 +695,27 @@ pub async fn update_feed(
     StrictJson(payload): StrictJson<UpdateFeedPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = load_feed_in_group(&state.db, group_id, feed_id).await?;
-    let permission = find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, group_id).await?;
+    let permission =
+        find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, group_id).await?;
     guard_resource_manage(&caller, permission.as_ref())?;
 
-    let effective_parser_type = payload.parser_type.as_deref().unwrap_or(&existing.parser_type);
-    let effective_config = payload.parser_config_json.as_deref().or(existing.parser_config_json.as_deref());
+    let effective_parser_type = payload
+        .parser_type
+        .as_deref()
+        .unwrap_or(&existing.parser_type);
+    let effective_config = payload
+        .parser_config_json
+        .as_deref()
+        .or(existing.parser_config_json.as_deref());
     validate_feed_parser(effective_parser_type, effective_config)?;
     validate_max_age_days(payload.max_age_days)?;
 
     let mut active: external_source::ActiveModel = existing.into();
     if let Some(name) = payload.name {
-        active.name = Set(name);
+        active.name = Set(name.trim().to_owned());
     }
     if let Some(source_url) = payload.source_url {
-        active.source_url = Set(source_url);
+        active.source_url = Set(source_url.trim().to_owned());
     }
     if let Some(parser_type) = payload.parser_type {
         active.parser_type = Set(parser_type);
@@ -613,7 +732,15 @@ pub async fn update_feed(
     active.updated_at = Set(Utc::now());
     let updated = active.update(&state.db).await?;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "FEED_UPDATE", Some(updated.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "FEED_UPDATE",
+        Some(updated.name.clone()),
+        None,
+    )
+    .await?;
 
     Ok(Json(to_feed_response(updated)))
 }
@@ -627,15 +754,26 @@ pub async fn delete_feed(
     StrictPath((group_id, feed_id)): StrictPath<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = load_feed_in_group(&state.db, group_id, feed_id).await?;
-    let permission = find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, group_id).await?;
+    let permission =
+        find_permission(&state.db, caller.id, RESOURCE_DESTINATION_GROUP, group_id).await?;
     guard_resource_manage(&caller, permission.as_ref())?;
 
     let name = existing.name.clone();
-    let result = external_source::Entity::delete_by_id(feed_id).exec(&state.db).await?;
+    let result = external_source::Entity::delete_by_id(feed_id)
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
-    create_audit_log(&state.db, &caller, client_ip.0, "FEED_DELETE", Some(name), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "FEED_DELETE",
+        Some(name),
+        None,
+    )
+    .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -699,8 +837,11 @@ pub async fn test_fetch_external_source(
     let (status, total_extracted, sample, error) = match result {
         Ok(records) => {
             let mut seen = std::collections::HashSet::new();
-            let deduped: Vec<String> =
-                records.into_iter().filter(|r| seen.insert(r.address.clone())).map(|r| r.address).collect();
+            let deduped: Vec<String> = records
+                .into_iter()
+                .filter(|r| seen.insert(r.address.clone()))
+                .map(|r| r.address)
+                .collect();
             if deduped.is_empty() {
                 // Same "zero is not trustworthy" reasoning as `execute`'s own status derivation: a
                 // syntactically clean fetch+parse that found nothing is far more often a
@@ -709,7 +850,8 @@ pub async fn test_fetch_external_source(
                 ("PARTIAL", 0, Vec::new(), None)
             } else {
                 let total = deduped.len();
-                let sample: Vec<String> = deduped.into_iter().take(TEST_FETCH_SAMPLE_LIMIT).collect();
+                let sample: Vec<String> =
+                    deduped.into_iter().take(TEST_FETCH_SAMPLE_LIMIT).collect();
                 ("SUCCESS", total, sample, None)
             }
         }

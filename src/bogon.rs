@@ -32,29 +32,32 @@ const LOOPBACK_LITERALS: &[&str] = &["127.0.0.0/8", "::1/128"];
 /// special-purpose registry entry, but covers the ranges that matter for a feed meant to be
 /// banned at a real perimeter. Excludes RFC 1918 and loopback, governed by their own tables above.
 const BOGON_LITERALS: &[&str] = &[
-    "0.0.0.0/8",       // "this network" / unspecified
-    "100.64.0.0/10",   // carrier-grade NAT (RFC 6598)
-    "169.254.0.0/16",  // link-local / APIPA
-    "192.0.0.0/24",    // IETF protocol assignments
-    "192.0.2.0/24",    // TEST-NET-1 (documentation)
-    "192.88.99.0/24",  // former 6to4 relay anycast
-    "198.18.0.0/15",   // benchmarking
-    "198.51.100.0/24", // TEST-NET-2 (documentation)
-    "203.0.113.0/24",  // TEST-NET-3 (documentation)
-    "224.0.0.0/4",     // multicast
-    "240.0.0.0/4",     // reserved / future use
+    "0.0.0.0/8",          // "this network" / unspecified
+    "100.64.0.0/10",      // carrier-grade NAT (RFC 6598)
+    "169.254.0.0/16",     // link-local / APIPA
+    "192.0.0.0/24",       // IETF protocol assignments
+    "192.0.2.0/24",       // TEST-NET-1 (documentation)
+    "192.88.99.0/24",     // former 6to4 relay anycast
+    "198.18.0.0/15",      // benchmarking
+    "198.51.100.0/24",    // TEST-NET-2 (documentation)
+    "203.0.113.0/24",     // TEST-NET-3 (documentation)
+    "224.0.0.0/4",        // multicast
+    "240.0.0.0/4",        // reserved / future use
     "255.255.255.255/32", // limited broadcast
-    "::/128",          // unspecified (v6)
-    "::ffff:0:0/96",   // IPv4-mapped v6
-    "100::/64",        // discard-only
-    "2001:db8::/32",   // documentation (v6)
-    "fc00::/7",        // unique local (ULA)
-    "fe80::/10",       // link-local (v6)
-    "ff00::/8",        // multicast (v6)
+    "::/128",             // unspecified (v6)
+    "::ffff:0:0/96",      // IPv4-mapped v6
+    "100::/64",           // discard-only
+    "2001:db8::/32",      // documentation (v6)
+    "fc00::/7",           // unique local (ULA)
+    "fe80::/10",          // link-local (v6)
+    "ff00::/8",           // multicast (v6)
 ];
 
 fn parse_literals(literals: &[&str]) -> Vec<IpNetwork> {
-    literals.iter().map(|s| s.parse().expect("static bogon literal is a valid CIDR")).collect()
+    literals
+        .iter()
+        .map(|s| s.parse().expect("static bogon literal is a valid CIDR"))
+        .collect()
 }
 
 static RESERVED_RANGES: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| {
@@ -76,7 +79,9 @@ fn overlaps(a: &IpNetwork, b: &IpNetwork) -> bool {
 /// Returns `true` if `candidate` overlaps any reserved (loopback/private/bogon) range at all —
 /// the address or CIDR is not safe to hand to a target vault as a real, bannable entry.
 pub fn is_bogon(candidate: &IpNetwork) -> bool {
-    RESERVED_RANGES.iter().any(|reserved| overlaps(candidate, reserved))
+    RESERVED_RANGES
+        .iter()
+        .any(|reserved| overlaps(candidate, reserved))
 }
 
 /// Splits `records` into `(kept, removed_count)`: `kept` holds every entry that parses as a valid
@@ -147,7 +152,10 @@ mod tests {
     /// to contain a `/16` private block inside it is exactly this case.
     #[test]
     fn a_supernet_only_partially_overlapping_a_bogon_is_dropped_entirely() {
-        assert!(is_bogon(&"10.0.0.0/6".parse().unwrap()), "10.0.0.0/6 spans 8.0.0.0-11.255.255.255, overlapping 10.0.0.0/8");
+        assert!(
+            is_bogon(&"10.0.0.0/6".parse().unwrap()),
+            "10.0.0.0/6 spans 8.0.0.0-11.255.255.255, overlapping 10.0.0.0/8"
+        );
     }
 
     #[test]

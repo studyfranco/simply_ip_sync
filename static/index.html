@@ -19,23 +19,23 @@
         <div class="logo-icon"></div>
         <h1>Simply IP Sync</h1>
       </div>
-      <h2>Sign in</h2>
-      <p class="subtitle">Enter an API key and its signing secret. Every request is signed
-        client-side (CANONICAL_V1 HMAC-SHA256) — the secret never leaves this page except as part
-        of a signature, and is kept only in this tab's memory.</p>
+      <h2>Threat Intelligence Orchestrator</h2>
+      <p class="subtitle">Enter your API key and its signing secret to access the dashboard. Every
+        request is signed client-side (CANONICAL_V1 HMAC-SHA256) — the secret never leaves this
+        page except as part of a signature.</p>
       <form id="login-form" class="login-form">
         <div class="form-group">
-          <label for="login-api-key">X-API-Key</label>
+          <label for="login-api-key">API Key</label>
           <input type="password" id="login-api-key" class="input-field" placeholder="Enter X-API-Key..." autocomplete="off" required>
         </div>
         <div class="form-group">
-          <label for="login-signing-secret">Signing secret</label>
+          <label for="login-signing-secret">Signing Secret</label>
           <input type="password" id="login-signing-secret" class="input-field" placeholder="Enter HMAC signing secret..." autocomplete="off" required>
           <small class="field-hint">Used locally to sign every request (HMAC-SHA256). Never transmitted.</small>
         </div>
         <div class="form-group">
-          <label for="login-api-base">API base path override</label>
-          <input type="text" id="login-api-base" class="input-field" placeholder="leave blank" autocomplete="off">
+          <label for="login-api-base">API Base Path Override</label>
+          <input type="text" id="login-api-base" class="input-field" placeholder="/api" autocomplete="off">
           <small class="field-hint">
             Leave blank unless a reverse proxy forwards its mount prefix through untouched instead
             of stripping it. Requests are always sent to where this page is served from, but the
@@ -46,7 +46,7 @@
             since every endpoint here already spells its own <code>/api/...</code>.
           </small>
         </div>
-        <button type="submit" class="btn btn-primary">Sign in</button>
+        <button type="submit" class="btn btn-primary">Unlock Dashboard</button>
       </form>
       <div id="login-error" class="message error hidden"></div>
     </div>

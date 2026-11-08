@@ -107,9 +107,23 @@ enum ExternalSourcesRebuild {
 fn external_sources_definition(table: TableRef, post_refactor: bool) -> TableCreateStatement {
     let mut stmt = Table::create();
     stmt.table(table)
-        .col(ColumnDef::new(ExternalSources::Id).uuid().not_null().primary_key())
-        .col(ColumnDef::new(ExternalSources::Name).string().not_null().unique_key())
-        .col(ColumnDef::new(ExternalSources::SourceUrl).string().not_null())
+        .col(
+            ColumnDef::new(ExternalSources::Id)
+                .uuid()
+                .not_null()
+                .primary_key(),
+        )
+        .col(
+            ColumnDef::new(ExternalSources::Name)
+                .string()
+                .not_null()
+                .unique_key(),
+        )
+        .col(
+            ColumnDef::new(ExternalSources::SourceUrl)
+                .string()
+                .not_null(),
+        )
         .col(
             ColumnDef::new(ExternalSources::ParserType)
                 .string()
@@ -119,20 +133,50 @@ fn external_sources_definition(table: TableRef, post_refactor: bool) -> TableCre
         .col(ColumnDef::new(ExternalSources::ParserConfigJson).text());
 
     if post_refactor {
-        stmt.col(ColumnDef::new(ExternalSources::DestinationGroupId).uuid().not_null())
-            .col(ColumnDef::new(ExternalSources::MaxAgeDays).integer())
-            .col(ColumnDef::new(ExternalSources::SkipBogonFiltering).boolean());
+        stmt.col(
+            ColumnDef::new(ExternalSources::DestinationGroupId)
+                .uuid()
+                .not_null(),
+        )
+        .col(ColumnDef::new(ExternalSources::MaxAgeDays).integer())
+        .col(ColumnDef::new(ExternalSources::SkipBogonFiltering).boolean());
     } else {
-        stmt.col(ColumnDef::new(ExternalSources::CronSchedule).string().not_null())
-            .col(ColumnDef::new(ExternalSources::TargetGroupName).string().not_null())
-            .col(ColumnDef::new(ExternalSources::Mode).string().not_null().default("upsert"))
-            .col(ColumnDef::new(ExternalSources::IsActive).boolean().not_null().default(true))
-            .col(ColumnDef::new(ExternalSources::LastRunAt).timestamp_with_time_zone())
-            .col(ColumnDef::new(ExternalSources::OwnerKeyId).uuid());
+        stmt.col(
+            ColumnDef::new(ExternalSources::CronSchedule)
+                .string()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(ExternalSources::TargetGroupName)
+                .string()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(ExternalSources::Mode)
+                .string()
+                .not_null()
+                .default("upsert"),
+        )
+        .col(
+            ColumnDef::new(ExternalSources::IsActive)
+                .boolean()
+                .not_null()
+                .default(true),
+        )
+        .col(ColumnDef::new(ExternalSources::LastRunAt).timestamp_with_time_zone())
+        .col(ColumnDef::new(ExternalSources::OwnerKeyId).uuid());
     }
 
-    stmt.col(ColumnDef::new(ExternalSources::CreatedAt).timestamp_with_time_zone().not_null())
-        .col(ColumnDef::new(ExternalSources::UpdatedAt).timestamp_with_time_zone().not_null());
+    stmt.col(
+        ColumnDef::new(ExternalSources::CreatedAt)
+            .timestamp_with_time_zone()
+            .not_null(),
+    )
+    .col(
+        ColumnDef::new(ExternalSources::UpdatedAt)
+            .timestamp_with_time_zone()
+            .not_null(),
+    );
 
     if post_refactor {
         stmt.foreign_key(
@@ -153,12 +197,40 @@ async fn create_destination_groups(manager: &SchemaManager<'_>) -> Result<(), Db
             Table::create()
                 .table(DestinationGroups::Table)
                 .if_not_exists()
-                .col(ColumnDef::new(DestinationGroups::Id).uuid().not_null().primary_key())
-                .col(ColumnDef::new(DestinationGroups::Name).string().not_null().unique_key())
-                .col(ColumnDef::new(DestinationGroups::TargetGroupName).string().not_null())
-                .col(ColumnDef::new(DestinationGroups::CronSchedule).string().not_null())
-                .col(ColumnDef::new(DestinationGroups::Mode).string().not_null().default("upsert"))
-                .col(ColumnDef::new(DestinationGroups::IsActive).boolean().not_null().default(true))
+                .col(
+                    ColumnDef::new(DestinationGroups::Id)
+                        .uuid()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(
+                    ColumnDef::new(DestinationGroups::Name)
+                        .string()
+                        .not_null()
+                        .unique_key(),
+                )
+                .col(
+                    ColumnDef::new(DestinationGroups::TargetGroupName)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(DestinationGroups::CronSchedule)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(DestinationGroups::Mode)
+                        .string()
+                        .not_null()
+                        .default("upsert"),
+                )
+                .col(
+                    ColumnDef::new(DestinationGroups::IsActive)
+                        .boolean()
+                        .not_null()
+                        .default(true),
+                )
                 .col(
                     ColumnDef::new(DestinationGroups::SkipBogonFiltering)
                         .boolean()
@@ -167,8 +239,16 @@ async fn create_destination_groups(manager: &SchemaManager<'_>) -> Result<(), Db
                 )
                 .col(ColumnDef::new(DestinationGroups::LastRunAt).timestamp_with_time_zone())
                 .col(ColumnDef::new(DestinationGroups::OwnerKeyId).uuid())
-                .col(ColumnDef::new(DestinationGroups::CreatedAt).timestamp_with_time_zone().not_null())
-                .col(ColumnDef::new(DestinationGroups::UpdatedAt).timestamp_with_time_zone().not_null())
+                .col(
+                    ColumnDef::new(DestinationGroups::CreatedAt)
+                        .timestamp_with_time_zone()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(DestinationGroups::UpdatedAt)
+                        .timestamp_with_time_zone()
+                        .not_null(),
+                )
                 .to_owned(),
         )
         .await?;
@@ -189,8 +269,16 @@ async fn create_destination_group_vault_targets(manager: &SchemaManager<'_>) -> 
             Table::create()
                 .table(DestinationGroupVaultTargets::Table)
                 .if_not_exists()
-                .col(ColumnDef::new(DestinationGroupVaultTargets::DestinationGroupId).uuid().not_null())
-                .col(ColumnDef::new(DestinationGroupVaultTargets::VaultEndpointId).uuid().not_null())
+                .col(
+                    ColumnDef::new(DestinationGroupVaultTargets::DestinationGroupId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(DestinationGroupVaultTargets::VaultEndpointId)
+                        .uuid()
+                        .not_null(),
+                )
                 .col(ColumnDef::new(DestinationGroupVaultTargets::TargetGroupName).text())
                 .primary_key(
                     Index::create()
@@ -200,14 +288,20 @@ async fn create_destination_group_vault_targets(manager: &SchemaManager<'_>) -> 
                 .foreign_key(
                     ForeignKey::create()
                         .name("fk-dgvt-destination_group")
-                        .from(DestinationGroupVaultTargets::Table, DestinationGroupVaultTargets::DestinationGroupId)
+                        .from(
+                            DestinationGroupVaultTargets::Table,
+                            DestinationGroupVaultTargets::DestinationGroupId,
+                        )
                         .to(DestinationGroups::Table, DestinationGroups::Id)
                         .on_delete(ForeignKeyAction::Cascade),
                 )
                 .foreign_key(
                     ForeignKey::create()
                         .name("fk-dgvt-vault_endpoint")
-                        .from(DestinationGroupVaultTargets::Table, DestinationGroupVaultTargets::VaultEndpointId)
+                        .from(
+                            DestinationGroupVaultTargets::Table,
+                            DestinationGroupVaultTargets::VaultEndpointId,
+                        )
                         .to(VaultEndpoints::Table, VaultEndpoints::Id)
                         .on_delete(ForeignKeyAction::Cascade),
                 )
@@ -241,10 +335,16 @@ async fn migrate_existing_rows_into_groups(manager: &SchemaManager<'_>) -> Resul
 /// SQLite rebuild: creates the table under `post_refactor`'s shape, copies rows across (backfilling
 /// `destination_group_id = id`, the self-mapping the data migration above set up), drops the
 /// original, renames the replacement into place.
-async fn rebuild_external_sources_sqlite(manager: &SchemaManager<'_>, post_refactor: bool) -> Result<(), DbErr> {
+async fn rebuild_external_sources_sqlite(
+    manager: &SchemaManager<'_>,
+    post_refactor: bool,
+) -> Result<(), DbErr> {
     let db = manager.get_connection();
     manager
-        .create_table(external_sources_definition(ExternalSourcesRebuild::Table.into_table_ref(), post_refactor))
+        .create_table(external_sources_definition(
+            ExternalSourcesRebuild::Table.into_table_ref(),
+            post_refactor,
+        ))
         .await?;
 
     if post_refactor {
@@ -270,9 +370,15 @@ async fn rebuild_external_sources_sqlite(manager: &SchemaManager<'_>, post_refac
         .await?;
     }
 
-    manager.drop_table(Table::drop().table(ExternalSources::Table).to_owned()).await?;
     manager
-        .rename_table(Table::rename().table(ExternalSourcesRebuild::Table, ExternalSources::Table).to_owned())
+        .drop_table(Table::drop().table(ExternalSources::Table).to_owned())
+        .await?;
+    manager
+        .rename_table(
+            Table::rename()
+                .table(ExternalSourcesRebuild::Table, ExternalSources::Table)
+                .to_owned(),
+        )
         .await
 }
 
@@ -293,13 +399,18 @@ async fn alter_external_sources_directly(manager: &SchemaManager<'_>) -> Result<
         )
         .await?;
 
-    db.execute_unprepared("UPDATE external_sources SET destination_group_id = id").await?;
+    db.execute_unprepared("UPDATE external_sources SET destination_group_id = id")
+        .await?;
 
     manager
         .alter_table(
             Table::alter()
                 .table(ExternalSources::Table)
-                .modify_column(ColumnDef::new(ExternalSources::DestinationGroupId).uuid().not_null())
+                .modify_column(
+                    ColumnDef::new(ExternalSources::DestinationGroupId)
+                        .uuid()
+                        .not_null(),
+                )
                 .to_owned(),
         )
         .await?;
@@ -348,7 +459,13 @@ impl MigrationTrait for Migration {
             alter_external_sources_directly(manager).await?;
         }
 
-        manager.drop_table(Table::drop().table(ExternalSourceVaultTargets::Table).to_owned()).await
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(ExternalSourceVaultTargets::Table)
+                    .to_owned(),
+            )
+            .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -357,8 +474,16 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(ExternalSourceVaultTargets::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(ExternalSourceVaultTargets::ExternalSourceId).uuid().not_null())
-                    .col(ColumnDef::new(ExternalSourceVaultTargets::VaultEndpointId).uuid().not_null())
+                    .col(
+                        ColumnDef::new(ExternalSourceVaultTargets::ExternalSourceId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ExternalSourceVaultTargets::VaultEndpointId)
+                            .uuid()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(ExternalSourceVaultTargets::TargetGroupName).text())
                     .primary_key(
                         Index::create()
@@ -384,9 +509,19 @@ impl MigrationTrait for Migration {
                         .table(ExternalSources::Table)
                         .add_column(ColumnDef::new(ExternalSources::CronSchedule).string())
                         .add_column(ColumnDef::new(ExternalSources::TargetGroupName).string())
-                        .add_column(ColumnDef::new(ExternalSources::Mode).string().default("upsert"))
-                        .add_column(ColumnDef::new(ExternalSources::IsActive).boolean().default(true))
-                        .add_column(ColumnDef::new(ExternalSources::LastRunAt).timestamp_with_time_zone())
+                        .add_column(
+                            ColumnDef::new(ExternalSources::Mode)
+                                .string()
+                                .default("upsert"),
+                        )
+                        .add_column(
+                            ColumnDef::new(ExternalSources::IsActive)
+                                .boolean()
+                                .default(true),
+                        )
+                        .add_column(
+                            ColumnDef::new(ExternalSources::LastRunAt).timestamp_with_time_zone(),
+                        )
                         .add_column(ColumnDef::new(ExternalSources::OwnerKeyId).uuid())
                         .to_owned(),
                 )
@@ -402,8 +537,16 @@ impl MigrationTrait for Migration {
                 .alter_table(
                     Table::alter()
                         .table(ExternalSources::Table)
-                        .modify_column(ColumnDef::new(ExternalSources::CronSchedule).string().not_null())
-                        .modify_column(ColumnDef::new(ExternalSources::TargetGroupName).string().not_null())
+                        .modify_column(
+                            ColumnDef::new(ExternalSources::CronSchedule)
+                                .string()
+                                .not_null(),
+                        )
+                        .modify_column(
+                            ColumnDef::new(ExternalSources::TargetGroupName)
+                                .string()
+                                .not_null(),
+                        )
                         .to_owned(),
                 )
                 .await?;
@@ -420,9 +563,15 @@ impl MigrationTrait for Migration {
         }
 
         manager
-            .drop_table(Table::drop().table(DestinationGroupVaultTargets::Table).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(DestinationGroupVaultTargets::Table)
+                    .to_owned(),
+            )
             .await?;
-        manager.drop_table(Table::drop().table(DestinationGroups::Table).to_owned()).await
+        manager
+            .drop_table(Table::drop().table(DestinationGroups::Table).to_owned())
+            .await
     }
 }
 
@@ -442,17 +591,52 @@ mod tests {
             .to_string(sea_orm::sea_query::SqliteQueryBuilder);
 
         assert_ne!(post, pre, "the flag must actually change the DDL");
-        for shared in ["source_url", "parser_type", "parser_config_json", "created_at", "updated_at"] {
-            assert!(post.contains(shared), "{shared} missing from post-refactor shape");
-            assert!(pre.contains(shared), "{shared} missing from pre-refactor shape");
+        for shared in [
+            "source_url",
+            "parser_type",
+            "parser_config_json",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                post.contains(shared),
+                "{shared} missing from post-refactor shape"
+            );
+            assert!(
+                pre.contains(shared),
+                "{shared} missing from pre-refactor shape"
+            );
         }
-        for moved_up in ["cron_schedule", "target_group_name", "\"mode\"", "is_active", "last_run_at", "owner_key_id"] {
-            assert!(pre.contains(moved_up), "{moved_up} missing from the pre-refactor shape");
-            assert!(!post.contains(moved_up), "{moved_up} must not remain on the post-refactor (feed) shape");
+        for moved_up in [
+            "cron_schedule",
+            "target_group_name",
+            "\"mode\"",
+            "is_active",
+            "last_run_at",
+            "owner_key_id",
+        ] {
+            assert!(
+                pre.contains(moved_up),
+                "{moved_up} missing from the pre-refactor shape"
+            );
+            assert!(
+                !post.contains(moved_up),
+                "{moved_up} must not remain on the post-refactor (feed) shape"
+            );
         }
-        for new_on_feed in ["destination_group_id", "max_age_days", "skip_bogon_filtering"] {
-            assert!(post.contains(new_on_feed), "{new_on_feed} missing from the post-refactor shape");
-            assert!(!pre.contains(new_on_feed), "{new_on_feed} must not exist before the refactor");
+        for new_on_feed in [
+            "destination_group_id",
+            "max_age_days",
+            "skip_bogon_filtering",
+        ] {
+            assert!(
+                post.contains(new_on_feed),
+                "{new_on_feed} missing from the post-refactor shape"
+            );
+            assert!(
+                !pre.contains(new_on_feed),
+                "{new_on_feed} must not exist before the refactor"
+            );
         }
     }
 }

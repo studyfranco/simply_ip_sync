@@ -49,7 +49,8 @@ const ZIP_EMPTY_ARCHIVE_MAGIC: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
 
 /// True if `bytes` begins with a ZIP archive signature.
 pub fn is_zip(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && (bytes[..4] == ZIP_LOCAL_HEADER_MAGIC || bytes[..4] == ZIP_EMPTY_ARCHIVE_MAGIC)
+    bytes.len() >= 4
+        && (bytes[..4] == ZIP_LOCAL_HEADER_MAGIC || bytes[..4] == ZIP_EMPTY_ARCHIVE_MAGIC)
 }
 
 /// If `bytes` is a ZIP archive, decompresses and concatenates every non-directory member (each
@@ -63,26 +64,34 @@ pub fn is_zip(bytes: &[u8]) -> bool {
 /// limit in aggregate) — so a member whose true decompressed size vastly exceeds the archive's own
 /// compressed size (the defining shape of a ZIP bomb) is caught after reading at most
 /// `max_decompressed_bytes + 1` bytes of it, never after decompressing it in full.
-pub fn decompress_if_zip(bytes: &[u8], max_decompressed_bytes: u64) -> Result<Vec<u8>, DecompressError> {
+pub fn decompress_if_zip(
+    bytes: &[u8],
+    max_decompressed_bytes: u64,
+) -> Result<Vec<u8>, DecompressError> {
     if !is_zip(bytes) {
         return Ok(bytes.to_vec());
     }
 
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| DecompressError::OpenArchive(e.to_string()))?;
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|e| DecompressError::OpenArchive(e.to_string()))?;
     if archive.is_empty() {
         return Err(DecompressError::EmptyArchive);
     }
 
     let mut combined = Vec::new();
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| DecompressError::ReadMember(e.to_string()))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| DecompressError::ReadMember(e.to_string()))?;
         if entry.is_dir() {
             continue;
         }
         let budget = max_decompressed_bytes.saturating_sub(combined.len() as u64);
         if budget == 0 {
-            return Err(DecompressError::TooLarge { limit_bytes: max_decompressed_bytes });
+            return Err(DecompressError::TooLarge {
+                limit_bytes: max_decompressed_bytes,
+            });
         }
         let mut contents = Vec::new();
         (&mut entry)
@@ -90,7 +99,9 @@ pub fn decompress_if_zip(bytes: &[u8], max_decompressed_bytes: u64) -> Result<Ve
             .read_to_end(&mut contents)
             .map_err(|e| DecompressError::ReadMember(e.to_string()))?;
         if contents.len() as u64 > budget {
-            return Err(DecompressError::TooLarge { limit_bytes: max_decompressed_bytes });
+            return Err(DecompressError::TooLarge {
+                limit_bytes: max_decompressed_bytes,
+            });
         }
         if !combined.is_empty() && !combined.ends_with(b"\n") {
             combined.push(b'\n');
@@ -109,12 +120,21 @@ pub fn decompress_if_zip(bytes: &[u8], max_decompressed_bytes: u64) -> Result<Ve
 /// time `bytes()` returns, an arbitrarily large payload would already be fully decompressed and
 /// resident in memory. `Response::chunk()` polls that same post-decompression stream one piece at
 /// a time, which is what lets this function reject the payload mid-stream instead.
-pub async fn read_capped_body(mut response: reqwest::Response, max_bytes: u64) -> Result<Vec<u8>, DecompressError> {
+pub async fn read_capped_body(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, DecompressError> {
     let mut buf = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| DecompressError::ReadMember(e.to_string()))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| DecompressError::ReadMember(e.to_string()))?
+    {
         buf.extend_from_slice(&chunk);
         if buf.len() as u64 > max_bytes {
-            return Err(DecompressError::TooLarge { limit_bytes: max_bytes });
+            return Err(DecompressError::TooLarge {
+                limit_bytes: max_bytes,
+            });
         }
     }
     Ok(buf)
@@ -129,8 +149,8 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut buf);
-            let options: zip::write::FileOptions<'_, ()> =
-                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
             writer.start_file(name, options).expect("start_file");
             writer.write_all(contents).expect("write contents");
             writer.finish().expect("finish");
@@ -171,7 +191,10 @@ mod tests {
         }
         let empty_zip = buf.into_inner();
         assert!(is_zip(&empty_zip));
-        assert!(matches!(decompress_if_zip(&empty_zip, GENEROUS_LIMIT), Err(DecompressError::EmptyArchive)));
+        assert!(matches!(
+            decompress_if_zip(&empty_zip, GENEROUS_LIMIT),
+            Err(DecompressError::EmptyArchive)
+        ));
     }
 
     /// A ZIP bomb, reproduced at a scale small enough to keep the test fast: a single member of
@@ -185,7 +208,10 @@ mod tests {
         let huge_inner = vec![b'a'; 100_000];
         let zip_bytes = build_test_zip("bomb.txt", &huge_inner);
         let result = decompress_if_zip(&zip_bytes, 1024);
-        assert!(matches!(result, Err(DecompressError::TooLarge { limit_bytes: 1024 })), "got {result:?}");
+        assert!(
+            matches!(result, Err(DecompressError::TooLarge { limit_bytes: 1024 })),
+            "got {result:?}"
+        );
     }
 
     /// The ceiling applies to the *combined* output across every member, not per-member — three
@@ -197,11 +223,15 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut buf);
-            let options: zip::write::FileOptions<'_, ()> =
-                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
             for i in 0..5 {
-                writer.start_file(format!("part-{i}.txt"), options).expect("start_file");
-                writer.write_all(&vec![b'a'; 1000]).expect("write member contents");
+                writer
+                    .start_file(format!("part-{i}.txt"), options)
+                    .expect("start_file");
+                writer
+                    .write_all(&vec![b'a'; 1000])
+                    .expect("write member contents");
             }
             writer.finish().expect("finish archive");
         }
@@ -210,17 +240,26 @@ mod tests {
         // Each member (1000 bytes) is individually under this limit, but five of them (5000 bytes
         // combined) are not.
         let result = decompress_if_zip(&zip_bytes, 3000);
-        assert!(matches!(result, Err(DecompressError::TooLarge { limit_bytes: 3000 })), "got {result:?}");
+        assert!(
+            matches!(result, Err(DecompressError::TooLarge { limit_bytes: 3000 })),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
     async fn read_capped_body_passes_through_a_body_under_the_limit() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()),
+            )
             .mount(&mock_server)
             .await;
-        let response = reqwest::Client::new().get(mock_server.uri()).send().await.expect("request");
+        let response = reqwest::Client::new()
+            .get(mock_server.uri())
+            .send()
+            .await
+            .expect("request");
         let body = read_capped_body(response, 1024).await.expect("under limit");
         assert_eq!(body, b"hello world");
     }
@@ -238,8 +277,15 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(big))
             .mount(&mock_server)
             .await;
-        let response = reqwest::Client::new().get(mock_server.uri()).send().await.expect("request");
+        let response = reqwest::Client::new()
+            .get(mock_server.uri())
+            .send()
+            .await
+            .expect("request");
         let result = read_capped_body(response, 100).await;
-        assert!(matches!(result, Err(DecompressError::TooLarge { limit_bytes: 100 })), "got {result:?}");
+        assert!(
+            matches!(result, Err(DecompressError::TooLarge { limit_bytes: 100 })),
+            "got {result:?}"
+        );
     }
 }

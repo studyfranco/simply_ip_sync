@@ -3,14 +3,16 @@
 use axum::extract::State;
 
 use crate::extract::StrictPath;
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::response::IntoResponse;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::support::{create_audit_log, find_permission, grant_full_permission, RESOURCE_VAULT_ENDPOINT};
+use super::support::{
+    RESOURCE_VAULT_ENDPOINT, create_audit_log, find_permission, grant_full_permission,
+};
 use super::{guard_resource_creation, guard_resource_lifecycle, guard_resource_manage};
 use crate::entities::{api_key, vault_endpoint};
 use crate::error::AppError;
@@ -101,7 +103,9 @@ pub async fn list_vault_endpoints(
     for endpoint in all {
         if caller.is_master
             || endpoint.owner_key_id == Some(caller.id)
-            || find_permission(&state.db, caller.id, RESOURCE_VAULT_ENDPOINT, endpoint.id).await?.is_some()
+            || find_permission(&state.db, caller.id, RESOURCE_VAULT_ENDPOINT, endpoint.id)
+                .await?
+                .is_some()
         {
             visible.push(VaultEndpointResponse::from(endpoint));
         }
@@ -115,10 +119,15 @@ pub async fn get_vault_endpoint(
     axum::Extension(caller): axum::Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let endpoint = vault_endpoint::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let endpoint = vault_endpoint::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let visible = caller.is_master
         || endpoint.owner_key_id == Some(caller.id)
-        || find_permission(&state.db, caller.id, RESOURCE_VAULT_ENDPOINT, id).await?.is_some();
+        || find_permission(&state.db, caller.id, RESOURCE_VAULT_ENDPOINT, id)
+            .await?
+            .is_some();
     if !visible {
         return Err(AppError::NotFound);
     }
@@ -148,16 +157,33 @@ pub async fn create_vault_endpoint(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    let inserted = vault_endpoint::Entity::insert(model).exec_with_returning(&state.db).await.map_err(|e| {
-        if matches!(e.sql_err(), Some(sea_orm::SqlErr::UniqueConstraintViolation(_))) {
-            AppError::Conflict(format!("a vault endpoint named '{}' already exists", payload.name))
-        } else {
-            AppError::DbError(e)
-        }
-    })?;
+    let inserted = vault_endpoint::Entity::insert(model)
+        .exec_with_returning(&state.db)
+        .await
+        .map_err(|e| {
+            if matches!(
+                e.sql_err(),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+            ) {
+                AppError::Conflict(format!(
+                    "a vault endpoint named '{}' already exists",
+                    payload.name
+                ))
+            } else {
+                AppError::DbError(e)
+            }
+        })?;
 
     grant_full_permission(&state.db, caller.id, RESOURCE_VAULT_ENDPOINT, id).await?;
-    create_audit_log(&state.db, &caller, client_ip.0, "VAULT_CREATE", Some(inserted.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "VAULT_CREATE",
+        Some(inserted.name.clone()),
+        None,
+    )
+    .await?;
 
     Ok(Json(VaultEndpointResponse::from(inserted)))
 }
@@ -171,7 +197,10 @@ pub async fn update_vault_endpoint(
     StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateVaultEndpointPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = vault_endpoint::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = vault_endpoint::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let permission = find_permission(&state.db, caller.id, RESOURCE_VAULT_ENDPOINT, id).await?;
     guard_resource_manage(&caller, permission.as_ref())?;
 
@@ -194,7 +223,15 @@ pub async fn update_vault_endpoint(
     active.updated_at = Set(Utc::now());
 
     let updated = active.update(&state.db).await?;
-    create_audit_log(&state.db, &caller, client_ip.0, "VAULT_UPDATE", Some(updated.name.clone()), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "VAULT_UPDATE",
+        Some(updated.name.clone()),
+        None,
+    )
+    .await?;
     Ok(Json(VaultEndpointResponse::from(updated)))
 }
 
@@ -205,16 +242,29 @@ pub async fn delete_vault_endpoint(
     axum::Extension(client_ip): axum::Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = vault_endpoint::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = vault_endpoint::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     guard_resource_lifecycle(&caller, existing.owner_key_id)?;
 
     let name = existing.name.clone();
     // See `sources.rs::delete_external_source`'s identical comment: two concurrent deletes of the
     // same id can both pass `find_by_id` before either `DELETE` runs.
-    let result = vault_endpoint::Entity::delete_by_id(id).exec(&state.db).await?;
+    let result = vault_endpoint::Entity::delete_by_id(id)
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
-    create_audit_log(&state.db, &caller, client_ip.0, "VAULT_DELETE", Some(name), None).await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "VAULT_DELETE",
+        Some(name),
+        None,
+    )
+    .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

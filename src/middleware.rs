@@ -91,7 +91,10 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned)
         .ok_or_else(|| AppError::Unauthorized("Missing X-Signature-256 header".to_owned()))?;
-    if !provided_signature.trim().starts_with(crypto::SIGNATURE_PREFIX) {
+    if !provided_signature
+        .trim()
+        .starts_with(crypto::SIGNATURE_PREFIX)
+    {
         return Err(AppError::Unauthorized(
             "X-Signature-256 must be formatted as sha256=<hex>".to_owned(),
         ));
@@ -111,7 +114,11 @@ pub async fn auth_middleware(
     let signing_secret = key_record
         .signing_secret
         .as_deref()
-        .ok_or_else(|| AppError::Unauthorized("This API key has no signing secret; rotate it to obtain one".to_owned()))
+        .ok_or_else(|| {
+            AppError::Unauthorized(
+                "This API key has no signing secret; rotate it to obtain one".to_owned(),
+            )
+        })
         .and_then(|stored| state.cipher.open(stored).map_err(AppError::from))?;
 
     let method = req.method().as_str().to_owned();
@@ -152,7 +159,9 @@ pub async fn auth_middleware(
         &body_bytes,
         &provided_signature,
     ) else {
-        return Err(AppError::Unauthorized("Invalid request signature".to_owned()));
+        return Err(AppError::Unauthorized(
+            "Invalid request signature".to_owned(),
+        ));
     };
 
     // Replay check only after the signature has actually been proven valid — recording an
@@ -180,7 +189,10 @@ pub async fn auth_middleware(
     }
 
     let mut key_record = key_record;
-    state.master_pin.authenticate(&state.db, &mut key_record).await;
+    state
+        .master_pin
+        .authenticate(&state.db, &mut key_record)
+        .await;
 
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     req.extensions_mut().insert(ClientIp(client_ip));

@@ -46,7 +46,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 
-use super::{normalize_ip_or_cidr, FeedParser, ParseError, ParsedRecord};
+use super::{FeedParser, ParseError, ParsedRecord, normalize_ip_or_cidr};
 
 /// A `$.`-prefixed field selector, already split into its dot-separated segments (`$.meta.ip` →
 /// `["meta", "ip"]`).
@@ -57,7 +57,9 @@ fn parse_selector(raw: &str) -> Result<Selector, String> {
         .strip_prefix("$.")
         .ok_or_else(|| format!("selector '{raw}' must start with '$.' (e.g. \"$.ipAddress\")"))?;
     if rest.is_empty() {
-        return Err(format!("selector '{raw}' must name at least one field after '$.'"));
+        return Err(format!(
+            "selector '{raw}' must name at least one field after '$.'"
+        ));
     }
     Ok(rest.split('.').map(str::to_owned).collect())
 }
@@ -93,11 +95,16 @@ struct JsonPathConfig {
 
 impl JsonPathConfig {
     fn parse(config_str: &str) -> Result<Self, String> {
-        let value: Value =
-            serde_json::from_str(config_str).map_err(|e| format!("invalid parser_config_json: {e}"))?;
-        let obj = value.as_object().ok_or_else(|| "parser_config_json must be a JSON object".to_owned())?;
+        let value: Value = serde_json::from_str(config_str)
+            .map_err(|e| format!("invalid parser_config_json: {e}"))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "parser_config_json must be a JSON object".to_owned())?;
 
-        let array_path = obj.get("array_path").and_then(Value::as_str).map(str::to_owned);
+        let array_path = obj
+            .get("array_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let jsonl = obj.get("jsonl").and_then(Value::as_bool).unwrap_or(false);
 
         let target_address_raw = obj
@@ -118,7 +125,12 @@ impl JsonPathConfig {
             .map(parse_selector)
             .transpose()?;
 
-        Ok(Self { array_path, target_address, last_seen_at, jsonl })
+        Ok(Self {
+            array_path,
+            target_address,
+            last_seen_at,
+            jsonl,
+        })
     }
 }
 
@@ -129,8 +141,9 @@ impl JsonPathConfig {
 /// entry. The parser itself re-validates at parse time regardless (defense in depth, the same
 /// two-layer pattern `scheduler::validate_cron_expression` already uses for `cron_schedule`).
 pub fn validate_config(config: Option<&str>) -> Result<(), String> {
-    let config_str =
-        config.ok_or_else(|| "JSON_PATH requires parser_config_json with a target_address selector".to_owned())?;
+    let config_str = config.ok_or_else(|| {
+        "JSON_PATH requires parser_config_json with a target_address selector".to_owned()
+    })?;
     JsonPathConfig::parse(config_str).map(|_| ())
 }
 
@@ -142,7 +155,9 @@ pub struct JsonPathParser;
 impl FeedParser for JsonPathParser {
     fn parse(&self, raw: &[u8], config: Option<&str>) -> Result<Vec<ParsedRecord>, ParseError> {
         let config_str = config.ok_or_else(|| {
-            ParseError::InvalidConfig("JSON_PATH requires parser_config_json with a target_address selector".to_owned())
+            ParseError::InvalidConfig(
+                "JSON_PATH requires parser_config_json with a target_address selector".to_owned(),
+            )
         })?;
         let config = JsonPathConfig::parse(config_str).map_err(ParseError::InvalidConfig)?;
 
@@ -150,16 +165,18 @@ impl FeedParser for JsonPathParser {
             return parse_jsonl(raw, &config);
         }
 
-        let root: Value = serde_json::from_slice(raw).map_err(|e| ParseError::MalformedBody(e.to_string()))?;
+        let root: Value =
+            serde_json::from_slice(raw).map_err(|e| ParseError::MalformedBody(e.to_string()))?;
 
         let array = match &config.array_path {
-            Some(path) => walk_dotted_path(&root, path)
-                .ok_or_else(|| ParseError::InvalidConfig(format!("array_path '{path}' not found in feed body")))?,
+            Some(path) => walk_dotted_path(&root, path).ok_or_else(|| {
+                ParseError::InvalidConfig(format!("array_path '{path}' not found in feed body"))
+            })?,
             None => &root,
         };
-        let items = array
-            .as_array()
-            .ok_or_else(|| ParseError::InvalidConfig("array_path did not resolve to a JSON array".to_owned()))?;
+        let items = array.as_array().ok_or_else(|| {
+            ParseError::InvalidConfig("array_path did not resolve to a JSON array".to_owned())
+        })?;
 
         Ok(extract_records(items.iter(), &config))
     }
@@ -192,7 +209,8 @@ where
     let mut results = Vec::new();
     for item in items {
         let item = item.borrow();
-        let Some(candidate) = walk_selector(item, &config.target_address).and_then(Value::as_str) else {
+        let Some(candidate) = walk_selector(item, &config.target_address).and_then(Value::as_str)
+        else {
             continue;
         };
         let Some(address) = normalize_ip_or_cidr(candidate) else {
@@ -204,7 +222,10 @@ where
             .and_then(|selector| walk_selector(item, selector))
             .and_then(Value::as_str)
             .and_then(parse_last_seen_at);
-        results.push(ParsedRecord { address, last_seen_at });
+        results.push(ParsedRecord {
+            address,
+            last_seen_at,
+        });
     }
     results
 }
@@ -222,7 +243,12 @@ mod tests {
     use super::*;
 
     fn addrs(parser: &JsonPathParser, body: &[u8], config: &str) -> Vec<String> {
-        parser.parse(body, Some(config)).expect("parse").into_iter().map(|r| r.address).collect()
+        parser
+            .parse(body, Some(config))
+            .expect("parse")
+            .into_iter()
+            .map(|r| r.address)
+            .collect()
     }
 
     #[test]
@@ -230,7 +256,10 @@ mod tests {
         let parser = JsonPathParser;
         let body = br#"{"data":{"items":[{"ipAddress":"1.2.3.4"},{"ipAddress":"5.6.7.8"}]}}"#;
         let config = r#"{"array_path":"data.items","target_address":"$.ipAddress"}"#;
-        assert_eq!(addrs(&parser, body, config), vec!["1.2.3.4".to_owned(), "5.6.7.8".to_owned()]);
+        assert_eq!(
+            addrs(&parser, body, config),
+            vec!["1.2.3.4".to_owned(), "5.6.7.8".to_owned()]
+        );
     }
 
     #[test]
@@ -282,7 +311,9 @@ mod tests {
     fn errors_when_target_address_is_missing_entirely() {
         let parser = JsonPathParser;
         let config = r#"{"array_path":"data"}"#;
-        let err = parser.parse(br#"{"data":[]}"#, Some(config)).expect_err("must reject");
+        let err = parser
+            .parse(br#"{"data":[]}"#, Some(config))
+            .expect_err("must reject");
         assert!(matches!(err, ParseError::InvalidConfig(_)));
     }
 
@@ -290,13 +321,20 @@ mod tests {
     fn errors_when_target_address_lacks_the_dollar_dot_prefix() {
         let parser = JsonPathParser;
         let config = r#"{"target_address":"ipAddress"}"#;
-        let err = parser.parse(br#"[{"ipAddress":"1.2.3.4"}]"#, Some(config)).expect_err("must reject");
+        let err = parser
+            .parse(br#"[{"ipAddress":"1.2.3.4"}]"#, Some(config))
+            .expect_err("must reject");
         assert!(matches!(err, ParseError::InvalidConfig(_)));
     }
 
     #[test]
     fn validate_config_accepts_a_well_formed_configuration() {
-        assert!(validate_config(Some(r#"{"array_path":"data","target_address":"$.ipAddress"}"#)).is_ok());
+        assert!(
+            validate_config(Some(
+                r#"{"array_path":"data","target_address":"$.ipAddress"}"#
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -318,7 +356,10 @@ mod tests {
         let config = r#"{"target_address":"$.ipAddress","last_seen_at":"$.lastReportedAt"}"#;
         let out = parser.parse(body, Some(config)).expect("parse");
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].last_seen_at, Some("2026-09-26T15:17:01+00:00".parse().unwrap()));
+        assert_eq!(
+            out[0].last_seen_at,
+            Some("2026-09-26T15:17:01+00:00".parse().unwrap())
+        );
     }
 
     /// Task 5: the real SANS ISC `erratasec` threat list's own `lastseen` shape is a bare
@@ -331,7 +372,10 @@ mod tests {
         let config = r#"{"target_address":"$.ipv4","timestamp":"$.lastseen"}"#;
         let out = parser.parse(body, Some(config)).expect("parse");
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].last_seen_at, Some("2026-09-28T00:00:00Z".parse().unwrap()));
+        assert_eq!(
+            out[0].last_seen_at,
+            Some("2026-09-28T00:00:00Z".parse().unwrap())
+        );
     }
 
     #[test]
@@ -340,7 +384,11 @@ mod tests {
         let body = br#"[{"ip":"1.2.3.4","seen":"not-a-date"}]"#;
         let config = r#"{"target_address":"$.ip","last_seen_at":"$.seen"}"#;
         let out = parser.parse(body, Some(config)).expect("parse");
-        assert_eq!(out.len(), 1, "the record itself is kept even though its timestamp didn't parse");
+        assert_eq!(
+            out.len(),
+            1,
+            "the record itself is kept even though its timestamp didn't parse"
+        );
         assert_eq!(out[0].last_seen_at, None);
     }
 
@@ -365,7 +413,10 @@ mod tests {
         let config = r#"{"jsonl":true,"target_address":"$.cidr"}"#;
         assert_eq!(
             addrs(&parser, body.as_bytes(), config),
-            vec!["2001:678:254::/48".to_owned(), "2001:678:6c0::/48".to_owned()]
+            vec![
+                "2001:678:254::/48".to_owned(),
+                "2001:678:6c0::/48".to_owned()
+            ]
         );
     }
 
@@ -388,7 +439,10 @@ mod tests {
         let parser = JsonPathParser;
         let config = r#"{"target_address":"$.ip"}"#;
         let body: &[u8] = &[0x00, 0xff, 0xfe, 0x80, 0x81, 0x00, 0x00, 0xc0, 0xc1];
-        assert!(parser.parse(body, Some(config)).is_err(), "raw binary is not valid JSON and must be rejected cleanly, not panic");
+        assert!(
+            parser.parse(body, Some(config)).is_err(),
+            "raw binary is not valid JSON and must be rejected cleanly, not panic"
+        );
     }
 
     /// Task 3 (historical), `jsonl` mode specifically: a non-UTF-8 line among otherwise

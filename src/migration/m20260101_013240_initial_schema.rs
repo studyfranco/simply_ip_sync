@@ -18,7 +18,12 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(ColumnDef::new(ApiKeys::Id).uuid().not_null().primary_key())
                     .col(ColumnDef::new(ApiKeys::Name).string().not_null())
-                    .col(ColumnDef::new(ApiKeys::KeyHash).string().not_null().unique_key())
+                    .col(
+                        ColumnDef::new(ApiKeys::KeyHash)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
                     .col(ColumnDef::new(ApiKeys::SigningSecret).text())
                     .col(ColumnDef::new(ApiKeys::Prefix).string().not_null())
                     .col(
@@ -47,8 +52,16 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(ApiKeys::ParentKeyId).uuid())
                     .col(ColumnDef::new(ApiKeys::BoundIps).text())
-                    .col(ColumnDef::new(ApiKeys::CreatedAt).timestamp_with_time_zone().not_null())
-                    .col(ColumnDef::new(ApiKeys::UpdatedAt).timestamp_with_time_zone().not_null())
+                    .col(
+                        ColumnDef::new(ApiKeys::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeys::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
                     .to_owned(),
             )
             .await?;
@@ -76,11 +89,29 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(VaultEndpoints::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(VaultEndpoints::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(VaultEndpoints::Name).string().not_null().unique_key())
-                    .col(ColumnDef::new(VaultEndpoints::TargetUrl).string().not_null())
+                    .col(
+                        ColumnDef::new(VaultEndpoints::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultEndpoints::Name)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultEndpoints::TargetUrl)
+                            .string()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(VaultEndpoints::ApiKey).text().not_null())
-                    .col(ColumnDef::new(VaultEndpoints::SigningSecret).text().not_null())
+                    .col(
+                        ColumnDef::new(VaultEndpoints::SigningSecret)
+                            .text()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(VaultEndpoints::Description).text())
                     .col(ColumnDef::new(VaultEndpoints::OwnerKeyId).uuid())
                     .col(
@@ -111,9 +142,23 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(ExternalSources::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(ExternalSources::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(ExternalSources::Name).string().not_null().unique_key())
-                    .col(ColumnDef::new(ExternalSources::SourceUrl).string().not_null())
+                    .col(
+                        ColumnDef::new(ExternalSources::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ExternalSources::Name)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ExternalSources::SourceUrl)
+                            .string()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(ExternalSources::ParserType)
                             .string()
@@ -121,8 +166,16 @@ impl MigrationTrait for Migration {
                             .default("REGEX_LINE"),
                     )
                     .col(ColumnDef::new(ExternalSources::ParserConfigJson).text())
-                    .col(ColumnDef::new(ExternalSources::CronSchedule).string().not_null())
-                    .col(ColumnDef::new(ExternalSources::TargetGroupName).string().not_null())
+                    .col(
+                        ColumnDef::new(ExternalSources::CronSchedule)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ExternalSources::TargetGroupName)
+                            .string()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(ExternalSources::Mode)
                             .string()
@@ -165,8 +218,16 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(ExternalSourceVaultTargets::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(ExternalSourceVaultTargets::ExternalSourceId).uuid().not_null())
-                    .col(ColumnDef::new(ExternalSourceVaultTargets::VaultEndpointId).uuid().not_null())
+                    .col(
+                        ColumnDef::new(ExternalSourceVaultTargets::ExternalSourceId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ExternalSourceVaultTargets::VaultEndpointId)
+                            .uuid()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(ExternalSourceVaultTargets::TargetGroupName).text())
                     .primary_key(
                         Index::create()
@@ -176,14 +237,20 @@ impl MigrationTrait for Migration {
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-esvt-external_source")
-                            .from(ExternalSourceVaultTargets::Table, ExternalSourceVaultTargets::ExternalSourceId)
+                            .from(
+                                ExternalSourceVaultTargets::Table,
+                                ExternalSourceVaultTargets::ExternalSourceId,
+                            )
                             .to(ExternalSources::Table, ExternalSources::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-esvt-vault_endpoint")
-                            .from(ExternalSourceVaultTargets::Table, ExternalSourceVaultTargets::VaultEndpointId)
+                            .from(
+                                ExternalSourceVaultTargets::Table,
+                                ExternalSourceVaultTargets::VaultEndpointId,
+                            )
                             .to(VaultEndpoints::Table, VaultEndpoints::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
@@ -196,12 +263,38 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(VaultSyncTasks::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(VaultSyncTasks::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(VaultSyncTasks::Name).string().not_null().unique_key())
-                    .col(ColumnDef::new(VaultSyncTasks::SourceVaultId).uuid().not_null())
-                    .col(ColumnDef::new(VaultSyncTasks::SourceGroupName).string().not_null())
-                    .col(ColumnDef::new(VaultSyncTasks::TargetGroupName).string().not_null())
-                    .col(ColumnDef::new(VaultSyncTasks::CronSchedule).string().not_null())
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::Name)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::SourceVaultId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::SourceGroupName)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::TargetGroupName)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultSyncTasks::CronSchedule)
+                            .string()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(VaultSyncTasks::LastSyncAt).timestamp_with_time_zone())
                     .col(
                         ColumnDef::new(VaultSyncTasks::Mode)
@@ -251,8 +344,16 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(VaultSyncTaskTargets::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(VaultSyncTaskTargets::VaultSyncTaskId).uuid().not_null())
-                    .col(ColumnDef::new(VaultSyncTaskTargets::TargetVaultId).uuid().not_null())
+                    .col(
+                        ColumnDef::new(VaultSyncTaskTargets::VaultSyncTaskId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultSyncTaskTargets::TargetVaultId)
+                            .uuid()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(VaultSyncTaskTargets::TargetGroupName).text())
                     .primary_key(
                         Index::create()
@@ -262,14 +363,20 @@ impl MigrationTrait for Migration {
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-vstt-vault_sync_task")
-                            .from(VaultSyncTaskTargets::Table, VaultSyncTaskTargets::VaultSyncTaskId)
+                            .from(
+                                VaultSyncTaskTargets::Table,
+                                VaultSyncTaskTargets::VaultSyncTaskId,
+                            )
                             .to(VaultSyncTasks::Table, VaultSyncTasks::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-vstt-target_vault")
-                            .from(VaultSyncTaskTargets::Table, VaultSyncTaskTargets::TargetVaultId)
+                            .from(
+                                VaultSyncTaskTargets::Table,
+                                VaultSyncTaskTargets::TargetVaultId,
+                            )
                             .to(VaultEndpoints::Table, VaultEndpoints::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
@@ -282,10 +389,27 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(ApiKeySyncPermissions::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(ApiKeySyncPermissions::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(ApiKeySyncPermissions::ApiKeyId).uuid().not_null())
-                    .col(ColumnDef::new(ApiKeySyncPermissions::ResourceType).string().not_null())
-                    .col(ColumnDef::new(ApiKeySyncPermissions::ResourceId).uuid().not_null())
+                    .col(
+                        ColumnDef::new(ApiKeySyncPermissions::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeySyncPermissions::ApiKeyId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeySyncPermissions::ResourceType)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ApiKeySyncPermissions::ResourceId)
+                            .uuid()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(ApiKeySyncPermissions::CanSync)
                             .boolean()
@@ -312,7 +436,10 @@ impl MigrationTrait for Migration {
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-aksp-api_key")
-                            .from(ApiKeySyncPermissions::Table, ApiKeySyncPermissions::ApiKeyId)
+                            .from(
+                                ApiKeySyncPermissions::Table,
+                                ApiKeySyncPermissions::ApiKeyId,
+                            )
                             .to(ApiKeys::Table, ApiKeys::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
@@ -356,7 +483,11 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(SyncLogs::DurationMs).integer().not_null())
                     .col(ColumnDef::new(SyncLogs::ErrorMessage).text())
-                    .col(ColumnDef::new(SyncLogs::Timestamp).timestamp_with_time_zone().not_null())
+                    .col(
+                        ColumnDef::new(SyncLogs::Timestamp)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
                     .to_owned(),
             )
             .await?;
@@ -385,7 +516,12 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(AuditLogs::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(AuditLogs::Id).uuid().not_null().primary_key())
+                    .col(
+                        ColumnDef::new(AuditLogs::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
                     .col(ColumnDef::new(AuditLogs::ApiKeyId).uuid())
                     .col(ColumnDef::new(AuditLogs::ApiKeyName).string())
                     .col(ColumnDef::new(AuditLogs::ApiKeyPrefix).string())
@@ -393,7 +529,11 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(AuditLogs::Action).string().not_null())
                     .col(ColumnDef::new(AuditLogs::TargetResource).string())
                     .col(ColumnDef::new(AuditLogs::Details).text())
-                    .col(ColumnDef::new(AuditLogs::Timestamp).timestamp_with_time_zone().not_null())
+                    .col(
+                        ColumnDef::new(AuditLogs::Timestamp)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-audit_logs-api_key")
@@ -419,21 +559,37 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.drop_table(Table::drop().table(AuditLogs::Table).to_owned()).await?;
-        manager.drop_table(Table::drop().table(SyncLogs::Table).to_owned()).await?;
+        manager
+            .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(SyncLogs::Table).to_owned())
+            .await?;
         manager
             .drop_table(Table::drop().table(ApiKeySyncPermissions::Table).to_owned())
             .await?;
         manager
             .drop_table(Table::drop().table(VaultSyncTaskTargets::Table).to_owned())
             .await?;
-        manager.drop_table(Table::drop().table(VaultSyncTasks::Table).to_owned()).await?;
         manager
-            .drop_table(Table::drop().table(ExternalSourceVaultTargets::Table).to_owned())
+            .drop_table(Table::drop().table(VaultSyncTasks::Table).to_owned())
             .await?;
-        manager.drop_table(Table::drop().table(ExternalSources::Table).to_owned()).await?;
-        manager.drop_table(Table::drop().table(VaultEndpoints::Table).to_owned()).await?;
-        manager.drop_table(Table::drop().table(ApiKeys::Table).to_owned()).await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(ExternalSourceVaultTargets::Table)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(Table::drop().table(ExternalSources::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(VaultEndpoints::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(ApiKeys::Table).to_owned())
+            .await?;
         Ok(())
     }
 }

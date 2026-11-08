@@ -2,10 +2,10 @@
 //! without a credential, so they are held to a stricter rule than the authenticated routes:
 //! disclose nothing an anonymous caller could not already infer.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use sea_orm::{EntityTrait, PaginatorTrait};
 use serde_json::json;
 
@@ -28,7 +28,10 @@ pub async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse
     let master_ready = state.master_pin.get().is_some();
 
     if db_ok && master_ready {
-        (StatusCode::OK, Json(json!({ "status": "ok", "service": "simply_ip_sync" })))
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "service": "simply_ip_sync" })),
+        )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,

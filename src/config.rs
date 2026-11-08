@@ -78,7 +78,10 @@ pub struct InvalidInitialMasterSigningSecret {
 /// address is loopback.
 pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     }
 }
@@ -348,7 +351,10 @@ impl TrustedProxies {
             let cache = self.cache.read().await;
             if cache.built
                 && self.hostnames.iter().all(|name| {
-                    cache.hosts.get(name).is_some_and(|s| s.is_fresh(self.positive_ttl, self.negative_ttl))
+                    cache
+                        .hosts
+                        .get(name)
+                        .is_some_and(|s| s.is_fresh(self.positive_ttl, self.negative_ttl))
                 })
             {
                 return Arc::clone(&cache.snapshot);
@@ -365,15 +371,24 @@ impl TrustedProxies {
     /// Re-resolves every hostname whose cached attempt has expired, then rebuilds the snapshot.
     async fn refresh_locked(&self, cache: &mut ResolutionCache) {
         for name in self.hostnames.iter() {
-            if cache.hosts.get(name).is_some_and(|s| s.is_fresh(self.positive_ttl, self.negative_ttl)) {
+            if cache
+                .hosts
+                .get(name)
+                .is_some_and(|s| s.is_fresh(self.positive_ttl, self.negative_ttl))
+            {
                 continue;
             }
 
             let addresses = resolve_hostname(name).await;
             let resolved = !addresses.is_empty();
-            cache
-                .hosts
-                .insert(name.clone(), HostnameState { addresses, attempted_at: Instant::now(), resolved });
+            cache.hosts.insert(
+                name.clone(),
+                HostnameState {
+                    addresses,
+                    attempted_at: Instant::now(),
+                    resolved,
+                },
+            );
         }
 
         let mut merged = (*self.networks).clone();
@@ -401,7 +416,11 @@ impl TrustedProxies {
         cache.hosts.clear();
         self.refresh_locked(&mut cache).await;
 
-        self.hostnames.iter().filter(|name| !cache.hosts.get(*name).is_some_and(|s| s.resolved)).cloned().collect()
+        self.hostnames
+            .iter()
+            .filter(|name| !cache.hosts.get(*name).is_some_and(|s| s.resolved))
+            .cloned()
+            .collect()
     }
 
     /// Primes the set at boot and, if anything failed to resolve, retries once after
@@ -421,7 +440,11 @@ impl TrustedProxies {
                         "All {} {} hostname entr{} resolved at startup.",
                         proxies.hostnames.len(),
                         TRUSTED_PROXIES_ENV,
-                        if proxies.hostnames.len() == 1 { "y" } else { "ies" }
+                        if proxies.hostnames.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
                     );
                 }
                 return;
@@ -472,7 +495,9 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNetwork> {
     // Port 0: `lookup_host` wants a socket address, but only the address half is used.
     match tokio::net::lookup_host((hostname, 0u16)).await {
         Ok(addrs) => {
-            let networks: Vec<IpNetwork> = addrs.map(|addr| IpNetwork::from(normalize_ip(addr.ip()))).collect();
+            let networks: Vec<IpNetwork> = addrs
+                .map(|addr| IpNetwork::from(normalize_ip(addr.ip())))
+                .collect();
             if networks.is_empty() {
                 tracing::warn!(
                     "TRUSTED_PROXIES hostname {hostname:?} resolved to no addresses; it is not \
@@ -481,7 +506,11 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNetwork> {
             } else {
                 tracing::debug!(
                     "TRUSTED_PROXIES hostname {hostname:?} resolved to {}",
-                    networks.iter().map(|n| n.ip().to_string()).collect::<Vec<_>>().join(", ")
+                    networks
+                        .iter()
+                        .map(|n| n.ip().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             networks
@@ -520,12 +549,19 @@ pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<Invalid
         } else {
             match hostname_rejection(entry) {
                 None => matchers.push(ProxyMatcher::Hostname(entry.to_owned())),
-                Some(reason) => invalid.push(InvalidProxyEntry { entry: entry.to_owned(), reason }),
+                Some(reason) => invalid.push(InvalidProxyEntry {
+                    entry: entry.to_owned(),
+                    reason,
+                }),
             }
         }
     }
 
-    if invalid.is_empty() { Ok(matchers) } else { Err(invalid) }
+    if invalid.is_empty() {
+        Ok(matchers)
+    } else {
+        Err(invalid)
+    }
 }
 
 /// Why `entry` cannot be a DNS name, or `None` when it is shaped like one.
@@ -572,7 +608,10 @@ fn hostname_rejection(entry: &str) -> Option<&'static str> {
     if entry.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return Some("made only of digits and dots, so this is a malformed IPv4 literal");
     }
-    if !entry.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_') {
+    if !entry
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    {
         return Some("contains characters that cannot appear in a DNS name");
     }
     None
@@ -586,7 +625,11 @@ fn hostname_rejection(entry: &str) -> Option<&'static str> {
 /// right-to-left (the entry closest to the trusted proxy is the one it actually observed),
 /// skipping any further trusted hops, so a chain of trusted proxies still resolves to the real
 /// originating address. Falls back to `X-Real-IP`, then the raw peer address.
-pub fn resolve_client_ip(peer: IpAddr, headers: &axum::http::HeaderMap, trusted: &[IpNetwork]) -> IpAddr {
+pub fn resolve_client_ip(
+    peer: IpAddr,
+    headers: &axum::http::HeaderMap,
+    trusted: &[IpNetwork],
+) -> IpAddr {
     let peer = normalize_ip(peer);
     if !is_trusted(peer, trusted) {
         return peer;
@@ -624,7 +667,11 @@ pub fn validate_initial_master_key(raw: &str) -> Result<(), InvalidInitialMaster
     }
     Err(InvalidInitialMasterKey {
         got: raw.chars().count(),
-        detail: if is_hex { "" } else { ", and it contains non-hexadecimal characters" },
+        detail: if is_hex {
+            ""
+        } else {
+            ", and it contains non-hexadecimal characters"
+        },
     })
 }
 
@@ -632,14 +679,20 @@ pub fn validate_initial_master_key(raw: &str) -> Result<(), InvalidInitialMaster
 /// reason as `validate_initial_master_key`: a malformed value here would otherwise boot with a
 /// broken Master identity that can never sign a request, and rotation is refused for the Master
 /// key through the API (RBAC §5), so there would be no recovery path short of deleting the row.
-pub fn validate_initial_master_signing_secret(raw: &str) -> Result<(), InvalidInitialMasterSigningSecret> {
+pub fn validate_initial_master_signing_secret(
+    raw: &str,
+) -> Result<(), InvalidInitialMasterSigningSecret> {
     let is_hex = raw.chars().all(|c| c.is_ascii_hexdigit());
     if raw.len() == MASTER_KEY_HEX_LEN && is_hex {
         return Ok(());
     }
     Err(InvalidInitialMasterSigningSecret {
         got: raw.chars().count(),
-        detail: if is_hex { "" } else { ", and it contains non-hexadecimal characters" },
+        detail: if is_hex {
+            ""
+        } else {
+            ", and it contains non-hexadecimal characters"
+        },
     })
 }
 
@@ -821,9 +874,14 @@ mod tests {
     /// underscore (`traefik_tomidejetsu`). Must parse as a hostname, not be refused as garbage.
     #[test]
     fn parse_trusted_proxies_accepts_docker_style_hostnames() {
-        let parsed = parse_trusted_proxies("traefik_tomidejetsu, proxy, traefik.internal").expect("parses");
+        let parsed =
+            parse_trusted_proxies("traefik_tomidejetsu, proxy, traefik.internal").expect("parses");
         assert_eq!(parsed.len(), 3);
-        assert!(parsed.iter().all(|m| matches!(m, ProxyMatcher::Hostname(_))));
+        assert!(
+            parsed
+                .iter()
+                .all(|m| matches!(m, ProxyMatcher::Hostname(_)))
+        );
     }
 
     #[test]
@@ -859,8 +917,13 @@ mod tests {
 
     #[test]
     fn parse_trusted_proxies_collects_every_bad_entry_not_just_the_first() {
-        let err = parse_trusted_proxies("10.0.0.0/99, good-hostname, !!!bad!!!").expect_err("two bad entries");
-        assert_eq!(err.len(), 2, "one restart should surface both typos: {err:?}");
+        let err = parse_trusted_proxies("10.0.0.0/99, good-hostname, !!!bad!!!")
+            .expect_err("two bad entries");
+        assert_eq!(
+            err.len(),
+            2,
+            "one restart should surface both typos: {err:?}"
+        );
     }
 
     /// `localhost` resolves on every platform this runs on, so it exercises the real DNS path.
@@ -874,20 +937,34 @@ mod tests {
                 || is_trusted("::1".parse().unwrap(), &resolved),
             "localhost should resolve to a loopback address: {resolved:?}"
         );
-        assert!(!is_trusted("203.0.113.9".parse().unwrap(), &resolved), "an unrelated address must not match");
+        assert!(
+            !is_trusted("203.0.113.9".parse().unwrap(), &resolved),
+            "an unrelated address must not match"
+        );
     }
 
     /// Docker/Traefik shape: a container name alongside the bridge network CIDR. Either may match.
     #[tokio::test]
     async fn docker_style_configuration_matches_by_cidr_or_by_hostname() {
-        let trusted =
-            TrustedProxies::new(vec!["172.16.0.0/12".parse().map(ProxyMatcher::Network).unwrap(), ProxyMatcher::Hostname("localhost".to_owned())])
-                .resolved()
-                .await;
+        let trusted = TrustedProxies::new(vec![
+            "172.16.0.0/12".parse().map(ProxyMatcher::Network).unwrap(),
+            ProxyMatcher::Hostname("localhost".to_owned()),
+        ])
+        .resolved()
+        .await;
 
-        assert!(is_trusted("172.17.0.5".parse().unwrap(), &trusted), "docker bridge CIDR matches");
-        assert!(is_trusted("127.0.0.1".parse().unwrap(), &trusted), "the named service matches");
-        assert!(!is_trusted("192.0.2.7".parse().unwrap(), &trusted), "anything else does not");
+        assert!(
+            is_trusted("172.17.0.5".parse().unwrap(), &trusted),
+            "docker bridge CIDR matches"
+        );
+        assert!(
+            is_trusted("127.0.0.1".parse().unwrap(), &trusted),
+            "the named service matches"
+        );
+        assert!(
+            !is_trusted("192.0.2.7".parse().unwrap(), &trusted),
+            "anything else does not"
+        );
     }
 
     /// Failing closed matters: a DNS outage must never be able to *widen* what is trusted, and it
@@ -901,8 +978,15 @@ mod tests {
         ]);
         let resolved = trusted.resolved().await;
 
-        assert!(is_trusted("10.1.2.3".parse().unwrap(), &resolved), "the literal entry still applies");
-        assert_eq!(resolved.len(), 1, "the unresolvable name contributes nothing: {resolved:?}");
+        assert!(
+            is_trusted("10.1.2.3".parse().unwrap(), &resolved),
+            "the literal entry still applies"
+        );
+        assert_eq!(
+            resolved.len(),
+            1,
+            "the unresolvable name contributes nothing: {resolved:?}"
+        );
     }
 
     /// A resolution is reused rather than re-queried on every request within the TTL window —
@@ -913,26 +997,54 @@ mod tests {
             .with_ttls(Duration::from_secs(30), Duration::from_secs(30));
         let first = trusted.resolved().await;
         let second = trusted.resolved().await;
-        assert!(Arc::ptr_eq(&first, &second), "an unexpired resolution must be reused, not re-queried");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unexpired resolution must be reused, not re-queried"
+        );
     }
 
     /// The no-hostname path (every deployment naming its proxies by address) must never touch the
     /// resolution lock at all — the common case pays nothing for hostname support existing.
     #[tokio::test]
     async fn no_hostnames_never_touches_the_cache() {
-        let trusted = TrustedProxies::new(vec!["10.0.0.0/8".parse().map(ProxyMatcher::Network).unwrap()]);
+        let trusted = TrustedProxies::new(vec![
+            "10.0.0.0/8".parse().map(ProxyMatcher::Network).unwrap(),
+        ]);
         let first = trusted.resolved().await;
         let second = trusted.resolved().await;
-        assert!(Arc::ptr_eq(&first, &second), "same allocation each time: nothing was rebuilt");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same allocation each time: nothing was rebuilt"
+        );
     }
 
     #[test]
     fn hostname_syntax_accepts_container_names_and_rejects_near_miss_addresses() {
-        for name in ["traefik", "traefik_tomidejetsu", "proxy-1", "traefik.internal", "a", "a1"] {
-            assert!(hostname_rejection(name).is_none(), "{name:?} must be accepted as a hostname");
+        for name in [
+            "traefik",
+            "traefik_tomidejetsu",
+            "proxy-1",
+            "traefik.internal",
+            "a",
+            "a1",
+        ] {
+            assert!(
+                hostname_rejection(name).is_none(),
+                "{name:?} must be accepted as a hostname"
+            );
         }
-        for garbage in ["10.0.0.0/8", "::1", "10.0.0.256", "-leading-hyphen", "trailing-hyphen-", ""] {
-            assert!(hostname_rejection(garbage).is_some(), "{garbage:?} must be refused");
+        for garbage in [
+            "10.0.0.0/8",
+            "::1",
+            "10.0.0.256",
+            "-leading-hyphen",
+            "trailing-hyphen-",
+            "",
+        ] {
+            assert!(
+                hostname_rejection(garbage).is_some(),
+                "{garbage:?} must be refused"
+            );
         }
     }
 
@@ -950,7 +1062,10 @@ mod tests {
         let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
         let mut headers = HeaderMap::new();
         // real client, intermediate trusted proxy, edge trusted proxy (closest to us)
-        headers.insert("X-Forwarded-For", "198.51.100.9, 10.0.0.5, 10.0.0.1".parse().unwrap());
+        headers.insert(
+            "X-Forwarded-For",
+            "198.51.100.9, 10.0.0.5, 10.0.0.1".parse().unwrap(),
+        );
         let peer: IpAddr = "10.0.0.1".parse().unwrap();
         let resolved = resolve_client_ip(peer, &headers, &trusted);
         assert_eq!(resolved, "198.51.100.9".parse::<IpAddr>().unwrap());
@@ -1023,6 +1138,9 @@ mod tests {
         unsafe {
             std::env::remove_var("OUTBOUND_RETRY_BACKOFF_MS");
         }
-        assert_eq!(outbound_retry_backoff(), std::time::Duration::from_millis(DEFAULT_OUTBOUND_RETRY_BACKOFF_MS));
+        assert_eq!(
+            outbound_retry_backoff(),
+            std::time::Duration::from_millis(DEFAULT_OUTBOUND_RETRY_BACKOFF_MS)
+        );
     }
 }
