@@ -122,6 +122,7 @@ pub fn create_app(state: AppState) -> Router {
         )
         .route("/sync-logs", get(api::list_sync_logs))
         .route("/audit-logs", get(api::list_audit_logs))
+        .route("/settings", get(api::get_settings))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

@@ -598,16 +598,25 @@ textarea.input-field {
     border: 1px solid var(--border);
 }
 
+.badge-tier-master,
 .badge-tier.badge-master {
-    background-color: rgba(231, 76, 60, 0.12);
-    color: var(--danger);
-    border-color: rgba(231, 76, 60, 0.3);
+    background-color: rgba(28, 220, 154, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(28, 220, 154, 0.4);
 }
 
+.badge-tier-parent,
 .badge-tier.badge-parent {
-    background-color: rgba(61, 174, 233, 0.12);
+    background-color: rgba(61, 174, 233, 0.14);
     color: var(--highlight);
-    border-color: rgba(61, 174, 233, 0.3);
+    border: 1px solid rgba(61, 174, 233, 0.4);
+}
+
+.badge-tier-daughter,
+.badge-tier.badge-daughter {
+    background-color: rgba(189, 195, 199, 0.1);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
 }
 
 /* A granted global right (`can_manage_keys` and friends). Deliberately quieter than a tier chip:
@@ -827,4 +836,59 @@ textarea.input-field {
     .form-actions .btn {
         width: 100%;
     }
+}
+
+/* ─── Key / Value Detail Grids (System Settings) ───────────── */
+.kv-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+.kv-item {
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.6rem 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    min-width: 0;
+}
+
+.kv-key {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.kv-value {
+    font-weight: 500;
+    word-break: break-word;
+}
+
+/* ─── Pagination ────────────────────────────────────────── */
+.pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+}
+
+.pagination #audit-page-indicator {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    font-weight: 500;
+    min-width: 60px;
+    text-align: center;
+    white-space: nowrap;
+}
+
+.pagination .btn-icon {
+    min-width: 2.25rem;
 }

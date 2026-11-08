@@ -64,12 +64,9 @@
           <h1>Simply IP Sync</h1>
         </div>
         <div id="header-actions" class="header-actions">
-          <!-- The signed-in key's RBAC tier (Master / Parent / Daughter). Shown so "why can't I
-               see the Audit Logs tab?" is answerable without reading RBAC_MODEL.md. -->
-          <span id="identity-name" class="text-muted text-sm"></span>
-          <span id="identity-badge" class="badge badge-tier" title="Your key's RBAC tier"></span>
-          <button id="btn-refresh" type="button" class="btn btn-secondary btn-sm">Refresh</button>
-          <button id="btn-logout" type="button" class="btn btn-logout btn-sm" title="Also clears the saved session from this browser">Logout</button>
+          <span id="current-key-tier" class="badge badge-tier" title="Your key's RBAC tier"></span>
+          <button id="refresh-btn" type="button" class="btn btn-secondary btn-sm">Refresh</button>
+          <button id="logout-btn" type="button" class="btn btn-logout btn-sm" title="Also clears the saved session from this browser">Logout</button>
         </div>
       </header>
 
@@ -79,6 +76,7 @@
         <button class="tab-btn" data-tab="vaults" role="tab" aria-selected="false">Vault Endpoints</button>
         <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
         <button class="tab-btn" data-tab="sync-logs" role="tab" aria-selected="false">Sync Logs</button>
+        <button class="tab-btn" data-tab="settings" id="settings-tab-btn" role="tab" aria-selected="false">System Settings</button>
         <button class="tab-btn" data-tab="audit-logs" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
       </nav>
     </div>
@@ -91,10 +89,32 @@
       <main id="tab-vaults" class="tab-panel"></main>
       <main id="tab-keys" class="tab-panel"></main>
       <main id="tab-sync-logs" class="tab-panel"></main>
+      <main id="tab-settings" class="tab-panel"></main>
       <main id="tab-audit-logs" class="tab-panel"></main>
     </div>
 
   </div>
+
+  <datalist id="audit-action-options">
+    <option value="KEY_CREATE"></option>
+    <option value="KEY_UPDATE"></option>
+    <option value="KEY_DELETE"></option>
+    <option value="KEY_ROTATE"></option>
+    <option value="KEY_ROTATE_SECRET"></option>
+    <option value="SOURCE_CREATE"></option>
+    <option value="SOURCE_UPDATE"></option>
+    <option value="SOURCE_DELETE"></option>
+    <option value="FEED_CREATE"></option>
+    <option value="FEED_UPDATE"></option>
+    <option value="FEED_DELETE"></option>
+    <option value="SYNC_TASK_CREATE"></option>
+    <option value="SYNC_TASK_UPDATE"></option>
+    <option value="SYNC_TASK_DELETE"></option>
+    <option value="SYNC_TASK_TRIGGER"></option>
+    <option value="VAULT_CREATE"></option>
+    <option value="VAULT_UPDATE"></option>
+    <option value="VAULT_DELETE"></option>
+  </datalist>
 
   <script src="app.js"></script>
 </body>

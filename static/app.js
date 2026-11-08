@@ -398,21 +398,22 @@ function rbacTier(key) {
 
 function renderIdentity() {
   const tier = rbacTier(me);
-  document.getElementById("identity-name").textContent = me.name;
-
-  const badge = document.getElementById("identity-badge");
-  badge.textContent = tier;
-  badge.className = "badge badge-tier" + (me.is_master ? " badge-master" : me.can_manage_keys ? " badge-parent" : "");
-  const scopes = [
-    me.can_manage_keys && "can_manage_keys",
-    me.can_manage_sources && "can_manage_sources",
-    me.can_manage_vaults && "can_manage_vaults",
-  ].filter(Boolean);
-  badge.title = scopes.length ? `${tier} — ${scopes.join(", ")}` : `${tier} — no global rights`;
+  const badge = document.getElementById("current-key-tier");
+  if (badge) {
+    badge.textContent = tier;
+    badge.className = "badge badge-tier badge-tier-" + tier.toLowerCase();
+    const scopes = [
+      me.can_manage_keys && "can_manage_keys",
+      me.can_manage_sources && "can_manage_sources",
+      me.can_manage_vaults && "can_manage_vaults",
+    ].filter(Boolean);
+    badge.title = scopes.length ? `${tier} — ${scopes.join(", ")}` : `${tier} — no global rights`;
+  }
 
   // Hide tabs the caller's tier can never load, rather than letting them render a 403. The server
   // is still the authority (`api/guards.rs`); this only keeps the menu honest.
   document.getElementById("audit-tab-btn").classList.toggle("hidden", !me.is_master);
+  document.getElementById("settings-tab-btn").classList.toggle("hidden", !me.is_master);
   document.getElementById("keys-tab-btn").classList.toggle("hidden", !(me.is_master || me.can_manage_keys));
 }
 
@@ -438,7 +439,7 @@ function setupTabs() {
     });
   });
 
-  document.getElementById("btn-refresh").addEventListener("click", async () => {
+  document.getElementById("refresh-btn").addEventListener("click", async () => {
     // Refresh means "show me the true current state", so the cache must not survive it — a stale
     // vault list silently surviving an explicit refresh would defeat the button's own purpose.
     invalidateVaultsCache();
@@ -446,7 +447,7 @@ function setupTabs() {
     if (active) await loadTab(active.dataset.tab);
   });
 
-  document.getElementById("btn-logout").addEventListener("click", () => {
+  document.getElementById("logout-btn").addEventListener("click", () => {
     // Logout doubles as "Clear Saved Session" (Task 6) -- there is no meaningful difference
     // between "sign out" and "forget this credential" for this app, so one button does both
     // rather than adding a second, redundant control. The vaults cache goes with it too — a
@@ -468,6 +469,7 @@ async function loadTab(tab) {
     else if (tab === "vaults") await renderVaults();
     else if (tab === "keys") await renderKeys();
     else if (tab === "sync-logs") await renderSyncLogs();
+    else if (tab === "settings") await renderSettings();
     else if (tab === "audit-logs") await renderAuditLogs();
   } catch (err) {
     toast("Failed to load: " + err.message, "error");
@@ -1397,7 +1399,50 @@ function logRow(l) {
   </tr>`;
 }
 
-let auditFilterState = { action: "", client_ip: "", api_key: "" };
+/* ---------------------------------------------------------------------- *
+ * Settings
+ * ---------------------------------------------------------------------- */
+
+async function renderSettings() {
+  const panel = document.getElementById("tab-settings");
+  if (!me.is_master) {
+    panel.innerHTML = '<section class="card"><p class="empty-state">System settings are visible to the Master key only.</p></section>';
+    return;
+  }
+  const s = await client.get("/api/settings");
+  const item = (k, v) => `<div class="kv-item"><span class="kv-key">${escapeHtml(k)}</span><span class="kv-value">${v}</span></div>`;
+  panel.innerHTML = `
+    <section class="card">
+      <div class="list-header">
+        <h2>System Configuration</h2>
+      </div>
+      <p class="subtitle mb-4">Effective runtime settings and system-wide counters. Master keys only.</p>
+      <div class="kv-grid">
+        ${[
+          item("Trusted proxies", s.trusted_proxies.length
+            ? `<span class="font-mono text-sm">${escapeHtml(s.trusted_proxies.join(", "))}</span>`
+            : '<span class="text-muted">(none — forwarding headers ignored)</span>'),
+          item("Secrets at rest", s.encryption_enabled
+            ? '<span class="badge badge-success">encrypted</span>'
+            : '<span class="badge badge-timeout">unencrypted</span>'),
+          item("Max decompressed bytes", `${Math.round(s.max_decompressed_bytes / 1024 / 1024)} MiB`),
+          item("Outbound HTTP timeout", `${s.outbound_http_timeout_secs}s`),
+          item("Destination groups", s.destination_group_count),
+          item("Vault sync tasks", s.sync_task_count),
+          item("Vault endpoints", s.vault_endpoint_count),
+          item("API keys", s.api_key_count),
+          item("Sync logs stored", s.sync_log_count),
+          item("Audit logs stored", s.audit_log_count),
+        ].join("")}
+      </div>
+    </section>`;
+}
+
+/* ---------------------------------------------------------------------- *
+ * Audit logs
+ * ---------------------------------------------------------------------- */
+
+let auditFilterState = { action: "", client_ip: "", api_key: "", since: "", until: "", page: 1, limit: 50 };
 
 async function renderAuditLogs() {
   const panel = document.getElementById("tab-audit-logs");
@@ -1405,54 +1450,114 @@ async function renderAuditLogs() {
     panel.innerHTML = '<section class="card"><p class="empty-state">Audit logs are visible to the Master key only.</p></section>';
     return;
   }
-  const params = new URLSearchParams({ limit: "100" });
+  const offset = (auditFilterState.page - 1) * auditFilterState.limit;
+  const params = new URLSearchParams({
+    limit: String(auditFilterState.limit),
+    offset: String(offset),
+  });
   if (auditFilterState.action) params.set("action", auditFilterState.action);
   if (auditFilterState.client_ip) params.set("client_ip", auditFilterState.client_ip);
   if (auditFilterState.api_key) params.set("api_key", auditFilterState.api_key);
+  if (auditFilterState.since) {
+    try {
+      params.set("since", new Date(auditFilterState.since).toISOString());
+    } catch {}
+  }
+  if (auditFilterState.until) {
+    try {
+      params.set("until", new Date(auditFilterState.until).toISOString());
+    } catch {}
+  }
+
   const logs = await client.get("/api/audit-logs?" + params.toString());
   panel.innerHTML = `
     <section class="card">
       <div class="list-header">
         <h2>Audit Logs</h2>
-        <div class="row-actions">
-          <input type="text" id="audit-action-filter" class="input-field font-mono" placeholder="Filter by action..." value="${escapeHtml(auditFilterState.action)}">
-          <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP..." value="${escapeHtml(auditFilterState.client_ip)}">
-          <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key..." value="${escapeHtml(auditFilterState.api_key)}">
-          <button type="button" id="audit-search-btn" class="btn btn-secondary btn-sm">Filter</button>
-          <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
-        </div>
+      </div>
+      <p class="subtitle mb-4">Every mutating configuration change — destination groups, feeds, sync tasks, vault endpoints, and keys. Master keys only.</p>
+      <div class="filters mb-4">
+        <input type="text" id="audit-action-filter" class="input-field font-mono" list="audit-action-options" placeholder="Filter by action..." value="${escapeHtml(auditFilterState.action)}">
+        <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP..." value="${escapeHtml(auditFilterState.client_ip)}">
+        <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key..." value="${escapeHtml(auditFilterState.api_key)}">
+        <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)" value="${escapeHtml(auditFilterState.since)}">
+        <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)" value="${escapeHtml(auditFilterState.until)}">
+        <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search">🔍</button>
+        <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
       </div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Timestamp</th><th>API Key</th><th>Client IP</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
-        <tbody>
-          ${logs.length ? logs.map(auditRow).join("") : '<tr><td colspan="6" class="empty-state">No audit entries yet.</td></tr>'}
-        </tbody>
-      </table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>API Key</th>
+              <th>Client IP</th>
+              <th>Action</th>
+              <th>Target</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${logs.length ? logs.map(auditRow).join("") : '<tr><td colspan="6" class="empty-state">No audit entries matching filter.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+      <div class="pagination">
+        <button id="audit-btn-prev" class="btn btn-icon" ${auditFilterState.page <= 1 ? "disabled" : ""}>&laquo; Prev</button>
+        <span id="audit-page-indicator">Page ${auditFilterState.page}</span>
+        <button id="audit-btn-next" class="btn btn-icon" ${logs.length < auditFilterState.limit ? "disabled" : ""}>Next &raquo;</button>
       </div>
     </section>`;
 
-  document.getElementById("audit-search-btn").addEventListener("click", async () => {
-    auditFilterState = {
-      action: document.getElementById("audit-action-filter").value.trim(),
-      client_ip: document.getElementById("audit-ip-filter").value.trim(),
-      api_key: document.getElementById("audit-key-filter").value.trim(),
-    };
+  const actionFilter = document.getElementById("audit-action-filter");
+  const ipFilter = document.getElementById("audit-ip-filter");
+  const keyFilter = document.getElementById("audit-key-filter");
+  const sinceFilter = document.getElementById("audit-since-filter");
+  const untilFilter = document.getElementById("audit-until-filter");
+  const searchBtn = document.getElementById("audit-search-btn");
+  const clearBtn = document.getElementById("audit-clear-btn");
+  const prevBtn = document.getElementById("audit-btn-prev");
+  const pageIndicator = document.getElementById("audit-page-indicator");
+  const nextBtn = document.getElementById("audit-btn-next");
+
+  searchBtn.addEventListener("click", async () => {
+    auditFilterState.action = actionFilter.value.trim();
+    auditFilterState.client_ip = ipFilter.value.trim();
+    auditFilterState.api_key = keyFilter.value.trim();
+    auditFilterState.since = sinceFilter.value;
+    auditFilterState.until = untilFilter.value;
+    auditFilterState.page = 1;
     await renderAuditLogs();
   });
-  document.getElementById("audit-clear-btn").addEventListener("click", async () => {
-    auditFilterState = { action: "", client_ip: "", api_key: "" };
+
+  clearBtn.addEventListener("click", async () => {
+    auditFilterState = { action: "", client_ip: "", api_key: "", since: "", until: "", page: 1, limit: 50 };
     await renderAuditLogs();
+  });
+
+  prevBtn.addEventListener("click", async () => {
+    if (auditFilterState.page > 1) {
+      auditFilterState.page--;
+      await renderAuditLogs();
+    }
+  });
+
+  nextBtn.addEventListener("click", async () => {
+    if (logs.length >= auditFilterState.limit) {
+      auditFilterState.page++;
+      await renderAuditLogs();
+    }
   });
 }
 
 function auditRow(a) {
+  const dateStr = a.timestamp ? new Date(a.timestamp).toLocaleString() : "—";
   return `<tr>
-    <td class="font-mono text-sm">${escapeHtml(a.timestamp)}</td>
-    <td>${escapeHtml(a.api_key_name || "")} <span class="font-mono text-muted text-sm">(${escapeHtml(a.api_key_prefix || "")})</span></td>
-    <td class="font-mono">${escapeHtml(a.client_ip || "")}</td>
-    <td class="font-mono">${escapeHtml(a.action)}</td>
-    <td>${escapeHtml(a.target_resource || "—")}</td>
+    <td class="font-mono text-sm">${escapeHtml(dateStr)}</td>
+    <td>${escapeHtml(a.api_key_name || "")} <span class="font-mono text-muted text-sm">(${escapeHtml(a.api_key_prefix || "")}...)</span></td>
+    <td class="font-mono text-sm">${escapeHtml(a.client_ip || "")}</td>
+    <td><span class="badge badge-scope">${escapeHtml(a.action)}</span></td>
+    <td class="text-sm">${escapeHtml(a.target_resource || "—")}</td>
     <td class="text-muted text-sm">${escapeHtml(a.details || "—")}</td>
   </tr>`;
 }
