@@ -149,7 +149,7 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut buf);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             writer.start_file(name, options).expect("start_file");
             writer.write_all(contents).expect("write contents");
@@ -223,7 +223,7 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut buf);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             for i in 0..5 {
                 writer

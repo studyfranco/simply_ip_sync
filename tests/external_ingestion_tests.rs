@@ -689,7 +689,7 @@ async fn oversized_zip_member_is_rejected_as_a_decompression_bomb() {
     let mut zip_buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut zip_buf);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         writer.start_file("bomb.txt", options).expect("start_file");
         writer.write_all(&oversized).expect("write member contents");

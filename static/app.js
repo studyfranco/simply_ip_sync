@@ -1443,13 +1443,91 @@ async function renderSettings() {
  * ---------------------------------------------------------------------- */
 
 let auditFilterState = { action: "", client_ip: "", api_key: "", since: "", until: "", page: 1, limit: 50 };
+let auditControlsConfigured = false;
+let lastAuditLogCount = 0;
+
+function setupAuditControls() {
+  if (auditControlsConfigured) return;
+  const searchBtn = document.getElementById("audit-search-btn");
+  const clearBtn = document.getElementById("audit-clear-btn");
+  const prevBtn = document.getElementById("audit-btn-prev");
+  const nextBtn = document.getElementById("audit-btn-next");
+  const actionFilter = document.getElementById("audit-action-filter");
+  const ipFilter = document.getElementById("audit-ip-filter");
+  const keyFilter = document.getElementById("audit-key-filter");
+  const sinceFilter = document.getElementById("audit-since-filter");
+  const untilFilter = document.getElementById("audit-until-filter");
+
+  if (!searchBtn) return;
+  auditControlsConfigured = true;
+
+  const triggerSearch = async () => {
+    auditFilterState.action = actionFilter ? actionFilter.value.trim() : "";
+    auditFilterState.client_ip = ipFilter ? ipFilter.value.trim() : "";
+    auditFilterState.api_key = keyFilter ? keyFilter.value.trim() : "";
+    auditFilterState.since = sinceFilter ? sinceFilter.value : "";
+    auditFilterState.until = untilFilter ? untilFilter.value : "";
+    auditFilterState.page = 1;
+    await renderAuditLogs();
+  };
+
+  searchBtn.addEventListener("click", triggerSearch);
+  if (clearBtn) {
+    clearBtn.addEventListener("click", async () => {
+      if (actionFilter) actionFilter.value = "";
+      if (ipFilter) ipFilter.value = "";
+      if (keyFilter) keyFilter.value = "";
+      if (sinceFilter) sinceFilter.value = "";
+      if (untilFilter) untilFilter.value = "";
+      auditFilterState = { action: "", client_ip: "", api_key: "", since: "", until: "", page: 1, limit: 50 };
+      await renderAuditLogs();
+    });
+  }
+  if (sinceFilter) sinceFilter.addEventListener("change", triggerSearch);
+  if (untilFilter) untilFilter.addEventListener("change", triggerSearch);
+  [actionFilter, ipFilter, keyFilter].forEach((el) => {
+    if (el) {
+      el.addEventListener("keydown", async (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          await triggerSearch();
+        }
+      });
+    }
+  });
+
+  if (prevBtn) {
+    prevBtn.addEventListener("click", async () => {
+      if (auditFilterState.page > 1) {
+        auditFilterState.page--;
+        await renderAuditLogs();
+      }
+    });
+  }
+  if (nextBtn) {
+    nextBtn.addEventListener("click", async () => {
+      if (lastAuditLogCount >= auditFilterState.limit) {
+        auditFilterState.page++;
+        await renderAuditLogs();
+      }
+    });
+  }
+}
 
 async function renderAuditLogs() {
   const panel = document.getElementById("tab-audit-logs");
+  if (!panel) return;
   if (!me.is_master) {
     panel.innerHTML = '<section class="card"><p class="empty-state">Audit logs are visible to the Master key only.</p></section>';
     return;
   }
+  setupAuditControls();
+
+  const tbody = document.getElementById("audit-logs-table-body");
+  if (tbody) {
+    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">Loading data...</td></tr>';
+  }
+
   const offset = (auditFilterState.page - 1) * auditFilterState.limit;
   const params = new URLSearchParams({
     limit: String(auditFilterState.limit),
@@ -1460,105 +1538,47 @@ async function renderAuditLogs() {
   if (auditFilterState.api_key) params.set("api_key", auditFilterState.api_key);
   if (auditFilterState.since) {
     try {
-      params.set("since", new Date(auditFilterState.since).toISOString());
+      const d = new Date(auditFilterState.since);
+      if (!Number.isNaN(d.getTime())) params.set("since", d.toISOString());
     } catch {}
   }
   if (auditFilterState.until) {
     try {
-      params.set("until", new Date(auditFilterState.until).toISOString());
+      const d = new Date(auditFilterState.until);
+      if (!Number.isNaN(d.getTime())) params.set("until", d.toISOString());
     } catch {}
   }
 
-  const logs = await client.get("/api/audit-logs?" + params.toString());
-  panel.innerHTML = `
-    <section class="card">
-      <div class="list-header">
-        <h2>Audit Logs</h2>
-      </div>
-      <p class="subtitle mb-4">Every mutating configuration change — destination groups, feeds, sync tasks, vault endpoints, and keys. Master keys only.</p>
-      <div class="filters mb-4">
-        <input type="text" id="audit-action-filter" class="input-field font-mono" list="audit-action-options" placeholder="Filter by action..." value="${escapeHtml(auditFilterState.action)}">
-        <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP..." value="${escapeHtml(auditFilterState.client_ip)}">
-        <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key..." value="${escapeHtml(auditFilterState.api_key)}">
-        <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)" value="${escapeHtml(auditFilterState.since)}">
-        <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)" value="${escapeHtml(auditFilterState.until)}">
-        <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search">🔍</button>
-        <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
-      </div>
-      <div class="table-container">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Timestamp</th>
-              <th>API Key</th>
-              <th>Client IP</th>
-              <th>Action</th>
-              <th>Target</th>
-              <th>Details</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${logs.length ? logs.map(auditRow).join("") : '<tr><td colspan="6" class="empty-state">No audit entries matching filter.</td></tr>'}
-          </tbody>
-        </table>
-      </div>
-      <div class="pagination">
-        <button id="audit-btn-prev" class="btn btn-icon" ${auditFilterState.page <= 1 ? "disabled" : ""}>&laquo; Prev</button>
-        <span id="audit-page-indicator">Page ${auditFilterState.page}</span>
-        <button id="audit-btn-next" class="btn btn-icon" ${logs.length < auditFilterState.limit ? "disabled" : ""}>Next &raquo;</button>
-      </div>
-    </section>`;
-
-  const actionFilter = document.getElementById("audit-action-filter");
-  const ipFilter = document.getElementById("audit-ip-filter");
-  const keyFilter = document.getElementById("audit-key-filter");
-  const sinceFilter = document.getElementById("audit-since-filter");
-  const untilFilter = document.getElementById("audit-until-filter");
-  const searchBtn = document.getElementById("audit-search-btn");
-  const clearBtn = document.getElementById("audit-clear-btn");
-  const prevBtn = document.getElementById("audit-btn-prev");
-  const pageIndicator = document.getElementById("audit-page-indicator");
-  const nextBtn = document.getElementById("audit-btn-next");
-
-  searchBtn.addEventListener("click", async () => {
-    auditFilterState.action = actionFilter.value.trim();
-    auditFilterState.client_ip = ipFilter.value.trim();
-    auditFilterState.api_key = keyFilter.value.trim();
-    auditFilterState.since = sinceFilter.value;
-    auditFilterState.until = untilFilter.value;
-    auditFilterState.page = 1;
-    await renderAuditLogs();
-  });
-
-  clearBtn.addEventListener("click", async () => {
-    auditFilterState = { action: "", client_ip: "", api_key: "", since: "", until: "", page: 1, limit: 50 };
-    await renderAuditLogs();
-  });
-
-  prevBtn.addEventListener("click", async () => {
-    if (auditFilterState.page > 1) {
-      auditFilterState.page--;
-      await renderAuditLogs();
+  try {
+    const logs = await client.get("/api/audit-logs?" + params.toString());
+    lastAuditLogCount = logs.length;
+    if (tbody) {
+      tbody.innerHTML = logs.length
+        ? logs.map(auditRow).join("")
+        : '<tr><td colspan="6" class="empty-state">No audit entries matching filter.</td></tr>';
     }
-  });
-
-  nextBtn.addEventListener("click", async () => {
-    if (logs.length >= auditFilterState.limit) {
-      auditFilterState.page++;
-      await renderAuditLogs();
+    const prevBtn = document.getElementById("audit-btn-prev");
+    const nextBtn = document.getElementById("audit-btn-next");
+    const pageIndicator = document.getElementById("audit-page-indicator");
+    if (prevBtn) prevBtn.disabled = auditFilterState.page <= 1;
+    if (nextBtn) nextBtn.disabled = logs.length < auditFilterState.limit;
+    if (pageIndicator) pageIndicator.textContent = `Page ${auditFilterState.page}`;
+  } catch (err) {
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="6" class="text-center text-danger">Failed to load audit logs: ${escapeHtml(err.message)}</td></tr>`;
     }
-  });
+  }
 }
 
 function auditRow(a) {
   const dateStr = a.timestamp ? new Date(a.timestamp).toLocaleString() : "—";
   return `<tr>
     <td class="font-mono text-sm">${escapeHtml(dateStr)}</td>
-    <td>${escapeHtml(a.api_key_name || "")} <span class="font-mono text-muted text-sm">(${escapeHtml(a.api_key_prefix || "")}...)</span></td>
+    <td><strong>${escapeHtml(a.api_key_name || "")}</strong> <span class="font-mono text-muted text-sm">(${escapeHtml(a.api_key_prefix || "")}...)</span></td>
     <td class="font-mono text-sm">${escapeHtml(a.client_ip || "")}</td>
     <td><span class="badge badge-scope">${escapeHtml(a.action)}</span></td>
-    <td class="text-sm">${escapeHtml(a.target_resource || "—")}</td>
-    <td class="text-muted text-sm">${escapeHtml(a.details || "—")}</td>
+    <td class="text-sm font-mono">${escapeHtml(a.target_resource || "—")}</td>
+    <td class="text-sm">${escapeHtml(a.details || "—")}</td>
   </tr>`;
 }
 

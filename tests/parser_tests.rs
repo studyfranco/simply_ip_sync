@@ -47,7 +47,7 @@ fn build_zip_fixture(member_name: &str, contents: &[u8]) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buf);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         writer.start_file(member_name, options).expect("start_file");
         writer.write_all(contents).expect("write member contents");

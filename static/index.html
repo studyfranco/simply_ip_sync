@@ -90,7 +90,45 @@
       <main id="tab-keys" class="tab-panel"></main>
       <main id="tab-sync-logs" class="tab-panel"></main>
       <main id="tab-settings" class="tab-panel"></main>
-      <main id="tab-audit-logs" class="tab-panel"></main>
+      <main id="tab-audit-logs" class="tab-panel">
+        <section class="card audit-section">
+          <div class="list-header">
+            <h2>Audit Logs</h2>
+          </div>
+          <p class="subtitle mb-4">Every mutating configuration change — destination groups, feeds, sync tasks, vault endpoints, and keys. Master keys only.</p>
+          <div class="filters mb-4">
+            <input type="text" id="audit-action-filter" class="input-field font-mono" list="audit-action-options" placeholder="Filter by action...">
+            <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
+            <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key (name or prefix)...">
+            <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
+            <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
+            <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
+            <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
+          </div>
+          <div class="table-container table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>API Key</th>
+                  <th>Client IP</th>
+                  <th>Action</th>
+                  <th>Target</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody id="audit-logs-table-body">
+                <tr><td colspan="6" class="text-center text-muted">Loading data...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <button id="audit-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
+            <span id="audit-page-indicator">Page 1</span>
+            <button id="audit-btn-next" class="btn btn-icon" disabled>Next &raquo;</button>
+          </div>
+        </section>
+      </main>
     </div>
 
   </div>
