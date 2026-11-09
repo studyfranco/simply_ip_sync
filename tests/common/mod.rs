@@ -207,8 +207,8 @@ pub fn canonicalize_address(raw: &str) -> String {
     if let Ok(ip) = IpAddr::from_str(trimmed) {
         return ip.to_string();
     }
-    if let Ok(net) = ipnetwork::IpNetwork::from_str(trimmed) {
-        return format!("{}/{}", net.network(), net.prefix());
+    if let Ok(net) = ipnet::IpNet::from_str(trimmed) {
+        return format!("{}/{}", net.network(), net.prefix_len());
     }
     trimmed.to_owned()
 }

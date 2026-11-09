@@ -42,13 +42,13 @@ pub trait FeedParser {
 /// is not a valid IP address or CIDR subnet.
 pub fn normalize_ip_or_cidr(input: &str) -> Option<String> {
     let trimmed = input.trim();
-    if let Ok(net) = trimmed.parse::<ipnetwork::IpNetwork>() {
-        let max_prefixlen = match net.ip() {
+    if let Ok(net) = trimmed.parse::<ipnet::IpNet>() {
+        let max_prefixlen = match net.addr() {
             std::net::IpAddr::V4(_) => 32,
             std::net::IpAddr::V6(_) => 128,
         };
-        return Some(if net.prefix() == max_prefixlen {
-            net.ip().to_string()
+        return Some(if net.prefix_len() == max_prefixlen {
+            net.addr().to_string()
         } else {
             net.to_string()
         });

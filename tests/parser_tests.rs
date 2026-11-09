@@ -121,7 +121,7 @@ fn spamhaus_drop_v6_json_fixture_parses_via_jsonl_mode_and_skips_the_metadata_fo
     assert_eq!(records.len(), cidrs.len(), "the metadata footer line must be skipped, not counted or erroring");
     for cidr in cidrs {
         assert!(records.contains(&cidr.to_owned()), "expected {cidr} in parsed output: {records:?}");
-        assert!(cidr.parse::<ipnetwork::IpNetwork>().is_ok(), "{cidr} must be a valid IPv6 CIDR");
+        assert!(cidr.parse::<ipnet::IpNet>().is_ok(), "{cidr} must be a valid IPv6 CIDR");
     }
 }
 
@@ -201,7 +201,7 @@ fn captive_portal_page_extracts_the_embedded_address_without_crashing() {
     // The line-oriented scanner has no concept of HTML syntax, so an IP-shaped substring inside a
     // URL or script tag is still picked up — documented behavior, not a bug: normalize_ip_or_cidr
     // re-validates every candidate, so this can never smuggle in something that isn't a real IP.
-    assert!(records.iter().all(|r| r.parse::<std::net::IpAddr>().is_ok() || r.parse::<ipnetwork::IpNetwork>().is_ok()));
+    assert!(records.iter().all(|r| r.parse::<std::net::IpAddr>().is_ok() || r.parse::<ipnet::IpNet>().is_ok()));
 }
 
 /// A large HTML body (well beyond a single packet/buffer's worth) must still parse in bounded

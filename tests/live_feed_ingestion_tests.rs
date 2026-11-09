@@ -31,7 +31,7 @@ async fn assert_feed_yields_valid_entries(url: &str) {
     assert!(!entries.is_empty(), "{url} yielded zero parsed entries — the feed format may have changed");
     for entry in &entries {
         assert!(
-            entry.address.parse::<ipnetwork::IpNetwork>().is_ok() || entry.address.parse::<std::net::IpAddr>().is_ok(),
+            entry.address.parse::<ipnet::IpNet>().is_ok() || entry.address.parse::<std::net::IpAddr>().is_ok(),
             "{url} yielded an entry that is not a valid IP/CIDR: '{}'",
             entry.address
         );

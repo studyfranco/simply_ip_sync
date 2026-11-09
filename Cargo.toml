@@ -8,7 +8,7 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
 sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
-ipnetwork = "0.21"
+ipnet = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip", "deflate", "brotli", "zstd"] }
 tokio-cron-scheduler = "0.15"
 tracing = "0.1"
@@ -28,7 +28,7 @@ log = "0.4"
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"] }
 regex = "1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-croner = "4"
+croner = "3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

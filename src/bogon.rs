@@ -3,7 +3,7 @@
 //! target vault.
 //!
 //! Modeled on `example/simply_ip_exporter`'s `src/ipfilter.rs` — same hand-rolled CIDR literal
-//! tables (not `std::net`'s or `ipnetwork`'s built-in `.is_private()`/`.is_loopback()` methods,
+//! tables (not `std::net`'s or `ipnet`'s built-in `.is_private()`/`.is_loopback()` methods,
 //! which classify individual addresses but don't cleanly express "does this CIDR *overlap* a
 //! reserved range" for a supplied subnet rather than a single IP), but applied at a different
 //! pipeline stage: `simply_ip_exporter` filters at serve-time, per output endpoint, with three
@@ -18,7 +18,7 @@
 
 use std::sync::LazyLock;
 
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 
 /// RFC 1918 private IPv4 ranges.
 const RFC1918_LITERALS: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
@@ -53,14 +53,14 @@ const BOGON_LITERALS: &[&str] = &[
     "ff00::/8",           // multicast (v6)
 ];
 
-fn parse_literals(literals: &[&str]) -> Vec<IpNetwork> {
+fn parse_literals(literals: &[&str]) -> Vec<IpNet> {
     literals
         .iter()
         .map(|s| s.parse().expect("static bogon literal is a valid CIDR"))
         .collect()
 }
 
-static RESERVED_RANGES: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| {
+static RESERVED_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
     let mut all = Vec::new();
     all.extend(parse_literals(RFC1918_LITERALS));
     all.extend(parse_literals(LOOPBACK_LITERALS));
@@ -69,19 +69,25 @@ static RESERVED_RANGES: LazyLock<Vec<IpNetwork>> = LazyLock::new(|| {
 });
 
 /// Two networks "overlap" for this purpose if either contains the other's base address, which
-/// `IpNetwork` doesn't expose as a single method — computed from `contains()` in both directions
+/// `IpNet` doesn't expose as a single method — computed from `contains()` in both directions
 /// so a `/8` reserved range correctly catches a more specific `/24` candidate, and vice versa (a
 /// candidate supernet that happens to swallow a reserved range is just as unbannable).
-fn overlaps(a: &IpNetwork, b: &IpNetwork) -> bool {
-    a.contains(b.ip()) || b.contains(a.ip())
+fn overlaps(a: &IpNet, b: &IpNet) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
 }
 
 /// Returns `true` if `candidate` overlaps any reserved (loopback/private/bogon) range at all —
 /// the address or CIDR is not safe to hand to a target vault as a real, bannable entry.
-pub fn is_bogon(candidate: &IpNetwork) -> bool {
+pub fn is_bogon(candidate: &IpNet) -> bool {
     RESERVED_RANGES
         .iter()
         .any(|reserved| overlaps(candidate, reserved))
+}
+
+fn parse_ip_or_net(s: &str) -> Option<IpNet> {
+    s.parse::<IpNet>()
+        .ok()
+        .or_else(|| s.parse::<std::net::IpAddr>().ok().map(IpNet::from))
 }
 
 /// Splits `records` into `(kept, removed_count)`: `kept` holds every entry that parses as a valid
@@ -89,13 +95,13 @@ pub fn is_bogon(candidate: &IpNetwork) -> bool {
 /// parse as an IP/CIDR at all — already-invalid data that has no business surviving this stage
 /// either) is dropped and counted. `records` are expected already-normalized (see
 /// `parsers::normalize_ip_or_cidr`), so the parse here is just re-establishing the typed
-/// `IpNetwork` needed for the overlap check, not re-validating shape.
+/// `IpNet` needed for the overlap check, not re-validating shape.
 pub fn sanitize(records: Vec<String>) -> (Vec<String>, usize) {
     let mut kept = Vec::with_capacity(records.len());
     let mut removed = 0usize;
     for record in records {
-        match record.parse::<IpNetwork>() {
-            Ok(net) if !is_bogon(&net) => kept.push(record),
+        match parse_ip_or_net(&record) {
+            Some(net) if !is_bogon(&net) => kept.push(record),
             _ => removed += 1,
         }
     }

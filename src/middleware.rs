@@ -12,7 +12,7 @@ use axum::extract::{ConnectInfo, OriginalUri, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use chrono::Utc;
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
 
@@ -177,14 +177,19 @@ pub async fn auth_middleware(
     // valid-looking key must not be able to distinguish "wrong key" from "right key, wrong IP" by
     // status code alone.
     let bound_ips_raw = key_record.bound_ips.as_deref().unwrap_or("");
-    let networks: Vec<IpNetwork> = bound_ips_raw
+    let networks: Vec<IpNet> = bound_ips_raw
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse())
+        .map(|s| {
+            s.parse::<IpNet>().or_else(|_| {
+                s.parse::<IpAddr>()
+                    .map(|ip| IpNet::from(crate::config::normalize_ip(ip)))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| AppError::Internal)?;
-    if !networks.is_empty() && !networks.iter().any(|net| net.contains(client_ip)) {
+    if !networks.is_empty() && !networks.iter().any(|net| net.contains(&client_ip)) {
         return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }
 
