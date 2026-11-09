@@ -32,6 +32,8 @@ for marker in Cargo.toml AGENT.MD SCHEMA.MD src/main.rs scripts/test_e2e.sh; do
     fi
 done
 PROJECT_ROOT="$PWD"
+# Ensure local cargo-installed binaries (e.g. cargo-audit in ~/.cargo/bin) are on PATH
+export PATH="$HOME/.cargo/bin:$PATH"
 
 # ── Output helpers ───────────────────────────────────────────────────────────
 PASS_COUNT=0
@@ -78,6 +80,15 @@ for tool in cargo curl openssl jq; do
         exit 1
     fi
 done
+if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
+    log "cargo-audit not found on PATH; attempting to install via 'cargo install cargo-audit'..."
+    if ! cargo install cargo-audit; then
+        err "cargo-audit is required for dependency security audits but is missing and could not be installed."
+        exit 1
+    fi
+fi
+log "Found cargo-audit: $(command -v cargo-audit 2>/dev/null || echo "cargo audit subcommand")"
+
 PYTHON3_AVAILABLE=0
 if command -v python3 >/dev/null 2>&1; then
     PYTHON3_AVAILABLE=1
@@ -91,6 +102,30 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/simply_ip_sync_e2e.XXXXXX")"
 DB_PATH="$WORK_DIR/e2e.db"
 SERVER_LOG="$WORK_DIR/server.log"
 RESP_BODY_FILE="$WORK_DIR/resp_body"
+
+# ── Dependencies & Security Audit ─────────────────────────────────────────────
+log_section "Dependencies & Security Audit"
+
+log "Running cargo update in $PROJECT_ROOT ..."
+if ! (cd "$PROJECT_ROOT" && cargo update >"$WORK_DIR/cargo_update.log" 2>&1); then
+    err "cargo update failed:"
+    cat "$WORK_DIR/cargo_update.log" >&2
+    rm -rf "$WORK_DIR"
+    exit 1
+fi
+log "cargo update succeeded."
+
+log "Running cargo audit in $PROJECT_ROOT ..."
+# RUSTSEC-2026-0459: upstream unpatched SQLite CVE in libsqlite3-sys 0.37.0 transitively pinned by
+# sqlx-sqlite 0.9.0 (which restricts libsqlite3-sys <0.38.0). Ignored until sqlx publishes a patch release.
+AUDIT_ARGS=(${CARGO_AUDIT_ARGS:---ignore RUSTSEC-2026-0459})
+if ! (cd "$PROJECT_ROOT" && cargo audit "${AUDIT_ARGS[@]}" >"$WORK_DIR/cargo_audit.log" 2>&1); then
+    err "cargo audit detected vulnerabilities or failed:"
+    cat "$WORK_DIR/cargo_audit.log" >&2
+    rm -rf "$WORK_DIR"
+    exit 1
+fi
+log "cargo audit passed cleanly."
 
 log_section "Build"
 log "Running cargo build in $PROJECT_ROOT ..."
