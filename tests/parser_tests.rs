@@ -285,3 +285,45 @@ fn jsonl_feed_with_one_non_utf8_line_still_extracts_the_well_formed_lines() {
     let records = addrs(parser.parse(&body, Some(config)).expect("must not error on one bad line"));
     assert_eq!(records, vec!["2001:678:254::/48".to_owned(), "2001:678:6c0::/48".to_owned()]);
 }
+
+#[test]
+fn regex_line_parser_handles_trailing_inline_comments_and_spaces() {
+    let body = b"
+# Top level feed comments
+198.51.100.1    # Malicious scanner
+203.0.113.0/24  ; Honeypot subnet
+2001:db8::cafe/128 // IPv6 probe
+";
+    let parser = parsers::for_type("REGEX_LINE").expect("REGEX_LINE parser");
+    let records = addrs(parser.parse(body, None).expect("parse regex line with comments"));
+    assert_eq!(
+        records,
+        vec![
+            "198.51.100.1".to_owned(),
+            "203.0.113.0/24".to_owned(),
+            "2001:db8::cafe".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn json_path_parser_extracts_from_deeply_nested_structures_with_mixed_v4_and_v6() {
+    let body = br#"{
+        "data": {
+            "threats": [
+                {"network": {"cidr": "198.51.100.0/24", "severity": "high"}},
+                {"network": {"cidr": "2001:db8:a::/48", "severity": "critical"}}
+            ]
+        }
+    }"#;
+    let parser = parsers::for_type("JSON_PATH").expect("JSON_PATH parser");
+    let config = r#"{"array_path":"data.threats","target_address":"$.network.cidr"}"#;
+    let records = addrs(parser.parse(body, Some(config)).expect("parse nested JSON"));
+    assert_eq!(
+        records,
+        vec![
+            "198.51.100.0/24".to_owned(),
+            "2001:db8:a::/48".to_owned(),
+        ]
+    );
+}

@@ -176,4 +176,51 @@ mod tests {
         assert_eq!(kept, vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()]);
         assert_eq!(removed, 3);
     }
+
+    #[test]
+    fn parse_ip_or_net_accepts_bare_and_cidr_formats() {
+        assert_eq!(
+            parse_ip_or_net("8.8.8.8"),
+            Some("8.8.8.8/32".parse::<IpNet>().unwrap())
+        );
+        assert_eq!(
+            parse_ip_or_net("10.0.0.0/8"),
+            Some("10.0.0.0/8".parse::<IpNet>().unwrap())
+        );
+        assert_eq!(
+            parse_ip_or_net("::1"),
+            Some("::1/128".parse::<IpNet>().unwrap())
+        );
+        assert_eq!(
+            parse_ip_or_net("2001:db8::/32"),
+            Some("2001:db8::/32".parse::<IpNet>().unwrap())
+        );
+        assert!(parse_ip_or_net("invalid-ip").is_none());
+    }
+
+    #[test]
+    fn all_special_purpose_bogon_categories_are_filtered() {
+        // CGN (RFC 6598)
+        assert!(is_bogon(&"100.64.1.2/32".parse().unwrap()));
+        assert!(is_bogon(&"100.64.0.0/10".parse().unwrap()));
+
+        // Multicast
+        assert!(is_bogon(&"224.0.0.1/32".parse().unwrap()));
+        assert!(is_bogon(&"239.255.255.250/32".parse().unwrap()));
+        assert!(is_bogon(&"ff02::1/128".parse().unwrap()));
+
+        // Benchmark / Test
+        assert!(is_bogon(&"198.18.1.1/32".parse().unwrap()));
+        assert!(is_bogon(&"198.18.0.0/15".parse().unwrap()));
+
+        // Reserved / Future Use
+        assert!(is_bogon(&"240.0.0.1/32".parse().unwrap()));
+        assert!(is_bogon(&"255.255.255.255/32".parse().unwrap()));
+
+        // IPv6 ULA & Link-Local & Discard
+        assert!(is_bogon(&"fc00::1/128".parse().unwrap()));
+        assert!(is_bogon(&"fd12:3456:789a::1/128".parse().unwrap()));
+        assert!(is_bogon(&"fe80::1/128".parse().unwrap()));
+        assert!(is_bogon(&"100::1/128".parse().unwrap()));
+    }
 }

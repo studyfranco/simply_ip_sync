@@ -69,3 +69,33 @@ pub fn for_type(parser_type: &str) -> Result<Box<dyn FeedParser + Send + Sync>, 
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_ip_or_cidr_strips_host_prefix_and_keeps_subnets() {
+        // IPv4
+        assert_eq!(normalize_ip_or_cidr("192.168.1.1/32"), Some("192.168.1.1".to_owned()));
+        assert_eq!(normalize_ip_or_cidr("192.168.1.1"), Some("192.168.1.1".to_owned()));
+        assert_eq!(normalize_ip_or_cidr("10.0.0.0/24"), Some("10.0.0.0/24".to_owned()));
+
+        // IPv6
+        assert_eq!(normalize_ip_or_cidr("2001:db8::1/128"), Some("2001:db8::1".to_owned()));
+        assert_eq!(normalize_ip_or_cidr("2001:db8::1"), Some("2001:db8::1".to_owned()));
+        assert_eq!(normalize_ip_or_cidr("2001:db8::/64"), Some("2001:db8::/64".to_owned()));
+
+        // Whitespace handling & invalid
+        assert_eq!(normalize_ip_or_cidr("  8.8.8.8  "), Some("8.8.8.8".to_owned()));
+        assert_eq!(normalize_ip_or_cidr("not-an-ip"), None);
+        assert_eq!(normalize_ip_or_cidr(""), None);
+    }
+
+    #[test]
+    fn for_type_resolves_known_parsers_and_rejects_unknown() {
+        assert!(for_type("REGEX_LINE").is_ok());
+        assert!(for_type("JSON_PATH").is_ok());
+        assert!(for_type("UNKNOWN").is_err());
+    }
+}
