@@ -1239,16 +1239,23 @@ function showKeyForm(existing) {
   const slot = document.getElementById("key-form-slot");
   const isEditingMaster = Boolean(existing?.is_master);
   slot.innerHTML = `
-    <form class="form-grid" id="key-form">
-      <label class="form-group"><span>Name</span><input class="input-field" name="name" ${isEditingMaster ? "disabled" : "required"} value="${escapeHtml(existing?.name || "")}"></label>
-      <label class="form-group"><span>Bound IPs (CIDR, comma-separated)</span><input class="input-field" name="bound_ips" placeholder="0.0.0.0/0,::/0" value="${escapeHtml(existing?.bound_ips || "")}"></label>
+    <form class="card" id="key-form" style="margin-bottom:1rem;background:var(--bg-input);">
+      <h3>${existing ? `Edit Key: ${escapeHtml(existing.name)}` : "Create New Sub-Key"}</h3>
+      <div class="form-grid" style="margin-top:0.75rem;">
+        <label class="form-group"><span>Name</span><input class="input-field" name="name" ${isEditingMaster ? "disabled" : "required"} value="${escapeHtml(existing?.name || "")}"></label>
+        <label class="form-group"><span>Bound IPs (CIDR, comma-separated)</span><input class="input-field" name="bound_ips" placeholder="0.0.0.0/0,::/0" value="${escapeHtml(existing?.bound_ips || "")}"></label>
+      </div>
       ${me.is_master && !isEditingMaster ? `
-      <label class="checkbox-container"><input type="checkbox" name="can_manage_keys" ${existing?.can_manage_keys ? "checked" : ""}><span>can_manage_keys</span></label>
-      <label class="checkbox-container"><input type="checkbox" name="can_manage_sources" ${existing?.can_manage_sources ? "checked" : ""}><span>can_manage_sources</span></label>
-      <label class="checkbox-container"><input type="checkbox" name="can_manage_vaults" ${existing?.can_manage_vaults ? "checked" : ""}><span>can_manage_vaults</span></label>
-      ` : ""}
-      <div class="form-actions">
-        <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create"}</button>
+      <div class="permissions-grid mt-2 mb-4">
+        <label class="checkbox-container"><input type="checkbox" name="can_manage_keys" ${existing?.can_manage_keys ? "checked" : ""}><span>can_manage_keys</span></label>
+        <label class="checkbox-container"><input type="checkbox" name="can_manage_sources" ${existing?.can_manage_sources ? "checked" : ""}><span>can_manage_sources</span></label>
+        <label class="checkbox-container"><input type="checkbox" name="can_manage_vaults" ${existing?.can_manage_vaults ? "checked" : ""}><span>can_manage_vaults</span></label>
+      </div>
+      ` : !isEditingMaster ? `
+      <p class="text-muted text-sm mt-2 mb-4">Only the Master key may grant global scopes (R4). Keys you create are Daughter keys.</p>
+      ` : `<p class="text-muted text-sm mt-2 mb-4">Master key permissions are immutable; only <code>bound_ips</code> may be updated.</p>`}
+      <div class="form-actions mt-4">
+        <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create Key"}</button>
         <button type="button" class="btn btn-cancel" id="key-form-cancel">Cancel</button>
       </div>
     </form>`;

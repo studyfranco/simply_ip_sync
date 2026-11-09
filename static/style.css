@@ -892,3 +892,29 @@ textarea.input-field {
 .pagination .btn-icon {
     min-width: 2.25rem;
 }
+
+/* ─── Filters & Audit Presentation ──────────────────────── */
+.filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.filters .input-field {
+    width: auto;
+    flex: 1 1 150px;
+    min-width: 0;
+}
+
+/* ─── RBAC Permissions Grid ─────────────────────────────── */
+.permissions-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
