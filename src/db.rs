@@ -25,14 +25,18 @@ pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 /// rather than being issued once as raw statements and forgotten). Other backends fall through to
 /// a plain `Database::connect`.
 pub async fn connect(database_url: &str) -> Result<DatabaseConnection, DbErr> {
-    if let Some(sqlite_url) = database_url.strip_prefix("sqlite://") {
-        let connect_options = SqliteConnectOptions::from_str(&format!("sqlite://{sqlite_url}"))
+    if database_url.starts_with("sqlite:") {
+        let connect_options = SqliteConnectOptions::from_str(database_url)
             .map_err(|e| DbErr::Custom(format!("invalid DATABASE_URL: {e}")))?
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS));
+            .busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+            .pragma("temp_store", "MEMORY")
+            .pragma("mmap_size", "268435456")
+            .pragma("cache_size", "-64000")
+            .pragma("analysis_limit", "1000");
         let pool = SqlitePoolOptions::new()
             .max_connections(SQLITE_MAX_CONNECTIONS)
             .connect_with(connect_options)
@@ -54,6 +58,10 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) {
         "PRAGMA foreign_keys = ON",
         "PRAGMA synchronous = NORMAL",
         &format!("PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"),
+        "PRAGMA temp_store = MEMORY",
+        "PRAGMA mmap_size = 268435456",
+        "PRAGMA cache_size = -64000",
+        "PRAGMA analysis_limit = 1000",
     ];
     for stmt in statements {
         if let Err(e) = db
@@ -81,6 +89,27 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) {
         Ok(None) => {}
         Err(e) => tracing::warn!("failed to read back journal_mode: {e}"),
     }
+}
+
+/// Runs SQLite query planner statistics optimization (`PRAGMA optimize;`) to ensure the query
+/// planner has optimal index selection statistics for query execution.
+pub async fn run_sqlite_optimize(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+
+    tracing::info!("Running SQLite query planner optimization (PRAGMA optimize)...");
+    if let Err(e) = db
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA optimize;".to_owned(),
+        ))
+        .await
+    {
+        tracing::warn!("Could not run PRAGMA optimize: {e}");
+    }
+
+    Ok(())
 }
 
 /// Runs all pending migrations.

@@ -30,6 +30,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let db = simply_ip_sync::db::connect(&database_url).await?;
     simply_ip_sync::db::apply_sqlite_pragmas(&db).await;
     simply_ip_sync::db::run_migrations(&db).await?;
+    simply_ip_sync::db::run_sqlite_optimize(&db).await?;
 
     bootstrap_master_key(&db).await?;
     verify_encryption_key(&db).await?;
