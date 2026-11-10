@@ -172,13 +172,60 @@ pub async fn list_vault_sync_tasks(
     axum::Extension(caller): axum::Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
     let all = vault_sync_task::Entity::find().all(&state.db).await?;
-    let mut visible = Vec::new();
-    for task in all {
-        if visible_to(&state, &caller, &task).await? {
-            let targets = load_targets(&state.db, task.id).await?;
-            visible.push(to_response(task, targets));
-        }
+    if all.is_empty() {
+        return Ok(Json(Vec::new()));
     }
+
+    let visible_tasks: Vec<_> = if caller.is_master {
+        all
+    } else {
+        let permitted_ids: std::collections::HashSet<Uuid> =
+            crate::entities::api_key_sync_permission::Entity::find()
+                .filter(crate::entities::api_key_sync_permission::Column::ApiKeyId.eq(caller.id))
+                .filter(
+                    crate::entities::api_key_sync_permission::Column::ResourceType
+                        .eq(RESOURCE_SYNC_TASK),
+                )
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|p| p.resource_id)
+                .collect();
+        all.into_iter()
+            .filter(|t| t.owner_key_id == Some(caller.id) || permitted_ids.contains(&t.id))
+            .collect()
+    };
+
+    if visible_tasks.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let task_ids: Vec<Uuid> = visible_tasks.iter().map(|t| t.id).collect();
+
+    let all_targets = vault_sync_task_target::Entity::find()
+        .filter(vault_sync_task_target::Column::VaultSyncTaskId.is_in(task_ids))
+        .all(&state.db)
+        .await?;
+    let mut targets_by_task: std::collections::HashMap<Uuid, Vec<TargetSpec>> =
+        std::collections::HashMap::new();
+    for r in all_targets {
+        targets_by_task
+            .entry(r.vault_sync_task_id)
+            .or_default()
+            .push(TargetSpec {
+                vault_endpoint_id: r.target_vault_id,
+                target_group_name: r.target_group_name,
+            });
+    }
+
+    let visible = visible_tasks
+        .into_iter()
+        .map(|task| {
+            let targets = targets_by_task.remove(&task.id).unwrap_or_default();
+            to_response(task, targets)
+        })
+        .collect();
+
     Ok(Json(visible))
 }
 

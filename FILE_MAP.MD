@@ -397,6 +397,14 @@ create-copy-drop-rename; Postgres/MySQL: direct `ADD`/`DROP COLUMN`), and drops 
 `external_source_vault_targets`. `m20260928_034145_vault_sync_task_bogon_filtering` — a plain
 `ADD COLUMN skip_bogon_filtering BOOLEAN NOT NULL DEFAULT false` on `vault_sync_tasks`.
 
+`m20261109_000001_add_performance_indexes` — adds composite and foreign-key indexes for audit logs,
+sync logs, and FK lookups (`destination_group_id`, `source_vault_id`, `target_vault_id`, `vault_endpoint_id`).
+
+`m20261110_000001_add_scheduling_and_lookup_indexes` — adds indexes on `is_active` for fast scheduler
+boot/polling on `destination_groups` and `vault_sync_tasks`, temporal indexes (`last_run_at`, `last_sync_at`,
+`created_at`), execution status/type indexes on `sync_logs`, polymorphic resource permission lookups on
+`api_key_sync_permissions(resource_type, resource_id)`, and `api_keys(is_master)`.
+
 ## `tests/` — what each suite owns
 
 | File | Owns |

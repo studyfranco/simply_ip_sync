@@ -242,7 +242,16 @@ Security audit trail tracking mutating operations across `simply_ip_sync`.
 1. `api_keys.prefix`: Fast header matching.
 2. `api_keys.key_hash`: Fast key lookup.
 3. `destination_groups.name` & `external_sources.name` & `vault_sync_tasks.name`: Unique names.
-4. `sync_logs (job_type, job_id)`: Quick task history filtering.
-5. `sync_logs.timestamp`: Temporal log retention queries.
-6. `audit_logs (action, timestamp)`: Audit trail queries.
-7. `destination_groups.owner_key_id` & `vault_endpoints.owner_key_id` & `vault_sync_tasks.owner_key_id`: RBAC §6 pre-flight ownership inventory queries.
+4. `sync_logs (job_type, job_id)` & `sync_logs (job_type, job_id, timestamp DESC)`: Quick task history filtering.
+5. `sync_logs.timestamp` & `sync_logs (timestamp DESC)`: Temporal log retention and newest-first queries.
+6. `sync_logs (status, timestamp DESC)` & `sync_logs (job_type, timestamp DESC)`: Fast log status/type queries.
+7. `audit_logs (action, timestamp)` & `audit_logs (timestamp DESC)`: Audit trail queries.
+8. `destination_groups.owner_key_id` & `vault_endpoints.owner_key_id` & `vault_sync_tasks.owner_key_id`: RBAC §6 pre-flight ownership inventory queries.
+9. `external_sources.destination_group_id`: Child feed foreign key lookup.
+10. `destination_group_vault_targets.vault_endpoint_id`: Target vault foreign key lookup.
+11. `vault_sync_tasks.source_vault_id`: Source vault foreign key lookup.
+12. `vault_sync_task_targets.target_vault_id`: Target vault foreign key lookup.
+13. `destination_groups.is_active` & `vault_sync_tasks.is_active`: Fast scheduler boot and polling.
+14. `destination_groups.last_run_at` & `vault_sync_tasks.last_sync_at`: High-water mark queries.
+15. `api_key_sync_permissions (resource_type, resource_id)`: Resource permission checks.
+16. `api_keys.is_master`: Fast master key lookup.

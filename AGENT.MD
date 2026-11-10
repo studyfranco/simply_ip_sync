@@ -106,6 +106,7 @@ directory that contains a `.git` — see that script for the graceful offline-mo
   - Zero compiler warnings, zero `clippy` warnings.
   - **Zero `.unwrap()` or `.expect()`** in production or HTTP handlers. Use structured `AppError` and Axum's `IntoResponse`.
   - **Mandatory `rustdoc`**: Document all public items with `///`. Enforce `#![warn(missing_docs)]` in `lib.rs`.
+  - **Dependency Updates & Security Audits**: All external libraries/Cargo dependencies must always be kept at their latest compatible versions (`cargo update`, latest semver). `scripts/test_e2e.sh` and GitHub CI workflows strictly enforce `cargo update` and `cargo audit` before building, testing, or publishing.
 
 ---
 
@@ -349,6 +350,11 @@ change and audited whenever a new migration is added:
 - **`./scripts/test_e2e.sh`** is a mandatory quality gate alongside `cargo check`/`clippy`/`test`.
   It boots the real compiled binary (not the in-process router) against an isolated temp database
   and port, drives it with hand-signed `curl` requests, and is the only gate that proves actual
-  multi-vault delivery over a real socket and a clean process shutdown on `SIGTERM`.
+  multi-vault delivery over a real socket and a clean process shutdown on `SIGTERM`. It enforces
+  `cargo update` and `cargo audit` with error logging prior to building.
+- **CI/CD Enforcement**: Automated testing is a mandatory prerequisite for deployments. In GitHub
+  Actions, all `push` and `pull_request` events to `master` execute `cargo test --workspace --verbose`
+  via `.github/workflows/ci.yml`, and `.github/workflows/docker-publish.yml` requires the `test`
+  job to succeed (`needs: test`) before container images can be built or published.
 
 *End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*

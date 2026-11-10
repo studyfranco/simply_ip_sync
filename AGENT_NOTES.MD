@@ -2580,3 +2580,31 @@ project name elsewhere on the machine.
   match verified both by count and by full address-list diff), incremental 10-record delta,
   tombstone propagation, and the case-mismatch diagnostic fix — all confirmed working as described
   above, against the real compiled binaries over real sockets, not mocks.
+
+---
+
+## Session 25 (2026-11-10): DB Query & Index Optimization, CI Test Gate, E2E Cargo Audit & AGENT.MD Directives
+
+### 1. Database Query Optimization & Missing Indexes
+- Authoring migration `m20261110_000001_add_scheduling_and_lookup_indexes.rs`:
+  - `idx_destination_groups_is_active`, `idx_destination_groups_last_run_at`, `idx_destination_groups_created_at`
+  - `idx_vault_sync_tasks_is_active`, `idx_vault_sync_tasks_last_sync_at`, `idx_vault_sync_tasks_created_at`
+  - `idx_sync_logs_status_timestamp`, `idx_sync_logs_job_type_timestamp`
+  - `idx_api_key_sync_permissions_resource` (`(resource_type, resource_id)`)
+  - `idx_api_keys_is_master`, `idx_api_keys_created_at`
+  - `idx_vault_endpoints_created_at`, `idx_external_sources_created_at`
+- Eliminated N+1 query patterns:
+  - `src/api/sources.rs` (`list_destination_groups`): batched permission lookups for non-master keys into a single `HashSet`, and batched fetching of junction table `destination_group_vault_target` and child feeds `external_source` using `is_in(group_ids)` into hash maps, reducing (3N+1) queries to 3 O(1) queries.
+  - `src/api/sync_tasks.rs` (`list_vault_sync_tasks`): batched permission lookups and batched fetching of `vault_sync_task_target` via `is_in(task_ids)`, reducing (2N+1) queries to 3 queries.
+  - `src/api/vaults.rs` (`list_vault_endpoints`): batched caller permission checks into a single query.
+  - `src/api/sync_logs.rs` (`list_sync_logs`): batched caller permission filtering into a single pre-fetch query and added support for filtering by outcome `status`.
+- Updated `SCHEMA.MD` and `API_REFERENCE.md` to reflect all mandatory indexes and query parameters.
+
+### 2. CI/CD Workflows
+- Updated `.github/workflows/docker-publish.yml` to introduce a `test` job executing `cargo test --workspace --verbose` and made the deployment `build` job depend on it via `needs: test`.
+- Created `.github/workflows/ci.yml` triggering on `push` and `pull_request` to `master` to run `cargo test --workspace --verbose`.
+
+### 3. E2E Tests & AGENT.MD Directives
+- Verified `scripts/test_e2e.sh` performs automated `cargo update` and `cargo audit --ignore RUSTSEC-2026-0459` with error logging prior to build and execution. Verified full test suite execution passes 100% (231/231 passed).
+- Updated `AGENT.MD` with explicit rules requiring all dependencies to be maintained at latest compatible semver versions, enforced by CI and `scripts/test_e2e.sh`.
+

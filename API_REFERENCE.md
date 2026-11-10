@@ -402,6 +402,7 @@ Resource model: `sync_logs` (read-only). Handler: `src/api/sync_logs.rs::list_sy
 | :--- | :--- | :--- | :--- | :--- |
 | `job_type` | string | no | none (no filter) | `"EXTERNAL_FEED"` or `"VAULT_SYNC"` |
 | `job_id` | UUID | no | none (no filter) | The specific `external_sources`/`vault_sync_tasks` id |
+| `status` | string | no | none (no filter) | Filter by outcome: `"SUCCESS"`, `"FAILED"`, or `"PARTIAL"` |
 | `limit` | integer | no | `100` | Clamped to a maximum of `1000` regardless of the value requested |
 | `offset` | integer | no | `0` | |
 

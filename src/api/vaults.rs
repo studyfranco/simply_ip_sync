@@ -6,7 +6,7 @@ use crate::extract::StrictPath;
 use axum::Json;
 use axum::response::IntoResponse;
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -99,17 +99,31 @@ pub async fn list_vault_endpoints(
     axum::Extension(caller): axum::Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
     let all = vault_endpoint::Entity::find().all(&state.db).await?;
-    let mut visible = Vec::new();
-    for endpoint in all {
-        if caller.is_master
-            || endpoint.owner_key_id == Some(caller.id)
-            || find_permission(&state.db, caller.id, RESOURCE_VAULT_ENDPOINT, endpoint.id)
-                .await?
-                .is_some()
-        {
-            visible.push(VaultEndpointResponse::from(endpoint));
-        }
+    if all.is_empty() {
+        return Ok(Json(Vec::new()));
     }
+
+    let visible: Vec<_> = if caller.is_master {
+        all.into_iter().map(VaultEndpointResponse::from).collect()
+    } else {
+        let permitted_ids: std::collections::HashSet<Uuid> =
+            crate::entities::api_key_sync_permission::Entity::find()
+                .filter(crate::entities::api_key_sync_permission::Column::ApiKeyId.eq(caller.id))
+                .filter(
+                    crate::entities::api_key_sync_permission::Column::ResourceType
+                        .eq(RESOURCE_VAULT_ENDPOINT),
+                )
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|p| p.resource_id)
+                .collect();
+        all.into_iter()
+            .filter(|e| e.owner_key_id == Some(caller.id) || permitted_ids.contains(&e.id))
+            .map(VaultEndpointResponse::from)
+            .collect()
+    };
+
     Ok(Json(visible))
 }
 

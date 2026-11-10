@@ -10,7 +10,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::guard_can_view_logs;
-use super::support::{RESOURCE_DESTINATION_GROUP, RESOURCE_SYNC_TASK, find_permission};
+use super::support::{RESOURCE_DESTINATION_GROUP, RESOURCE_SYNC_TASK};
 use crate::entities::{api_key, sync_log};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -22,6 +22,8 @@ pub struct SyncLogQuery {
     pub job_type: Option<String>,
     /// Filter by the id of a specific external source or sync task.
     pub job_id: Option<Uuid>,
+    /// Filter by job outcome: `"SUCCESS"`, `"FAILED"`, or `"PARTIAL"`.
+    pub status: Option<String>,
     /// Maximum rows to return. Defaults to 100.
     pub limit: Option<u64>,
     /// Row offset for pagination. Defaults to 0.
@@ -49,6 +51,9 @@ pub async fn list_sync_logs(
     if let Some(job_id) = query.job_id {
         find = find.filter(sync_log::Column::JobId.eq(job_id));
     }
+    if let Some(status) = &query.status {
+        find = find.filter(sync_log::Column::Status.eq(status.clone()));
+    }
     let rows = find
         .order_by_desc(sync_log::Column::Timestamp)
         .limit(query.limit.unwrap_or(100).min(1000))
@@ -60,15 +65,25 @@ pub async fn list_sync_logs(
         return Ok(Json(rows));
     }
 
-    let mut visible = Vec::new();
-    for row in rows {
-        let Some(resource_type) = resource_type_for(&row.job_type) else {
-            continue;
-        };
-        let permission = find_permission(&state.db, caller.id, resource_type, row.job_id).await?;
-        if guard_can_view_logs(&caller, permission.as_ref()) {
-            visible.push(row);
-        }
-    }
+    let permissions = crate::entities::api_key_sync_permission::Entity::find()
+        .filter(crate::entities::api_key_sync_permission::Column::ApiKeyId.eq(caller.id))
+        .all(&state.db)
+        .await?;
+    let allowed: std::collections::HashSet<(String, Uuid)> = permissions
+        .iter()
+        .filter(|p| guard_can_view_logs(&caller, Some(p)))
+        .map(|p| (p.resource_type.clone(), p.resource_id))
+        .collect();
+
+    let visible: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            let Some(resource_type) = resource_type_for(&row.job_type) else {
+                return false;
+            };
+            allowed.contains(&(resource_type.to_owned(), row.job_id))
+        })
+        .collect();
+
     Ok(Json(visible))
 }

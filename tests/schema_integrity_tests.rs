@@ -38,6 +38,33 @@ async fn master_marker_index_exists_after_migration() {
     assert!(present, "master_marker unique index must exist after migration");
 }
 
+#[tokio::test]
+async fn performance_and_lookup_indexes_exist_after_migration() {
+    let db = in_memory_db().await;
+    let expected_indexes = [
+        ("destination_groups", "idx_destination_groups_is_active"),
+        ("destination_groups", "idx_destination_groups_last_run_at"),
+        ("destination_groups", "idx_destination_groups_created_at"),
+        ("vault_sync_tasks", "idx_vault_sync_tasks_is_active"),
+        ("vault_sync_tasks", "idx_vault_sync_tasks_last_sync_at"),
+        ("vault_sync_tasks", "idx_vault_sync_tasks_created_at"),
+        ("sync_logs", "idx_sync_logs_status_timestamp"),
+        ("sync_logs", "idx_sync_logs_job_type_timestamp"),
+        ("api_key_sync_permissions", "idx_api_key_sync_permissions_resource"),
+        ("api_keys", "idx_api_keys_is_master"),
+        ("api_keys", "idx_api_keys_created_at"),
+        ("vault_endpoints", "idx_vault_endpoints_created_at"),
+        ("external_sources", "idx_external_sources_created_at"),
+    ];
+
+    for (table, index) in expected_indexes {
+        let present = db::has_index(&db, table, index)
+            .await
+            .unwrap_or_else(|e| panic!("failed checking index {index} on {table}: {e}"));
+        assert!(present, "index {index} on table {table} must exist after migrations");
+    }
+}
+
 // The adversarial raw-SQL proof that a second `is_master=true` row is rejected by the generated
 // `master_marker` column lives in `tests/rbac_model_compliance.rs::s5_adversarial_second_master_rejected_by_generated_column`
 // — RBAC §5's guarantees, adversarial or not, are indexed there so a missing one shows up as a

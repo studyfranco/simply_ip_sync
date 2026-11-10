@@ -11,6 +11,7 @@ mod m20260818_010217_audit_attribution_not_null;
 mod m20260928_033617_destination_groups;
 mod m20260928_034145_vault_sync_task_bogon_filtering;
 mod m20261109_000001_add_performance_indexes;
+mod m20261110_000001_add_scheduling_and_lookup_indexes;
 
 /// The ordered set of migrations applied at startup.
 pub struct Migrator;
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260928_033617_destination_groups::Migration),
             Box::new(m20260928_034145_vault_sync_task_bogon_filtering::Migration),
             Box::new(m20261109_000001_add_performance_indexes::Migration),
+            Box::new(m20261110_000001_add_scheduling_and_lookup_indexes::Migration),
         ]
     }
 }

@@ -252,14 +252,74 @@ pub async fn list_destination_groups(
     axum::Extension(caller): axum::Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
     let all = destination_group::Entity::find().all(&state.db).await?;
-    let mut visible = Vec::new();
-    for group in all {
-        if group_visible_to(&state, &caller, &group).await? {
-            let targets = load_targets(&state.db, group.id).await?;
-            let feeds = load_feeds(&state.db, group.id).await?;
-            visible.push(to_group_response(group, targets, feeds));
-        }
+    if all.is_empty() {
+        return Ok(Json(Vec::new()));
     }
+
+    let visible_groups: Vec<_> = if caller.is_master {
+        all
+    } else {
+        let permitted_ids: std::collections::HashSet<Uuid> =
+            crate::entities::api_key_sync_permission::Entity::find()
+                .filter(crate::entities::api_key_sync_permission::Column::ApiKeyId.eq(caller.id))
+                .filter(
+                    crate::entities::api_key_sync_permission::Column::ResourceType
+                        .eq(RESOURCE_DESTINATION_GROUP),
+                )
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|p| p.resource_id)
+                .collect();
+        all.into_iter()
+            .filter(|g| g.owner_key_id == Some(caller.id) || permitted_ids.contains(&g.id))
+            .collect()
+    };
+
+    if visible_groups.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let group_ids: Vec<Uuid> = visible_groups.iter().map(|g| g.id).collect();
+
+    let all_targets = destination_group_vault_target::Entity::find()
+        .filter(destination_group_vault_target::Column::DestinationGroupId.is_in(group_ids.clone()))
+        .all(&state.db)
+        .await?;
+    let mut targets_by_group: std::collections::HashMap<Uuid, Vec<TargetSpec>> =
+        std::collections::HashMap::new();
+    for r in all_targets {
+        targets_by_group
+            .entry(r.destination_group_id)
+            .or_default()
+            .push(TargetSpec {
+                vault_endpoint_id: r.vault_endpoint_id,
+                target_group_name: r.target_group_name,
+            });
+    }
+
+    let all_feeds = external_source::Entity::find()
+        .filter(external_source::Column::DestinationGroupId.is_in(group_ids))
+        .all(&state.db)
+        .await?;
+    let mut feeds_by_group: std::collections::HashMap<Uuid, Vec<FeedResponse>> =
+        std::collections::HashMap::new();
+    for f in all_feeds {
+        feeds_by_group
+            .entry(f.destination_group_id)
+            .or_default()
+            .push(to_feed_response(f));
+    }
+
+    let visible = visible_groups
+        .into_iter()
+        .map(|group| {
+            let targets = targets_by_group.remove(&group.id).unwrap_or_default();
+            let feeds = feeds_by_group.remove(&group.id).unwrap_or_default();
+            to_group_response(group, targets, feeds)
+        })
+        .collect();
+
     Ok(Json(visible))
 }
 
