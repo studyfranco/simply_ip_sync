@@ -77,13 +77,7 @@ pub struct InvalidInitialMasterSigningSecret {
 /// on `Ipv6Addr` (e.g. `is_loopback`) are false for the mapped form even when the underlying
 /// address is loopback.
 pub fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    }
+    ip.to_canonical()
 }
 
 /// True if `ip` falls within any network in `trusted`.
