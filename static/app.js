@@ -141,6 +141,8 @@ class SyncClient {
     this.requestBase = SyncClient.deriveRequestBase();
     const override = localStorage.getItem("simply_ip_sync_api_base") || "";
     this.signingBase = SyncClient.normalizeBasePath(override);
+    this._lastSigSec = 0;
+    this._lastSigKey = "";
   }
 
   /**
@@ -186,8 +188,16 @@ class SyncClient {
     }
   }
 
-  async request(method, path, body) {
-    const timestamp = Math.floor(Date.now() / 1000).toString();
+  async request(method, path, body, isRetry = false) {
+    let nowSec = Math.floor(Date.now() / 1000);
+    const sigKey = `${method}\n${this.signingBase}${path}\n${body !== undefined ? JSON.stringify(body) : ""}`;
+    if (sigKey === this._lastSigKey && nowSec <= this._lastSigSec) {
+      nowSec = this._lastSigSec + 1;
+    }
+    this._lastSigKey = sigKey;
+    this._lastSigSec = nowSec;
+    const timestamp = nowSec.toString();
+
     const bodyBytes = body !== undefined ? new TextEncoder().encode(JSON.stringify(body)) : new Uint8Array(0);
     // The signed target is path *and* query string, matching `middleware.rs::signed_target` —
     // `path` here already carries any `?query` a call site appended (e.g. `/api/sync-logs?limit=100`).
@@ -216,6 +226,10 @@ class SyncClient {
     }
     if (!resp.ok) {
       const message = (data && data.error) || `HTTP ${resp.status}`;
+      if (resp.status === 401 && !isRetry && (message.includes("already been used") || message.includes("already used") || message.includes("timestamp"))) {
+        await new Promise(r => setTimeout(r, 1100));
+        return this.request(method, path, body, true);
+      }
       const err = new Error(message);
       err.status = resp.status;
       err.body = data;

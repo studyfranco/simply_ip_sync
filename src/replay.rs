@@ -13,6 +13,15 @@ use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+/// How often expired entries are swept out, as a fraction of the replay window.
+const PRUNE_INTERVAL_DIVISOR: u32 = 4;
+
+/// Minimum spacing between two *capacity-triggered* sweeps, as a fraction of the replay window.
+const CAPACITY_BACKOFF_DIVISOR: u32 = 16;
+
+/// Upper bound on tracked signatures before capacity-triggered sweeps kick in.
+const MAX_TRACKED_SIGNATURES: usize = 100_000;
+
 /// A signature is identified by the API key that produced it plus the raw decoded HMAC digest
 /// bytes (never the header text, so `sha256=AB…` and `sha256=ab…` cannot double-count).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -21,24 +30,40 @@ struct SignatureId {
     digest: Vec<u8>,
 }
 
-/// Upper bound on tracked signatures before capacity-triggered sweeps kick in.
-const MAX_TRACKED_SIGNATURES: usize = 100_000;
+/// When the next routine and capacity-triggered sweeps become due.
+#[derive(Debug)]
+struct PruneSchedule {
+    next: Instant,
+    next_capacity: Instant,
+}
 
 /// In-memory, single-use signature cache keyed on the monotonic clock.
+#[derive(Debug)]
 pub struct ReplayGuard {
     seen: Mutex<HashMap<SignatureId, Instant>>,
+    schedule: Mutex<PruneSchedule>,
     window: Duration,
-    last_sweep: Mutex<Instant>,
+    prune_interval: Duration,
+    capacity_backoff: Duration,
 }
 
 impl ReplayGuard {
     /// Builds a guard with the given freshness window, clamped to `[1, 3600]` seconds.
+    #[must_use]
     pub fn new(window_secs: i64) -> Self {
-        let clamped = window_secs.clamp(1, 3600) as u64;
+        let window = Duration::from_secs(window_secs.clamp(1, 3600) as u64);
+        let prune_interval = window / PRUNE_INTERVAL_DIVISOR;
+        let capacity_backoff = window / CAPACITY_BACKOFF_DIVISOR;
+        let now = Instant::now();
         Self {
             seen: Mutex::new(HashMap::new()),
-            window: Duration::from_secs(clamped),
-            last_sweep: Mutex::new(Instant::now()),
+            schedule: Mutex::new(PruneSchedule {
+                next: now + prune_interval,
+                next_capacity: now,
+            }),
+            window,
+            prune_interval,
+            capacity_backoff,
         }
     }
 
@@ -64,30 +89,44 @@ impl ReplayGuard {
         }
     }
 
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
+    }
+
     fn prune_if_due(&self, now: Instant) {
-        let routine_interval = self.window / 4;
-        let due = match self.last_sweep.lock() {
-            Ok(mut last) => {
-                if now.duration_since(*last) >= routine_interval {
-                    *last = now;
-                    true
-                } else {
-                    false
-                }
-            }
-            Err(_) => false,
-        };
         let over_capacity = self
             .seen
             .lock()
             .map(|seen| seen.len() >= MAX_TRACKED_SIGNATURES)
             .unwrap_or(false);
-        if (due || over_capacity)
-            && let Ok(mut seen) = self.seen.lock()
+
         {
-            // Saturation is never flushed wholesale — clearing would let every currently
-            // valid signature replay at once. Only truly expired entries are removed.
-            seen.retain(|_, expires_at| *expires_at > now);
+            let Ok(mut schedule) = self.schedule.lock() else {
+                return;
+            };
+            let routine_due = now >= schedule.next;
+            let capacity_due = over_capacity && now >= schedule.next_capacity;
+            if !routine_due && !capacity_due {
+                return;
+            }
+            schedule.next = now + self.prune_interval;
+            if capacity_due {
+                schedule.next_capacity = now + self.capacity_backoff;
+            }
+        }
+
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        seen.retain(|_, expires_at| *expires_at > now);
+
+        if seen.len() >= MAX_TRACKED_SIGNATURES {
+            tracing::warn!(
+                tracked = seen.len(),
+                ceiling = MAX_TRACKED_SIGNATURES,
+                "Replay guard is at capacity even after sweeping expired entries."
+            );
         }
     }
 }
@@ -125,6 +164,7 @@ mod tests {
         let key_id = Uuid::new_v4();
         let digest = vec![9, 9, 9];
         assert!(guard.check_and_record(key_id, &digest));
+        assert_eq!(guard.tracked(), 1);
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(guard.check_and_record(key_id, &digest));
     }
