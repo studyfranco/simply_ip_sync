@@ -1591,13 +1591,24 @@ async function renderAuditLogs() {
   }
 }
 
+function getActionBadgeClass(action) {
+  if (!action) return 'badge-scope';
+  const act = String(action).toUpperCase();
+  if (/CREATE|ADD|INSERT|REGISTER/.test(act)) return 'badge-action-create badge-success';
+  if (/DELETE|DESTROY|REVOKE|REMOVE|PURGE/.test(act)) return 'badge-action-delete badge-danger';
+  if (/UPDATE|EDIT|MODIFY|SET|ROTATE|RESTORE|LOCK|UNLOCK|GRANT/.test(act)) return 'badge-action-update badge-warning';
+  if (/EXECUTE|TRIGGER|DEPLOY|GENERATE|RELOAD|REFETCH|RUN|TEST|DISPATCH/.test(act)) return 'badge-action-execute badge-info badge-highlight';
+  if (/AUTH|LOGIN|SIGNIN|SIGNOUT|TOKEN/.test(act)) return 'badge-action-auth';
+  return 'badge-scope';
+}
+
 function auditRow(a) {
   const dateStr = a.timestamp ? new Date(a.timestamp).toLocaleString() : "—";
   return `<tr>
     <td class="font-mono text-sm">${escapeHtml(dateStr)}</td>
     <td><strong>${escapeHtml(a.api_key_name || "")}</strong> <span class="font-mono text-muted text-sm">(${escapeHtml(a.api_key_prefix || "")}...)</span></td>
     <td class="font-mono text-sm">${escapeHtml(a.client_ip || "")}</td>
-    <td><span class="badge badge-scope">${escapeHtml(a.action)}</span></td>
+    <td><span class="badge ${getActionBadgeClass(a.action)}">${escapeHtml(a.action)}</span></td>
     <td class="text-sm font-mono">${escapeHtml(a.target_resource || "—")}</td>
     <td class="text-sm">${escapeHtml(a.details || "—")}</td>
   </tr>`;

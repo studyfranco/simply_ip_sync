@@ -37,13 +37,10 @@
           <label for="login-api-base">API Base Path Override</label>
           <input type="text" id="login-api-base" class="input-field" placeholder="/api" autocomplete="off">
           <small class="field-hint">
-            Leave blank unless a reverse proxy forwards its mount prefix through untouched instead
-            of stripping it. Requests are always sent to where this page is served from, but the
-            <em>signature</em> must cover the path the <strong>server</strong> sees: if the proxy
-            strips the mount prefix (<code>/ip_sync/api/keys</code> → <code>/api/keys</code>, the
-            common case), leave this blank. If it forwards the prefix through untouched, set this
-            to the bare mount prefix alone — <code>/ip_sync</code>, not <code>/ip_sync/api</code>,
-            since every endpoint here already spells its own <code>/api/...</code>.
+            Leave blank unless a reverse proxy rewrites the path. Signatures must cover the path the
+            <em>server</em> sees: if the proxy strips a prefix (<code>/ip_sync/api/sources</code> →
+            <code>/api/sources</code>), keep <code>/api</code>; if it forwards the prefix untouched, set
+            <code>/ip_sync/api</code>. Requests themselves are always sent relative to this page.
           </small>
         </div>
         <button type="submit" class="btn btn-primary">Unlock Dashboard</button>
@@ -55,7 +52,7 @@
   <!-- ═══════════════════════════════════════ -->
   <!-- Dashboard                                -->
   <!-- ═══════════════════════════════════════ -->
-  <div id="dashboard-container" class="hidden">
+  <div id="dashboard-container" class="container hidden">
 
     <div id="top-bar" class="top-bar">
       <header class="header">
@@ -81,8 +78,7 @@
       </nav>
     </div>
 
-    <div class="container">
-      <!-- Panel bodies are rendered by app.js; each `data-tab="X"` above pairs with `id="tab-X"`
+    <!-- Panel bodies are rendered by app.js; each `data-tab="X"` above pairs with `id="tab-X"`
            here, which is the invariant `tests/source_hygiene.rs` checks. -->
       <main id="tab-sources" class="tab-panel active"></main>
       <main id="tab-sync-tasks" class="tab-panel"></main>
@@ -129,7 +125,6 @@
           </div>
         </section>
       </main>
-    </div>
 
   </div>
 
