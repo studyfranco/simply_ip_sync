@@ -89,6 +89,11 @@ body {
     background-color: var(--bg-main);
     margin: -2rem clamp(-4rem, -3vw, -1rem) 0;
     padding: 2rem clamp(1rem, 3vw, 4rem) 0;
+    transition: transform var(--transition-base), box-shadow var(--transition-base);
+}
+
+.top-bar.stuck {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
 }
 
 /* ─── Auth / Login Screen ────────────────────────────────── */
@@ -173,9 +178,13 @@ body {
 }
 
 .logo h1 {
-    font-size: 1.25rem;
-    font-weight: 600;
-    letter-spacing: -0.01em;
+    font-size: 1.6rem;
+    font-weight: 700;
+    background: linear-gradient(90deg, var(--accent), var(--highlight));
+    background-clip: text;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.02em;
 }
 
 .header-actions {
@@ -955,4 +964,71 @@ textarea.input-field {
     color: #c084fc;
     border: 1px solid rgba(168, 85, 247, 0.35);
 }
+
+/* ─── Modals ────────────────────────────────────────────── */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 0, 0, 0.55);
+    z-index: 20000;
+    padding: 1.5rem;
+    transition: opacity var(--transition-slow), visibility var(--transition-slow);
+}
+
+.modal-overlay.hidden {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    display: flex !important;
+}
+
+.modal-card {
+    width: 100%;
+    max-width: clamp(360px, 45vw, 760px);
+    box-shadow: var(--shadow-lg);
+    animation: fadeIn var(--transition-slow);
+}
+
+.modal-card h3 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+}
+
+.modal-card-form {
+    max-width: clamp(420px, 60vw, 900px);
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+}
+
+.modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.btn-modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.5rem;
+    line-height: 1;
+    padding: 0 0.25rem;
+    cursor: pointer;
+    border-radius: var(--radius);
+    transition: color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.btn-modal-close:hover {
+    color: var(--text-main);
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
 

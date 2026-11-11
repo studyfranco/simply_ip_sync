@@ -474,6 +474,95 @@ function setupTabs() {
     document.getElementById("dashboard-container").classList.add("hidden");
     document.getElementById("login-screen").classList.remove("hidden");
   });
+
+  document.getElementById("kf-cancel")?.addEventListener("click", () => {
+    document.getElementById("create-key-modal")?.classList.add("hidden");
+  });
+  document.getElementById("create-key-close-x")?.addEventListener("click", () => {
+    document.getElementById("create-key-modal")?.classList.add("hidden");
+  });
+  document.getElementById("create-key-modal")?.addEventListener("click", (e) => {
+    if (e.target.id === "create-key-modal") {
+      document.getElementById("create-key-modal")?.classList.add("hidden");
+    }
+  });
+  document.getElementById("key-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const existing = currentEditingSyncKey;
+    const isEditingMaster = Boolean(existing?.is_master);
+    try {
+      if (existing) {
+        const payload = isEditingMaster
+          ? { bound_ips: document.getElementById("kf-bound-ips").value.trim() }
+          : {
+              name: document.getElementById("kf-name").value.trim(),
+              bound_ips: document.getElementById("kf-bound-ips").value.trim(),
+              ...(me.is_master
+                ? {
+                    can_manage_keys: document.getElementById("kf-can-manage-keys")?.checked || false,
+                    can_manage_sources: document.getElementById("kf-can-manage-sources")?.checked || false,
+                    can_manage_vaults: document.getElementById("kf-can-manage-vaults")?.checked || false,
+                  }
+                : {}),
+            };
+        await client.put("/api/keys/" + existing.id, payload);
+        toast("API key updated", "success");
+        document.getElementById("create-key-modal")?.classList.add("hidden");
+        await renderKeys();
+      } else {
+        const payload = {
+          name: document.getElementById("kf-name").value.trim(),
+          bound_ips: document.getElementById("kf-bound-ips").value.trim() || null,
+          can_manage_keys: document.getElementById("kf-can-manage-keys")?.checked || false,
+          can_manage_sources: document.getElementById("kf-can-manage-sources")?.checked || false,
+          can_manage_vaults: document.getElementById("kf-can-manage-vaults")?.checked || false,
+        };
+        const result = await client.post("/api/keys", payload);
+        document.getElementById("create-key-modal")?.classList.add("hidden");
+        await renderKeys();
+        revealCredentials("Key created — save these now, they are not recoverable", [
+          ["API key", result.plaintext_key],
+          ["Signing secret", result.plaintext_signing_secret],
+        ]);
+      }
+    } catch (err) {
+      toast((existing ? "Update" : "Create") + " failed: " + err.message, "error");
+    }
+  });
+
+  document.getElementById("secret-reveal-done")?.addEventListener("click", () => {
+    document.getElementById("secret-reveal-modal")?.classList.add("hidden");
+  });
+  document.getElementById("secret-reveal-modal")?.addEventListener("click", (e) => {
+    if (e.target.id === "secret-reveal-modal") {
+      document.getElementById("secret-reveal-modal")?.classList.add("hidden");
+    }
+  });
+  document.getElementById("btn-copy-secret-key")?.addEventListener("click", () => {
+    const text = document.getElementById("secret-reveal-key-val")?.textContent;
+    if (text) {
+      navigator.clipboard?.writeText(text);
+      const btn = document.getElementById("btn-copy-secret-key");
+      if (btn) {
+        btn.textContent = "Copied!";
+        setTimeout(() => (btn.textContent = "Copy"), 1500);
+      }
+    }
+  });
+  document.getElementById("btn-copy-secret-val")?.addEventListener("click", () => {
+    const text = document.getElementById("secret-reveal-secret-val")?.textContent;
+    if (text) {
+      navigator.clipboard?.writeText(text);
+      const btn = document.getElementById("btn-copy-secret-val");
+      if (btn) {
+        btn.textContent = "Copied!";
+        setTimeout(() => (btn.textContent = "Copy"), 1500);
+      }
+    }
+  });
+  window.addEventListener("scroll", () => {
+    document.getElementById("top-bar")?.classList.toggle("stuck", window.scrollY > 4);
+  }, { passive: true });
 }
 
 async function loadTab(tab) {
@@ -1190,7 +1279,6 @@ async function renderKeys() {
       <div class="list-header"><h2>API Keys</h2>
         ${me.is_master || me.can_manage_keys ? '<button class="btn btn-primary" id="new-key-btn">+ New Key</button>' : ""}
       </div>
-      <div id="key-form-slot"></div>
       <div class="table-container">
         <table class="data-table">
         <thead><tr><th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Parent</th><th></th></tr></thead>
@@ -1249,107 +1337,91 @@ function keyRow(k) {
   </tr>`;
 }
 
-function showKeyForm(existing) {
-  const slot = document.getElementById("key-form-slot");
-  const isEditingMaster = Boolean(existing?.is_master);
-  slot.innerHTML = `
-    <form class="card" id="key-form" style="margin-bottom:1rem;background:var(--bg-input);">
-      <h3>${existing ? `Edit Key: ${escapeHtml(existing.name)}` : "Create New Sub-Key"}</h3>
-      <div class="form-grid" style="margin-top:0.75rem;">
-        <label class="form-group"><span>Name</span><input class="input-field" name="name" ${isEditingMaster ? "disabled" : "required"} value="${escapeHtml(existing?.name || "")}"></label>
-        <label class="form-group"><span>Bound IPs (CIDR, comma-separated)</span><input class="input-field" name="bound_ips" placeholder="0.0.0.0/0,::/0" value="${escapeHtml(existing?.bound_ips || "")}"></label>
-      </div>
-      ${me.is_master && !isEditingMaster ? `
-      <div class="permissions-grid mt-2 mb-4">
-        <label class="checkbox-container"><input type="checkbox" name="can_manage_keys" ${existing?.can_manage_keys ? "checked" : ""}><span>can_manage_keys</span></label>
-        <label class="checkbox-container"><input type="checkbox" name="can_manage_sources" ${existing?.can_manage_sources ? "checked" : ""}><span>can_manage_sources</span></label>
-        <label class="checkbox-container"><input type="checkbox" name="can_manage_vaults" ${existing?.can_manage_vaults ? "checked" : ""}><span>can_manage_vaults</span></label>
-      </div>
-      ` : !isEditingMaster ? `
-      <p class="text-muted text-sm mt-2 mb-4">Only the Master key may grant global scopes (R4). Keys you create are Daughter keys.</p>
-      ` : `<p class="text-muted text-sm mt-2 mb-4">Master key permissions are immutable; only <code>bound_ips</code> may be updated.</p>`}
-      <div class="form-actions mt-4">
-        <button type="submit" class="btn btn-primary">${existing ? "Save" : "Create Key"}</button>
-        <button type="button" class="btn btn-cancel" id="key-form-cancel">Cancel</button>
-      </div>
-    </form>`;
+let currentEditingSyncKey = null;
 
-  document.getElementById("key-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
-  document.getElementById("key-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    try {
-      if (existing) {
-        const payload = isEditingMaster
-          ? { bound_ips: fd.get("bound_ips") || "" }
-          : {
-              name: fd.get("name"),
-              bound_ips: fd.get("bound_ips") || "",
-              ...(me.is_master
-                ? {
-                    can_manage_keys: fd.get("can_manage_keys") === "on",
-                    can_manage_sources: fd.get("can_manage_sources") === "on",
-                    can_manage_vaults: fd.get("can_manage_vaults") === "on",
-                  }
-                : {}),
-            };
-        await client.put("/api/keys/" + existing.id, payload);
-        toast("API key updated", "success");
-        slot.innerHTML = "";
-        await renderKeys();
-      } else {
-        const payload = {
-          name: fd.get("name"),
-          bound_ips: fd.get("bound_ips") || null,
-          can_manage_keys: fd.get("can_manage_keys") === "on",
-          can_manage_sources: fd.get("can_manage_sources") === "on",
-          can_manage_vaults: fd.get("can_manage_vaults") === "on",
-        };
-        const result = await client.post("/api/keys", payload);
-        await renderKeys();
-        revealCredentials("Key created — save these now, they are not recoverable", [
-          ["API key", result.plaintext_key],
-          ["Signing secret", result.plaintext_signing_secret],
-        ]);
-      }
-    } catch (err) {
-      toast((existing ? "Update" : "Create") + " failed: " + err.message, "error");
+function showKeyForm(existing) {
+  currentEditingSyncKey = existing || null;
+  const isEditingMaster = Boolean(existing?.is_master);
+  const modal = document.getElementById("create-key-modal");
+  const modalTitle = document.getElementById("create-key-modal-title");
+  const nameInput = document.getElementById("kf-name");
+  const boundIpsInput = document.getElementById("kf-bound-ips");
+  const submitBtn = document.getElementById("kf-submit-btn");
+  const scopesGrid = document.getElementById("kf-scopes-grid");
+  const scopesNote = document.getElementById("kf-scopes-note");
+
+  if (modalTitle) modalTitle.textContent = existing ? `Edit Key: ${existing.name}` : "Create API Key";
+  if (submitBtn) submitBtn.textContent = existing ? "Save Changes" : "Create Key";
+  if (nameInput) {
+    nameInput.value = existing?.name || "";
+    nameInput.disabled = isEditingMaster;
+  }
+  if (boundIpsInput) {
+    boundIpsInput.value = existing?.bound_ips || "";
+  }
+
+  if (me.is_master && !isEditingMaster) {
+    if (scopesGrid) {
+      scopesGrid.classList.remove("hidden");
+      const kfManageKeys = document.getElementById("kf-can-manage-keys");
+      const kfManageSources = document.getElementById("kf-can-manage-sources");
+      const kfManageVaults = document.getElementById("kf-can-manage-vaults");
+      if (kfManageKeys) kfManageKeys.checked = Boolean(existing?.can_manage_keys);
+      if (kfManageSources) kfManageSources.checked = Boolean(existing?.can_manage_sources);
+      if (kfManageVaults) kfManageVaults.checked = Boolean(existing?.can_manage_vaults);
     }
-  });
+    if (scopesNote) scopesNote.classList.add("hidden");
+  } else {
+    if (scopesGrid) scopesGrid.classList.add("hidden");
+    if (scopesNote) {
+      scopesNote.classList.remove("hidden");
+      scopesNote.textContent = isEditingMaster
+        ? "Master key permissions are immutable; only bound_ips may be updated."
+        : "Only the Master key may grant global scopes (R4). Keys you create are Daughter keys.";
+    }
+  }
+
+  if (modal) modal.classList.remove("hidden");
 }
 
-/// Renders one-time credentials into the keys tab's form slot using the ecosystem's `.key-reveal`
-/// block, rather than a `window.alert()`.
-///
-/// The server returns a freshly minted key or secret exactly once (see `API_REFERENCE.md` §3.2);
-/// after this render there is no endpoint that can produce it again. An `alert()` was a poor fit
-/// for that: its text is not selectable in every browser, it cannot be re-read once dismissed, and
-/// it blocks the page while the value the user has to copy sits behind it.
-///
-/// Called after `renderKeys()` has rebuilt the panel, so `#key-form-slot` is the freshly rendered
-/// one — writing into the pre-render slot would paint the credentials into a node that
-/// `renderKeys()` then discards.
+/// Renders one-time credentials into the secret reveal modal.
 function revealCredentials(title, pairs) {
-  const slot = document.getElementById("key-form-slot");
-  if (!slot) {
-    toast(pairs.map(([label, value]) => `${label}: ${value}`).join(" | "), "success");
-    return;
+  const modal = document.getElementById("secret-reveal-modal");
+  const titleEl = document.getElementById("secret-reveal-title");
+  const keyRow = document.getElementById("secret-reveal-key-row");
+  const keyVal = document.getElementById("secret-reveal-key-val");
+  const secretRow = document.getElementById("secret-reveal-secret-row");
+  const secretVal = document.getElementById("secret-reveal-secret-val");
+
+  if (titleEl) titleEl.textContent = title;
+
+  let apiKey = "";
+  let signingSecret = "";
+  for (const [label, val] of pairs) {
+    const l = String(label).toLowerCase();
+    if (l.includes("key")) apiKey = val;
+    else if (l.includes("secret")) signingSecret = val;
+    else if (!apiKey) apiKey = val;
+    else if (!signingSecret) signingSecret = val;
   }
-  slot.innerHTML = `
-    <div class="key-reveal">
-      <p class="mb-4"><strong>${escapeHtml(title)}</strong></p>
-      ${pairs
-        .map(
-          ([label, value]) => `
-        <span class="key-reveal-label">${escapeHtml(label)}</span>
-        <code class="key-reveal-value">${escapeHtml(value)}</code>`
-        )
-        .join("")}
-      <button type="button" class="btn btn-secondary btn-sm" id="key-reveal-dismiss">Dismiss</button>
-    </div>`;
-  document.getElementById("key-reveal-dismiss").addEventListener("click", () => {
-    slot.innerHTML = "";
-  });
+
+  if (keyRow && keyVal) {
+    if (apiKey) {
+      keyRow.classList.remove("hidden");
+      keyVal.textContent = apiKey;
+    } else {
+      keyRow.classList.add("hidden");
+    }
+  }
+  if (secretRow && secretVal) {
+    if (signingSecret) {
+      secretRow.classList.remove("hidden");
+      secretVal.textContent = signingSecret;
+    } else {
+      secretRow.classList.add("hidden");
+    }
+  }
+  if (modal) modal.classList.remove("hidden");
 }
 
 async function rotateKey(id) {

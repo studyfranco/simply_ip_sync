@@ -149,6 +149,70 @@
     <option value="VAULT_DELETE"></option>
   </datalist>
 
+  <!-- Create API Key Modal -->
+  <div id="create-key-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="create-key-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="create-key-modal-title">Create API Key</h3>
+        <button type="button" id="create-key-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <p class="subtitle">Issue a new API key with specific network bindings and synchronization scopes.</p>
+      <form id="key-form" class="admin-form">
+        <div class="form-grid mt-2">
+          <div class="form-group">
+            <label for="kf-name">Key Name</label>
+            <input type="text" id="kf-name" name="name" class="input-field" required placeholder="e.g. Ingestion Worker">
+          </div>
+          <div class="form-group">
+            <label for="kf-bound-ips">Bound IPs (CIDR, comma-separated)</label>
+            <input type="text" id="kf-bound-ips" name="bound_ips" class="input-field font-mono" placeholder="0.0.0.0/0,::/0">
+          </div>
+        </div>
+        <div id="kf-scopes-container">
+          <div class="permissions-grid mt-2 mb-4" id="kf-scopes-grid">
+            <label class="checkbox-container"><input type="checkbox" id="kf-can-manage-keys" name="can_manage_keys"> <span>can_manage_keys</span></label>
+            <label class="checkbox-container"><input type="checkbox" id="kf-can-manage-sources" name="can_manage_sources"> <span>can_manage_sources</span></label>
+            <label class="checkbox-container"><input type="checkbox" id="kf-can-manage-vaults" name="can_manage_vaults"> <span>can_manage_vaults</span></label>
+          </div>
+          <p class="text-muted text-sm mt-2 mb-4 hidden" id="kf-scopes-note">
+            Only the Master key may grant global scopes (R4). Keys you create are Daughter keys.
+          </p>
+        </div>
+        <div class="form-actions mt-4">
+          <button type="submit" class="btn btn-primary" id="kf-submit-btn">Create Key</button>
+          <button type="button" id="kf-cancel" class="btn btn-secondary">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Secret Reveal Modal -->
+  <div id="secret-reveal-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="secret-reveal-title">
+    <div class="modal-card card">
+      <h3 id="secret-reveal-title">API Key Created</h3>
+      <p class="subtitle">Copy both values now — the signing secret cannot be retrieved or displayed again.</p>
+      <div class="key-reveal" id="secret-reveal-box">
+        <div id="secret-reveal-key-row">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span class="key-reveal-label">API Key:</span>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-secret-key" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+          </div>
+          <code id="secret-reveal-key-val" class="key-reveal-value"></code>
+        </div>
+        <div id="secret-reveal-secret-row">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span class="key-reveal-label">Signing Secret:</span>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-secret-val" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+          </div>
+          <code id="secret-reveal-secret-val" class="key-reveal-value"></code>
+        </div>
+        <div class="form-actions mt-4">
+          <button type="button" id="secret-reveal-done" class="btn btn-primary">Done</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>
