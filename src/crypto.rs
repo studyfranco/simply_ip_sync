@@ -124,9 +124,7 @@ impl SecretCipher {
     /// Builds a cipher from `SYNC_ENCRYPTION_KEY`. `Ok(Plaintext)` if unset or empty;
     /// `Err(InvalidKey)` if set but not exactly 64 hex characters.
     pub fn from_env() -> Result<Self, CryptoError> {
-        let configured = std::env::var(ENCRYPTION_KEY_ENV)
-            .ok()
-            .filter(|raw| !raw.trim().is_empty());
+        let configured = crate::config::get_secret_or_env(ENCRYPTION_KEY_ENV);
         match configured {
             Some(raw) => Self::from_hex_key(raw.trim()),
             None => Ok(Self::Plaintext),

@@ -25,7 +25,8 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://simply_ip_sync.db?mode=rwc".to_owned());
+    let database_url = simply_ip_sync::config::get_secret_or_env("DATABASE_URL")
+        .unwrap_or_else(|| "sqlite://simply_ip_sync.db?mode=rwc".to_owned());
 
     let db = simply_ip_sync::db::connect(&database_url).await?;
     simply_ip_sync::db::apply_sqlite_pragmas(&db).await;
@@ -138,8 +139,8 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
         return Ok(());
     }
 
-    let plaintext_key = match std::env::var(simply_ip_sync::config::INITIAL_MASTER_KEY_ENV) {
-        Ok(raw) if !raw.is_empty() => {
+    let plaintext_key = match simply_ip_sync::config::get_secret_or_env(simply_ip_sync::config::INITIAL_MASTER_KEY_ENV) {
+        Some(raw) if !raw.is_empty() => {
             simply_ip_sync::config::validate_initial_master_key(&raw).map_err(|e| {
                 tracing::error!("Refusing to start: {e}");
                 e
@@ -156,8 +157,8 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     };
 
     let cipher = simply_ip_sync::crypto::SecretCipher::from_env()?;
-    let signing_secret = match std::env::var(simply_ip_sync::config::INITIAL_MASTER_SIGNING_SECRET_ENV) {
-        Ok(raw) if !raw.is_empty() => {
+    let signing_secret = match simply_ip_sync::config::get_secret_or_env(simply_ip_sync::config::INITIAL_MASTER_SIGNING_SECRET_ENV) {
+        Some(raw) if !raw.is_empty() => {
             simply_ip_sync::config::validate_initial_master_signing_secret(&raw).map_err(|e| {
                 tracing::error!("Refusing to start: {e}");
                 e

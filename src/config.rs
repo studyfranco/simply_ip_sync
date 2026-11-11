@@ -28,6 +28,35 @@ pub const INITIAL_MASTER_KEY_ENV: &str = "INITIAL_MASTER_KEY";
 /// buffered/redirected server log — the same reasoning `INITIAL_MASTER_KEY` itself exists for.
 pub const INITIAL_MASTER_SIGNING_SECRET_ENV: &str = "INITIAL_MASTER_SIGNING_SECRET";
 
+/// Reads a secret from `<VAR>_FILE`, `/run/secrets/<var_lowercase>`, or `<VAR>`.
+#[must_use]
+pub fn get_secret_or_env(var_name: &str) -> Option<String> {
+    if let Ok(file_path) = std::env::var(format!("{var_name}_FILE")) {
+        let trimmed = file_path.trim();
+        if !trimmed.is_empty() {
+            if let Ok(content) = std::fs::read_to_string(trimmed) {
+                let trimmed_content = content.trim().to_owned();
+                if !trimmed_content.is_empty() {
+                    return Some(trimmed_content);
+                }
+            }
+        }
+    }
+
+    let default_path = format!("/run/secrets/{}", var_name.to_ascii_lowercase());
+    if let Ok(content) = std::fs::read_to_string(&default_path) {
+        let trimmed_content = content.trim().to_owned();
+        if !trimmed_content.is_empty() {
+            return Some(trimmed_content);
+        }
+    }
+
+    std::env::var(var_name)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
 /// Default maximum request body size, in mebibytes, when `MAX_BODY_SIZE_MIB` is unset.
 pub const DEFAULT_MAX_BODY_MIB: usize = 10;
 
