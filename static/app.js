@@ -392,6 +392,16 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
 // the saved session out from under the operator — they may just be offline for a moment, and a
 // second reload should retry rather than force re-typing the key.
 (async function restoreSessionOnLoad() {
+  if (window.location.protocol === 'file:') {
+    showLoginError(
+      "This dashboard must be opened through the daemon's own web server (http:// or https://), " +
+      "not as a local file — opening index.html directly blocks every request this page makes."
+    );
+    document.getElementById("login-form")?.querySelectorAll("input, button")
+      ?.forEach((el) => { el.disabled = true; });
+    return;
+  }
+
   const saved = loadSessionCredentials();
   if (!saved) return;
   document.getElementById("login-api-key").value = saved.apiKey;
@@ -585,8 +595,10 @@ async function loadTab(tab) {
 
 async function renderSources() {
   const panel = document.getElementById("tab-sources");
-  const groups = await client.get("/api/destination-groups");
-  const vaults = await getVaultsCached();
+  const [groups, vaults] = await Promise.all([
+    client.get("/api/destination-groups"),
+    getVaultsCached()
+  ]);
   panel.innerHTML = `
     <section class="card">
       <div class="list-header"><h2>Destination Groups</h2>
