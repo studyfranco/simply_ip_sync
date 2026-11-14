@@ -530,7 +530,7 @@ function setupTabs() {
         const result = await client.post("/api/keys", payload);
         document.getElementById("create-key-modal")?.classList.add("hidden");
         await renderKeys();
-        revealCredentials("Key created — save these now, they are not recoverable", [
+        revealCredentials("API Key Created", [
           ["API key", result.plaintext_key],
           ["Signing secret", result.plaintext_signing_secret],
         ]);

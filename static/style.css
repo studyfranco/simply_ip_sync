@@ -659,28 +659,34 @@ textarea.input-field {
 
 .key-reveal {
     margin-top: 1rem;
-    padding: 1rem;
-    background-color: var(--bg-input);
-    border: 1px solid var(--accent);
+    padding: 0.85rem 1rem;
+    background-color: rgba(28, 220, 154, 0.08);
+    border: 1px solid rgba(28, 220, 154, 0.25);
     border-radius: var(--radius);
 }
 
 .key-reveal-label {
-    display: block;
-    color: var(--text-muted);
-    font-size: 0.78rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    margin-bottom: 0.3rem;
+    font-size: 0.8rem;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 0.4rem;
 }
 
 .key-reveal-value {
     display: block;
     font-family: var(--font-mono);
     font-size: 0.85rem;
-    color: var(--accent);
+    color: var(--text-main);
     word-break: break-all;
-    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.7rem;
+    background-color: var(--bg-input);
+    border-radius: var(--radius);
+    user-select: all;
+    cursor: text;
+}
+
+.modal-card .key-reveal-value {
+    margin-top: 0.5rem;
 }
 
 /* ─── Toast Notifications ───────────────────────────────── */
