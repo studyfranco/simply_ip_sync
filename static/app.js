@@ -670,8 +670,11 @@ function showGroupForm(existing, vaults) {
           <option value="false" ${existing?.is_active === false ? "selected" : ""}>false</option>
         </select>
       </label>
-      <div class="form-group">
-        <label class="checkbox-container"><input type="checkbox" name="skip_bogon_filtering" ${existing?.skip_bogon_filtering ? "checked" : ""}><span>Bypass Bogon &amp; Private IP Filtering</span></label>
+      <div class="form-group form-group-grow" style="flex:1 1 100%;">
+        <label class="checkbox-container" style="display:inline-flex;align-items:center;gap:0.5rem;padding-left:0;cursor:pointer;color:var(--text-main);font-size:0.88rem;font-weight:500;">
+          <input type="checkbox" name="skip_bogon_filtering" ${existing?.skip_bogon_filtering ? "checked" : ""} style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;">
+          <span>Bypass Bogon &amp; Private IP Filtering</span>
+        </label>
         <small class="field-hint">Off by default: loopback/private/link-local/other reserved addresses are stripped from this group's aggregated feed content before push. Turn on only for a group deliberately ingesting internal/lab address space. A child feed can override this individually.</small>
       </div>
       <label class="form-group form-group-grow"><span>Target Vaults (select one or more)
@@ -1293,7 +1296,7 @@ async function renderKeys() {
       </div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Parent</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Bound IPs</th><th></th></tr></thead>
         <tbody>
           ${keys.length ? keys.map(keyRow).join("") : '<tr><td colspan="6" class="empty-state">No keys visible.</td></tr>'}
         </tbody>
@@ -1322,13 +1325,14 @@ function keyRow(k) {
   const tier = rbacTier(k);
   const tierModifier = k.is_master ? " badge-master" : k.can_manage_keys ? " badge-parent" : "";
   const scopes = [
+    k.is_master && "Master",
     k.can_manage_keys && "can_manage_keys",
     k.can_manage_sources && "can_manage_sources",
     k.can_manage_vaults && "can_manage_vaults",
   ]
     .filter(Boolean)
     .map((s) => `<span class="badge badge-scope">${escapeHtml(s)}</span>`)
-    .join(" ");
+    .join("");
   // The Master key is neither deletable nor rotatable through the API (RBAC §5), but its bound_ips
   // may be updated by Master.
   const actions = k.is_master
@@ -1343,9 +1347,9 @@ function keyRow(k) {
     <td>${escapeHtml(k.name)}</td>
     <td class="font-mono">${escapeHtml(k.prefix)}</td>
     <td><span class="badge badge-tier${tierModifier}">${escapeHtml(tier)}</span></td>
-    <td>${scopes || '<span class="text-muted text-sm">none</span>'}</td>
-    <td class="font-mono text-sm">${escapeHtml(k.parent_key_id || "")}</td>
-    <td class="row-actions">${actions}</td>
+    <td>${scopes ? `<div class="scope-badges">${scopes}</div>` : '<span class="text-muted text-sm">none</span>'}</td>
+    <td class="font-mono text-sm">${escapeHtml(k.bound_ips || "any")}</td>
+    <td class="row-actions">${actions ? `<div class="row-actions-group">${actions}</div>` : ""}</td>
   </tr>`;
 }
 
