@@ -641,12 +641,12 @@ function groupRow(g) {
     <td>${g.is_active ? "yes" : "no"}</td>
     <td>${g.skip_bogon_filtering ? "bypassed" : "filtered"}</td>
     <td>${escapeHtml(g.last_run_at || "never")}</td>
-    <td class="row-actions">
+    <td class="row-actions"><div class="row-actions-group">
       <button class="btn btn-sm" data-manage-feeds="${g.id}">Feeds (${g.feeds.length})</button>
       <button class="btn btn-sm" data-trigger-group="${g.id}">Trigger</button>
       <button class="btn btn-sm" data-edit-group="${g.id}">Edit</button>
       <button class="btn btn-sm btn-danger" data-delete-group="${g.id}">Delete</button>
-    </td>
+    </div></td>
   </tr>`;
 }
 
@@ -775,10 +775,10 @@ function feedRow(f) {
     <td>${escapeHtml(f.parser_type)}</td>
     <td>${f.max_age_days ?? ""}</td>
     <td>${escapeHtml(bogonLabel)}</td>
-    <td class="row-actions">
+    <td class="row-actions"><div class="row-actions-group">
       <button class="btn btn-sm" data-edit-feed="${f.id}">Edit</button>
       <button class="btn btn-sm btn-danger" data-delete-feed="${f.id}">Delete</button>
-    </td>
+    </div></td>
   </tr>`;
 }
 
@@ -1117,11 +1117,11 @@ function taskRow(t, vaults) {
     <td class="font-mono">${escapeHtml(t.cron_schedule)}</td>
     <td>${t.is_active ? "yes" : "no"}</td>
     <td>${escapeHtml(t.last_sync_at || "never")}</td>
-    <td class="row-actions">
+    <td class="row-actions"><div class="row-actions-group">
       <button class="btn btn-sm" data-trigger-task="${t.id}">Trigger</button>
       <button class="btn btn-sm" data-edit-task="${t.id}">Edit</button>
       <button class="btn btn-sm btn-danger" data-delete-task="${t.id}">Delete</button>
-    </td>
+    </div></td>
   </tr>`;
 }
 
@@ -1236,10 +1236,10 @@ function vaultRow(v) {
     <td>${escapeHtml(v.name)}</td>
     <td class="font-mono">${escapeHtml(v.target_url)}</td>
     <td>${escapeHtml(v.description || "")}</td>
-    <td class="row-actions">
+    <td class="row-actions"><div class="row-actions-group">
       <button class="btn btn-sm" data-edit-vault="${v.id}">Edit</button>
       <button class="btn btn-sm btn-danger" data-delete-vault="${v.id}">Delete</button>
-    </td>
+    </div></td>
   </tr>`;
 }
 
@@ -1331,7 +1331,7 @@ function keyRow(k) {
     k.can_manage_vaults && "can_manage_vaults",
   ]
     .filter(Boolean)
-    .map((s) => `<span class="badge badge-scope">${escapeHtml(s)}</span>`)
+    .map((s) => `<span class="badge badge-scope${s === "Master" ? " badge-scope-master" : ""}">${escapeHtml(s)}</span>`)
     .join("");
   // The Master key is neither deletable nor rotatable through the API (RBAC §5), but its bound_ips
   // may be updated by Master.

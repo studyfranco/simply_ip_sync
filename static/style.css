@@ -391,12 +391,22 @@ label.form-group {
 }
 
 .form-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    display: flex;
+    flex-wrap: wrap;
     gap: 1rem;
+    align-items: flex-start;
 }
 
-.form-group-grow {
+.form-grid > .form-group {
+    flex: 1 1 260px;
+    min-width: 220px;
+    margin-bottom: 0;
+}
+
+.form-grid > .form-group.form-group-grow,
+.form-group-grow,
+.form-grid > .form-actions {
+    flex: 1 1 100%;
     grid-column: 1 / -1;
 }
 
@@ -644,6 +654,15 @@ textarea.input-field {
     background-color: rgba(28, 220, 154, 0.1);
     color: var(--accent);
     border: 1px solid rgba(28, 220, 154, 0.25);
+    text-transform: none;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+}
+
+.badge-scope-master {
+    background-color: rgba(231, 76, 60, 0.16);
+    color: #ff7b6b;
+    border: 1px solid rgba(231, 76, 60, 0.45);
     text-transform: none;
     font-family: var(--font-mono);
     font-size: 0.7rem;
@@ -1006,7 +1025,7 @@ textarea.input-field {
 
 .modal-card {
     width: 100%;
-    max-width: clamp(360px, 45vw, 560px);
+    max-width: clamp(520px, 46vw, 860px);
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
 }
@@ -1018,28 +1037,29 @@ textarea.input-field {
 }
 
 .modal-card-form {
-    max-width: clamp(420px, 60vw, 780px);
+    max-width: clamp(600px, 56vw, 960px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }
 
 #secret-reveal-modal .modal-card {
-    max-width: 560px;
+    max-width: clamp(580px, 48vw, 860px);
 }
 
 #create-key-modal .modal-card-form {
-    max-width: 780px;
+    max-width: clamp(620px, 56vw, 960px);
 }
 
 #group-form-slot form,
 #feed-form-slot form,
 #task-form-slot form,
 #vault-form-slot form {
-    background-color: var(--bg-input);
-    border: 1px solid var(--border);
+    background-color: #383e45;
+    border: 1px solid #565b63;
     border-radius: var(--radius);
     padding: 1.25rem;
     margin-bottom: 1.25rem;
+    box-shadow: var(--shadow);
 }
 
 .modal-header {
