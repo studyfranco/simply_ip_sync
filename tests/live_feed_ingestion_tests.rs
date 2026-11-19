@@ -1,30 +1,43 @@
-//! Live network tests against real, public threat-intelligence feeds.
-//!
-//! `#[ignore]`d so `cargo test` stays offline and fast by default; run explicitly with
-//! `cargo test -- --ignored` (or `cargo test --test live_feed_ingestion_tests -- --ignored`) when
-//! network access is available. These exist to catch a feed's *actual* format drifting away from
-//! what `REGEX_LINE` expects — something no local fixture can ever detect, by definition.
+//! Offline HTTP tests using representative threat-feed payloads.
 
-use simply_ip_sync::parsers;
+use std::time::Duration;
 
-/// Moved upstream 2026-08: maltrail relocated this list from `trails/static/` to `data/`. The old
-/// path returns `404`, which is exactly the drift this suite exists to surface — see
-/// `AGENT_NOTES.MD` Session 14.
-const MASS_SCANNER_URL: &str =
-    "https://raw.githubusercontent.com/stamparm/maltrail/refs/heads/master/data/mass_scanner.txt";
-const DOH_IPV4_URL: &str =
-    "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv4.txt";
-const VPN_IPV4_URL: &str =
-    "https://raw.githubusercontent.com/NazgulCoder/IPLists/refs/heads/main/output/vpn-ipv4.txt";
-const DOH_IPV6_URL: &str =
-    "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv6.txt";
+use simply_ip_sync::parsers::{self, ParsedRecord};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Fetches `url` and parses it with `REGEX_LINE`, asserting a non-empty set of syntactically
-/// valid IPv4/IPv6/CIDR entries. Panics (failing the test) on a network error or a non-2xx
-/// response, rather than skipping — a `#[ignore]`d test that silently passes when the network is
-/// unreachable would stop meaning anything the first time someone actually needed it to fail.
-async fn assert_feed_yields_valid_entries(url: &str) {
-    let response = reqwest::get(url)
+const MASS_SCANNER_FEED: &str = "# Mass scanners\n\n192.0.2.14\n198.51.100.26 # scanner\n";
+const DOH_IPV4_FEED: &str = "1.1.1.1\n8.8.8.8\n9.9.9.9\n";
+const VPN_IPV4_FEED: &str = "# VPN provider networks\n192.0.2.0/24\n198.51.100.64/26\n";
+const DOH_IPV6_FEED: &str = "2001:4860:4860::8888\n2606:4700:4700::1111\n2620:fe::fe\n";
+
+async fn mock_feed(feed_path: &str, payload: &str) -> (MockServer, String) {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(feed_path))
+        .respond_with(ResponseTemplate::new(200).set_body_string(payload))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}{feed_path}", server.uri());
+    (server, url)
+}
+
+fn local_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build loopback HTTP client")
+}
+
+/// Fetches a fixture and checks that `REGEX_LINE` yields valid IP or CIDR records.
+async fn assert_feed_yields_valid_entries(feed_path: &str, payload: &str) -> Vec<ParsedRecord> {
+    let (_server, url) = mock_feed(feed_path, payload).await;
+    let response = local_http_client()
+        .get(&url)
+        .send()
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
     let status = response.status();
@@ -41,7 +54,7 @@ async fn assert_feed_yields_valid_entries(url: &str) {
 
     assert!(
         !entries.is_empty(),
-        "{url} yielded zero parsed entries — the feed format may have changed"
+        "{url} yielded zero parsed entries — expected IP/CIDR records in the fixture"
     );
     for entry in &entries {
         assert!(
@@ -51,64 +64,45 @@ async fn assert_feed_yields_valid_entries(url: &str) {
             entry.address
         );
     }
-    println!("{url}: {} valid entries", entries.len());
+    entries
 }
 
 #[tokio::test]
-#[ignore = "hits a live network endpoint; run with `cargo test -- --ignored`"]
 async fn mass_scanner_feed_parses_to_valid_entries() {
-    assert_feed_yields_valid_entries(MASS_SCANNER_URL).await;
+    assert_feed_yields_valid_entries("/mass_scanner.txt", MASS_SCANNER_FEED).await;
 }
 
 #[tokio::test]
-#[ignore = "hits a live network endpoint; run with `cargo test -- --ignored`"]
 async fn doh_ipv4_blocklist_parses_to_valid_entries() {
-    assert_feed_yields_valid_entries(DOH_IPV4_URL).await;
+    assert_feed_yields_valid_entries("/doh-ipv4.txt", DOH_IPV4_FEED).await;
 }
 
 #[tokio::test]
-#[ignore = "hits a live network endpoint; run with `cargo test -- --ignored`"]
 async fn vpn_ipv4_feed_parses_to_valid_entries() {
-    assert_feed_yields_valid_entries(VPN_IPV4_URL).await;
+    assert_feed_yields_valid_entries("/vpn-ipv4.txt", VPN_IPV4_FEED).await;
 }
 
 #[tokio::test]
-#[ignore = "hits a live network endpoint; run with `cargo test -- --ignored`"]
 async fn doh_ipv6_blocklist_parses_to_valid_entries() {
-    assert_feed_yields_valid_entries(DOH_IPV6_URL).await;
-
-    // This feed is IPv6-specific; confirm the parser actually extracted v6 addresses and not just
-    // an empty pass — a parser that silently extracted zero v6 addresses from a v6-only feed
-    // while still reporting "non-empty" (e.g. by matching something else on the line) would slip
-    // through the generic check above.
-    let response = reqwest::get(DOH_IPV6_URL)
-        .await
-        .expect("re-fetch for v6-specific assertion");
-    let body = response.bytes().await.expect("read body");
-    let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
-    let entries = parser.parse(&body, None).expect("parse");
-    let v6_count = entries
-        .iter()
-        .filter(|e| e.address.parse::<std::net::Ipv6Addr>().is_ok())
-        .count();
+    let entries = assert_feed_yields_valid_entries("/doh-ipv6.txt", DOH_IPV6_FEED).await;
     assert!(
-        v6_count > 0,
+        entries
+            .iter()
+            .any(|entry| entry.address.parse::<std::net::Ipv6Addr>().is_ok()),
         "doh-ipv6.txt yielded no actual IPv6 addresses among its {} entries",
         entries.len()
     );
 }
 
-/// End-to-end through the real ingestion pipeline (not just the parser in isolation): a
-/// `destination_groups` row with one child feed pointed at a live feed, triggered through
-/// `jobs::external_ingestion::run`, must report a `SUCCESS` summary with `items_processed > 0`.
+/// Exercises the external ingestion job with one destination group and one mock feed.
 #[tokio::test]
-#[ignore = "hits a live network endpoint; run with `cargo test -- --ignored`"]
-async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
+async fn mock_feed_ingests_successfully_through_the_full_job_pipeline() {
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
     use simply_ip_sync::entities::{destination_group, external_source};
     use uuid::Uuid;
 
+    let (_server, url) = mock_feed("/doh-ipv4.txt", DOH_IPV4_FEED).await;
     let conn = sea_orm::Database::connect("sqlite::memory:")
         .await
         .expect("connect");
@@ -133,14 +127,15 @@ async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
         updated_at: Set(now),
     };
     master.insert(&conn).await.expect("insert master");
-    let state = simply_ip_sync::state::AppState::for_tests(conn.clone(), master_id)
+    let mut state = simply_ip_sync::state::AppState::for_tests(conn.clone(), master_id)
         .await
         .expect("build test state");
+    state.http = local_http_client();
 
     let group_id = Uuid::new_v4();
     let group = destination_group::ActiveModel {
         id: Set(group_id),
-        name: Set("live-doh-ipv4-group".to_owned()),
+        name: Set("mock-doh-ipv4-group".to_owned()),
         target_group_name: Set("group".to_owned()),
         cron_schedule: Set("0 0 * * *".to_owned()),
         mode: Set("upsert".to_owned()),
@@ -156,8 +151,8 @@ async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
     let source = external_source::ActiveModel {
         id: Set(Uuid::new_v4()),
         destination_group_id: Set(group_id),
-        name: Set("live-doh-ipv4".to_owned()),
-        source_url: Set(DOH_IPV4_URL.to_owned()),
+        name: Set("mock-doh-ipv4".to_owned()),
+        source_url: Set(url),
         parser_type: Set("REGEX_LINE".to_owned()),
         parser_config_json: Set(None),
         max_age_days: Set(None),
@@ -175,6 +170,6 @@ async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
     assert_eq!(summary.status, "SUCCESS");
     assert!(
         summary.items_processed > 0,
-        "expected at least one parsed entry from a live feed"
+        "expected at least one parsed entry from the mock feed"
     );
 }

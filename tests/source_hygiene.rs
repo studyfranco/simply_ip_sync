@@ -478,6 +478,79 @@ fn entity_model_with_bool_fields(code: &str, attributes: &str) -> bool {
 const ENTITY_EXPECT_REASON: &str =
     "SeaORM DeriveEntityModel requires flat 1:1 fields for SQL BOOLEAN columns";
 
+fn is_ignore_attribute(contents: &str) -> bool {
+    static IGNORE: LazyLock<Regex> = LazyLock::new(|| regex(r"^\s*(?:r#)?ignore\s*(?:[=(,]|$)"));
+    static CONDITIONAL: LazyLock<Regex> = LazyLock::new(|| regex(r"^\s*(?:r#)?cfg_attr\s*\("));
+    if IGNORE.is_match(contents) {
+        return true;
+    }
+    let Some(header) = CONDITIONAL.find(contents) else {
+        return false;
+    };
+    let open = header.end() - 1;
+    let Some(close) = closing_delimiter(contents, open, b'(', b')') else {
+        return false;
+    };
+    let arguments = &contents[open + 1..close];
+    // Only top-level commas introduce attributes. The first argument is the cfg predicate.
+    let mut depth = 0;
+    for (index, byte) in arguments.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 && is_ignore_attribute(&arguments[index + 1..]) => return true,
+            _ => (),
+        }
+    }
+    false
+}
+
+#[test]
+fn rust_sources_forbid_ignored_tests() {
+    let attribute = regex(r"#\s*(?:!\s*)?\[");
+    for path in rust_files("src").chain(rust_files("tests")) {
+        let source = read(path.to_str().expect("UTF-8 path"));
+        let rust = rust_source(&source);
+        for header in attribute.find_iter(&rust.code) {
+            if let Some(end) = closing_delimiter(&rust.code, header.end() - 1, b'[', b']') {
+                assert!(
+                    !is_ignore_attribute(&rust.code[header.end()..end]),
+                    "{}: forbidden ignore attribute at byte offset {}",
+                    path.display(),
+                    header.start()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ignore_policy_covers_direct_and_conditional_attributes() {
+    for contents in [
+        "ignore",
+        " /* comment */ ignore = \"reason\"",
+        "r#ignore",
+        "ignore()",
+        "cfg_attr(test, ignore)",
+        "cfg_attr(all(test, unix), inline, cfg_attr(unix, ignore = \"reason\"))",
+    ] {
+        assert!(
+            is_ignore_attribute(&rust_source(contents).code),
+            "{contents}"
+        );
+    }
+    for contents in [
+        "ignore_other",
+        "cfg_attr(any(test, ignore), inline)",
+        "doc = \"#[ignore]\"",
+    ] {
+        assert!(
+            !is_ignore_attribute(&rust_source(contents).code),
+            "{contents}"
+        );
+    }
+}
+
 fn lint_attribute_violations(path: &Path, rust: &RustSource<'_>) -> Vec<usize> {
     static ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| regex(r"#\s*(!\s*)?\["));
     static LINT: LazyLock<Regex> = LazyLock::new(|| {
