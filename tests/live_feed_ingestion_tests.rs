@@ -10,28 +10,43 @@ use simply_ip_sync::parsers;
 /// Moved upstream 2026-08: maltrail relocated this list from `trails/static/` to `data/`. The old
 /// path returns `404`, which is exactly the drift this suite exists to surface — see
 /// `AGENT_NOTES.MD` Session 14.
-const MASS_SCANNER_URL: &str = "https://raw.githubusercontent.com/stamparm/maltrail/refs/heads/master/data/mass_scanner.txt";
-const DOH_IPV4_URL: &str = "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv4.txt";
-const VPN_IPV4_URL: &str = "https://raw.githubusercontent.com/NazgulCoder/IPLists/refs/heads/main/output/vpn-ipv4.txt";
-const DOH_IPV6_URL: &str = "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv6.txt";
+const MASS_SCANNER_URL: &str =
+    "https://raw.githubusercontent.com/stamparm/maltrail/refs/heads/master/data/mass_scanner.txt";
+const DOH_IPV4_URL: &str =
+    "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv4.txt";
+const VPN_IPV4_URL: &str =
+    "https://raw.githubusercontent.com/NazgulCoder/IPLists/refs/heads/main/output/vpn-ipv4.txt";
+const DOH_IPV6_URL: &str =
+    "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv6.txt";
 
 /// Fetches `url` and parses it with `REGEX_LINE`, asserting a non-empty set of syntactically
 /// valid IPv4/IPv6/CIDR entries. Panics (failing the test) on a network error or a non-2xx
 /// response, rather than skipping — a `#[ignore]`d test that silently passes when the network is
 /// unreachable would stop meaning anything the first time someone actually needed it to fail.
 async fn assert_feed_yields_valid_entries(url: &str) {
-    let response = reqwest::get(url).await.unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+    let response = reqwest::get(url)
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
     let status = response.status();
     assert!(status.is_success(), "GET {url} returned {status}");
-    let body = response.bytes().await.unwrap_or_else(|e| panic!("failed to read body from {url}: {e}"));
+    let body = response
+        .bytes()
+        .await
+        .unwrap_or_else(|e| panic!("failed to read body from {url}: {e}"));
 
     let parser = parsers::for_type("REGEX_LINE").expect("REGEX_LINE is a known parser type");
-    let entries = parser.parse(&body, None).unwrap_or_else(|e| panic!("REGEX_LINE failed to parse {url}: {e}"));
+    let entries = parser
+        .parse(&body, None)
+        .unwrap_or_else(|e| panic!("REGEX_LINE failed to parse {url}: {e}"));
 
-    assert!(!entries.is_empty(), "{url} yielded zero parsed entries — the feed format may have changed");
+    assert!(
+        !entries.is_empty(),
+        "{url} yielded zero parsed entries — the feed format may have changed"
+    );
     for entry in &entries {
         assert!(
-            entry.address.parse::<ipnet::IpNet>().is_ok() || entry.address.parse::<std::net::IpAddr>().is_ok(),
+            entry.address.parse::<ipnet::IpNet>().is_ok()
+                || entry.address.parse::<std::net::IpAddr>().is_ok(),
             "{url} yielded an entry that is not a valid IP/CIDR: '{}'",
             entry.address
         );
@@ -66,12 +81,21 @@ async fn doh_ipv6_blocklist_parses_to_valid_entries() {
     // an empty pass — a parser that silently extracted zero v6 addresses from a v6-only feed
     // while still reporting "non-empty" (e.g. by matching something else on the line) would slip
     // through the generic check above.
-    let response = reqwest::get(DOH_IPV6_URL).await.expect("re-fetch for v6-specific assertion");
+    let response = reqwest::get(DOH_IPV6_URL)
+        .await
+        .expect("re-fetch for v6-specific assertion");
     let body = response.bytes().await.expect("read body");
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
     let entries = parser.parse(&body, None).expect("parse");
-    let v6_count = entries.iter().filter(|e| e.address.parse::<std::net::Ipv6Addr>().is_ok()).count();
-    assert!(v6_count > 0, "doh-ipv6.txt yielded no actual IPv6 addresses among its {} entries", entries.len());
+    let v6_count = entries
+        .iter()
+        .filter(|e| e.address.parse::<std::net::Ipv6Addr>().is_ok())
+        .count();
+    assert!(
+        v6_count > 0,
+        "doh-ipv6.txt yielded no actual IPv6 addresses among its {} entries",
+        entries.len()
+    );
 }
 
 /// End-to-end through the real ingestion pipeline (not just the parser in isolation): a
@@ -85,8 +109,12 @@ async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
     use simply_ip_sync::entities::{destination_group, external_source};
     use uuid::Uuid;
 
-    let conn = sea_orm::Database::connect("sqlite::memory:").await.expect("connect");
-    simply_ip_sync::db::run_migrations(&conn).await.expect("migrate");
+    let conn = sea_orm::Database::connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    simply_ip_sync::db::run_migrations(&conn)
+        .await
+        .expect("migrate");
     let master_id = Uuid::new_v4();
     let now = Utc::now();
     let master = simply_ip_sync::entities::api_key::ActiveModel {
@@ -105,7 +133,9 @@ async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
         updated_at: Set(now),
     };
     master.insert(&conn).await.expect("insert master");
-    let state = simply_ip_sync::state::AppState::for_tests(conn.clone(), master_id).await;
+    let state = simply_ip_sync::state::AppState::for_tests(conn.clone(), master_id)
+        .await
+        .expect("build test state");
 
     let group_id = Uuid::new_v4();
     let group = destination_group::ActiveModel {
@@ -139,7 +169,12 @@ async fn live_feed_ingests_successfully_through_the_full_job_pipeline() {
 
     // No targets configured: the job still fetches and parses, it just has nothing to push to —
     // exactly what's needed to prove ingestion itself works without standing up a mock vault.
-    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
-    assert!(summary.items_processed > 0, "expected at least one parsed entry from a live feed");
+    assert!(
+        summary.items_processed > 0,
+        "expected at least one parsed entry from a live feed"
+    );
 }

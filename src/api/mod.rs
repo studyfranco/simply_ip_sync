@@ -20,11 +20,11 @@ pub(crate) use guards::*;
 /// HTTP API.
 pub use support::{generate_random_key, hash_key, key_prefix};
 
-pub use audit::*;
-pub use health::*;
-pub use keys::*;
-pub use settings::*;
-pub use sources::*;
-pub use sync_logs::*;
-pub use sync_tasks::*;
-pub use vaults::*;
+pub(crate) use audit::*;
+pub(crate) use health::*;
+pub(crate) use keys::*;
+pub(crate) use settings::*;
+pub(crate) use sources::*;
+pub(crate) use sync_logs::*;
+pub(crate) use sync_tasks::*;
+pub(crate) use vaults::*;

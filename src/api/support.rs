@@ -24,6 +24,7 @@ pub const RESOURCE_SYNC_TASK: &str = "sync_task";
 pub const RESOURCE_VAULT_ENDPOINT: &str = "vault_endpoint";
 
 /// Generates a fresh, high-entropy plaintext API key (64 hex characters).
+#[must_use]
 pub fn generate_random_key() -> String {
     let bytes: [u8; 32] = rand::rng().random();
     hex::encode(bytes)
@@ -31,6 +32,7 @@ pub fn generate_random_key() -> String {
 
 /// Hashes a plaintext API key for storage/lookup (`api_keys.key_hash`). Matches the hashing
 /// `middleware.rs` performs on every inbound `X-API-Key` header.
+#[must_use]
 pub fn hash_key(plaintext: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(plaintext.as_bytes());
@@ -38,6 +40,7 @@ pub fn hash_key(plaintext: &str) -> String {
 }
 
 /// The first 8 characters of a plaintext key, used for display and fast prefix lookups.
+#[must_use]
 pub fn key_prefix(plaintext: &str) -> String {
     plaintext.chars().take(8).collect()
 }

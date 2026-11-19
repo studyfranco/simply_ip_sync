@@ -35,13 +35,13 @@
 //! creating the table afresh, copying the rows, dropping the original, and renaming. PostgreSQL and
 //! MySQL take `ALTER COLUMN … SET NOT NULL` directly.
 //!
-//! The replacement table is built with SeaORM's schema builder rather than hand-written DDL, so its
+//! The replacement table is built with `SeaORM`'s schema builder rather than hand-written DDL, so its
 //! column types are byte-for-byte what the original migration produced. Hand-writing the `CREATE
-//! TABLE` would mean guessing how SeaORM renders `uuid` and `timestamp_with_time_zone` on each
+//! TABLE` would mean guessing how `SeaORM` renders `uuid` and `timestamp_with_time_zone` on each
 //! backend, and a near miss would silently change a column's affinity while every test still
 //! passed.
 
-use sea_orm::{ConnectionTrait, DatabaseBackend};
+use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
 /// The value written where attribution was never recorded.
@@ -86,14 +86,17 @@ enum AuditLogsRebuild {
 ///
 /// One function for both the rebuild and the `down` path so the two cannot describe different
 /// tables — the failure mode of a hand-maintained pair being that `down` quietly drops a column.
-fn table_definition(table: TableRef, attribution_not_null: bool) -> TableCreateStatement {
+pub(super) fn table_definition(
+    table: TableRef,
+    attribution_not_null: bool,
+) -> TableCreateStatement {
     let attribution = |name: AuditLogs| {
         let mut col = ColumnDef::new(name);
         col.string();
         if attribution_not_null {
             col.not_null();
         }
-        col.to_owned()
+        col.take()
     };
 
     let mut stmt = Table::create();
@@ -125,14 +128,14 @@ fn table_definition(table: TableRef, attribution_not_null: bool) -> TableCreateS
                 // own trail, which is the whole reason the denormalized columns above exist.
                 .on_delete(ForeignKeyAction::SetNull),
         );
-    stmt.to_owned()
+    stmt.take()
 }
 
 /// The composite index the initial schema put on `audit_logs`, recreated after a rebuild.
 ///
 /// A rebuild drops it with the old table. Losing it would turn every audit listing filtered or
 /// sorted by action/timestamp into a table scan — a silent performance regression no test notices.
-async fn recreate_index(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+pub(super) async fn recreate_index(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
         .create_index(
             Index::create()
@@ -151,8 +154,6 @@ async fn recreate_index(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// relying on `SELECT *`. Positional copying is what turns a future column reorder into silent
 /// data corruption — names moving into the address column, with every type still checking out.
 async fn rebuild(manager: &SchemaManager<'_>, attribution_not_null: bool) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-
     manager
         .create_table(table_definition(
             AuditLogsRebuild::Table.into_table_ref(),
@@ -170,13 +171,22 @@ async fn rebuild(manager: &SchemaManager<'_>, attribution_not_null: bool) -> Res
         "target_resource",
         "details",
         "timestamp",
-    ]
-    .join(", ");
-
-    db.execute_unprepared(&format!(
-        "INSERT INTO audit_logs_rebuild ({columns}) SELECT {columns} FROM audit_logs"
-    ))
-    .await?;
+    ];
+    manager
+        .exec_stmt(
+            Query::insert()
+                .into_table(AuditLogsRebuild::Table)
+                .columns(columns)
+                .select_from(
+                    Query::select()
+                        .columns(columns)
+                        .from(AuditLogs::Table)
+                        .take(),
+                )
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+                .take(),
+        )
+        .await?;
 
     manager
         .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
@@ -194,12 +204,16 @@ async fn rebuild(manager: &SchemaManager<'_>, attribution_not_null: bool) -> Res
 
 /// Replaces NULL attribution with [`UNRECORDED`] so the constraint can be applied to old rows.
 async fn backfill(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
     for column in ATTRIBUTION_COLUMNS {
-        db.execute_unprepared(&format!(
-            "UPDATE audit_logs SET {column} = '{UNRECORDED}' WHERE {column} IS NULL"
-        ))
-        .await?;
+        manager
+            .exec_stmt(
+                Query::update()
+                    .table(AuditLogs::Table)
+                    .value(column, UNRECORDED)
+                    .and_where(Expr::col(column).is_null())
+                    .take(),
+            )
+            .await?;
     }
     Ok(())
 }

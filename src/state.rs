@@ -57,12 +57,20 @@ pub struct AppState {
     /// Resource ids with a sync job currently executing (`jobs::try_start_job`/`JobGuard`) — guards
     /// against two overlapping executions of the same external source or sync task.
     pub running_jobs: RunningJobs,
+    /// Whether external feed ingestion and `/api/sources/test-fetch` permit private/loopback IPs.
+    /// Always `false` in production unless `ALLOW_PRIVATE_INGEST_URLS_FOR_TEST=true` is set.
+    pub allow_private_ingest_urls: bool,
 }
 
 impl AppState {
     /// Builds application state from a database connection, reading `SYNC_ENCRYPTION_KEY` and
     /// `TRUSTED_PROXIES` from the environment and starting the cron scheduler. Both env vars are
     /// security boundaries and fail hard on a malformed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupConfigError`] if environment configuration, HTTP client creation, or
+    /// scheduler startup fails.
     pub async fn new(db: DatabaseConnection) -> Result<Self, StartupConfigError> {
         let cipher = SecretCipher::from_env()?;
         let trusted_proxies = TrustedProxies::from_env()?;
@@ -80,6 +88,7 @@ impl AppState {
             http,
             scheduler: Arc::new(scheduler),
             running_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            allow_private_ingest_urls: crate::config::allow_private_ingest_urls(),
         })
     }
 
@@ -87,19 +96,35 @@ impl AppState {
     /// cipher, skipping environment reads entirely. Public (rather than `cfg(test)`-gated) so
     /// integration tests under `tests/`, which link against this crate as an ordinary dependency,
     /// can use it too.
-    pub async fn for_tests(db: DatabaseConnection, master_id: uuid::Uuid) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupConfigError`] if the HTTP client or scheduler fails to initialize.
+    pub async fn for_tests(
+        db: DatabaseConnection,
+        master_id: uuid::Uuid,
+    ) -> Result<Self, StartupConfigError> {
         let scheduler = SchedulerHandle::new()
             .await
-            .expect("scheduler starts in tests");
-        Self {
+            .map_err(|e| StartupConfigError::Scheduler(e.to_string()))?;
+        let http = crate::client::build_http_client()?;
+        Ok(Self {
             db,
             cipher: Arc::new(SecretCipher::Plaintext),
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::pinned_to(master_id)),
             trusted_proxies: TrustedProxies::default(),
-            http: crate::client::build_http_client().expect("http client builds"),
+            http,
             scheduler: Arc::new(scheduler),
             running_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-        }
+            allow_private_ingest_urls: true,
+        })
+    }
+
+    /// Overrides the private-URL ingestion escape hatch (primarily for SSRF integration tests).
+    #[must_use]
+    pub fn with_allow_private_ingest_urls(mut self, allow: bool) -> Self {
+        self.allow_private_ingest_urls = allow;
+        self
     }
 }

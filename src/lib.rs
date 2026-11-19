@@ -1,4 +1,3 @@
-#![warn(missing_docs)]
 //! `simply_ip_sync` — threat intelligence ingestion orchestrator and multi-site inter-vault
 //! replication daemon.
 //!
@@ -39,6 +38,7 @@ use state::{AppState, StartupConfigError};
 /// Maximum accepted request body size, in bytes. Single source of truth referenced by both the
 /// router's `DefaultBodyLimit` and the inbound auth middleware's signed-body buffer cap, so the
 /// two layers can never drift.
+#[must_use]
 pub fn max_request_body_bytes() -> usize {
     config::max_body_bytes()
 }
@@ -46,6 +46,10 @@ pub fn max_request_body_bytes() -> usize {
 /// Builds [`state::AppState`] from a database connection, reading environment configuration and
 /// starting the cron scheduler. Does not load scheduled jobs from the database yet — call
 /// `state.scheduler.boot(&state)` once the caller is ready to start dispatching.
+///
+/// # Errors
+///
+/// Returns [`StartupConfigError`] if environment configuration or scheduler initialization fails.
 pub async fn setup_state(db: DatabaseConnection) -> Result<AppState, StartupConfigError> {
     AppState::new(db).await
 }

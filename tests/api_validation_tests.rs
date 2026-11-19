@@ -7,7 +7,7 @@
 //! the validation after the insert (rejecting the HTTP response but leaving the row behind) would
 //! be caught.
 
-mod common;
+pub mod common;
 
 use axum::http::StatusCode;
 use sea_orm::EntityTrait;
@@ -23,7 +23,9 @@ async fn insert_vault_for_task(conn: &sea_orm::DatabaseConnection) -> Uuid {
 
     let id = Uuid::new_v4();
     let now = Utc::now();
-    let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext.seal("shared-secret").unwrap();
+    let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext
+        .seal("shared-secret")
+        .unwrap();
     let model = vault_endpoint::ActiveModel {
         id: Set(id),
         name: Set(format!("vault-{id}")),
@@ -50,7 +52,8 @@ async fn invalid_cron_on_destination_group_creation_is_rejected_with_400_and_not
             "cron_schedule": bad_cron,
             "target_group_name": "group",
         });
-        let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
+        let req =
+            common::signed_request(&master, "POST", "/api/destination-groups", Some(&payload));
         let resp = app.clone().oneshot(req).await.expect("response");
         assert_eq!(
             resp.status(),
@@ -59,8 +62,15 @@ async fn invalid_cron_on_destination_group_creation_is_rejected_with_400_and_not
         );
     }
 
-    let count = destination_group::Entity::find().all(&conn).await.expect("query groups").len();
-    assert_eq!(count, 0, "no destination group may be persisted when cron validation rejects the request");
+    let count = destination_group::Entity::find()
+        .all(&conn)
+        .await
+        .expect("query groups")
+        .len();
+    assert_eq!(
+        count, 0,
+        "no destination group may be persisted when cron validation rejects the request"
+    );
 }
 
 #[tokio::test]
@@ -74,9 +84,14 @@ async fn valid_cron_on_destination_group_creation_is_accepted() {
             "cron_schedule": good_cron,
             "target_group_name": "group",
         });
-        let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
+        let req =
+            common::signed_request(&master, "POST", "/api/destination-groups", Some(&payload));
         let resp = app.clone().oneshot(req).await.expect("response");
-        assert_eq!(resp.status(), StatusCode::OK, "cron_schedule '{good_cron}' should be accepted");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "cron_schedule '{good_cron}' should be accepted"
+        );
     }
 }
 
@@ -94,7 +109,7 @@ async fn invalid_cron_on_sync_task_creation_is_rejected_with_400_and_not_persist
             "target_group_name": "target-group",
             "cron_schedule": bad_cron,
         });
-        let req = common::signed_request(&master, "POST", "/api/sync-tasks", Some(payload));
+        let req = common::signed_request(&master, "POST", "/api/sync-tasks", Some(&payload));
         let resp = app.clone().oneshot(req).await.expect("response");
         assert_eq!(
             resp.status(),
@@ -103,8 +118,15 @@ async fn invalid_cron_on_sync_task_creation_is_rejected_with_400_and_not_persist
         );
     }
 
-    let count = vault_sync_task::Entity::find().all(&conn).await.expect("query tasks").len();
-    assert_eq!(count, 0, "no sync task may be persisted when cron validation rejects the request");
+    let count = vault_sync_task::Entity::find()
+        .all(&conn)
+        .await
+        .expect("query tasks")
+        .len();
+    assert_eq!(
+        count, 0,
+        "no sync task may be persisted when cron validation rejects the request"
+    );
 }
 
 #[tokio::test]
@@ -117,15 +139,27 @@ async fn invalid_cron_on_destination_group_update_is_rejected_without_mutating_e
         "cron_schedule": "0 0 * * *",
         "target_group_name": "group",
     });
-    let create_req = common::signed_request(&master, "POST", "/api/destination-groups", Some(create_payload));
+    let create_req = common::signed_request(
+        &master,
+        "POST",
+        "/api/destination-groups",
+        Some(&create_payload),
+    );
     let create_resp = app.clone().oneshot(create_req).await.expect("response");
     assert_eq!(create_resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(create_resp.into_body(), usize::MAX).await.expect("body");
+    let body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
     let created: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let id = created["id"].as_str().expect("id field");
 
     let update_payload = json!({ "cron_schedule": "not a cron" });
-    let update_req = common::signed_request(&master, "PATCH", &format!("/api/destination-groups/{id}"), Some(update_payload));
+    let update_req = common::signed_request(
+        &master,
+        "PATCH",
+        &format!("/api/destination-groups/{id}"),
+        Some(&update_payload),
+    );
     let update_resp = app.oneshot(update_req).await.expect("response");
     assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
 
@@ -134,7 +168,10 @@ async fn invalid_cron_on_destination_group_update_is_rejected_without_mutating_e
         .await
         .expect("query")
         .expect("row exists");
-    assert_eq!(stored.cron_schedule, "0 0 * * *", "the original valid cron_schedule must be unchanged");
+    assert_eq!(
+        stored.cron_schedule, "0 0 * * *",
+        "the original valid cron_schedule must be unchanged"
+    );
 }
 
 /// `mode` must be one of the two values `client::BatchMode::parse` recognizes — a typo here would
@@ -152,13 +189,25 @@ async fn invalid_mode_on_destination_group_creation_is_rejected_with_400_and_not
             "target_group_name": "group",
             "mode": bad_mode,
         });
-        let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
+        let req =
+            common::signed_request(&master, "POST", "/api/destination-groups", Some(&payload));
         let resp = app.clone().oneshot(req).await.expect("response");
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "mode '{bad_mode}' must be rejected with 400");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "mode '{bad_mode}' must be rejected with 400"
+        );
     }
 
-    let count = destination_group::Entity::find().all(&conn).await.expect("query groups").len();
-    assert_eq!(count, 0, "no destination group may be persisted when mode validation rejects the request");
+    let count = destination_group::Entity::find()
+        .all(&conn)
+        .await
+        .expect("query groups")
+        .len();
+    assert_eq!(
+        count, 0,
+        "no destination group may be persisted when mode validation rejects the request"
+    );
 }
 
 /// Both recognized `mode` values must be accepted, and a request that omits `mode` entirely must
@@ -175,10 +224,17 @@ async fn valid_mode_on_destination_group_creation_is_accepted_and_omission_defau
             "target_group_name": "group",
             "mode": good_mode,
         });
-        let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
+        let req =
+            common::signed_request(&master, "POST", "/api/destination-groups", Some(&payload));
         let resp = app.clone().oneshot(req).await.expect("response");
-        assert_eq!(resp.status(), StatusCode::OK, "mode '{good_mode}' should be accepted");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "mode '{good_mode}' should be accepted"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
         let created: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(created["mode"], json!(good_mode));
     }
@@ -188,12 +244,18 @@ async fn valid_mode_on_destination_group_creation_is_accepted_and_omission_defau
         "cron_schedule": "0 0 * * *",
         "target_group_name": "group",
     });
-    let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(payload));
+    let req = common::signed_request(&master, "POST", "/api/destination-groups", Some(&payload));
     let resp = app.clone().oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
     let created: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(created["mode"], json!("upsert"), "omitting mode must default to upsert");
+    assert_eq!(
+        created["mode"],
+        json!("upsert"),
+        "omitting mode must default to upsert"
+    );
 }
 
 /// An update that tries to set an invalid `mode` must be rejected without mutating the existing
@@ -209,15 +271,27 @@ async fn invalid_mode_on_destination_group_update_is_rejected_without_mutating_e
         "target_group_name": "group",
         "mode": "upsert",
     });
-    let create_req = common::signed_request(&master, "POST", "/api/destination-groups", Some(create_payload));
+    let create_req = common::signed_request(
+        &master,
+        "POST",
+        "/api/destination-groups",
+        Some(&create_payload),
+    );
     let create_resp = app.clone().oneshot(create_req).await.expect("response");
     assert_eq!(create_resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(create_resp.into_body(), usize::MAX).await.expect("body");
+    let body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
     let created: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let id = created["id"].as_str().expect("id field");
 
     let update_payload = json!({ "mode": "not_a_real_mode" });
-    let update_req = common::signed_request(&master, "PATCH", &format!("/api/destination-groups/{id}"), Some(update_payload));
+    let update_req = common::signed_request(
+        &master,
+        "PATCH",
+        &format!("/api/destination-groups/{id}"),
+        Some(&update_payload),
+    );
     let update_resp = app.oneshot(update_req).await.expect("response");
     assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
 
@@ -226,7 +300,10 @@ async fn invalid_mode_on_destination_group_update_is_rejected_without_mutating_e
         .await
         .expect("query")
         .expect("row exists");
-    assert_eq!(stored.mode, "upsert", "the original valid mode must be unchanged");
+    assert_eq!(
+        stored.mode, "upsert",
+        "the original valid mode must be unchanged"
+    );
 }
 
 /// Prompted by a pattern audited in `example/simply_ip_exporter/tests/integration.rs`
@@ -248,7 +325,8 @@ async fn oversized_inbound_body_is_rejected_cleanly_before_signature_verificatio
     let (_conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
 
-    let oversized_body = vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_BODY_MIB * 1024 * 1024 + 1024];
+    let oversized_body =
+        vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_BODY_MIB * 1024 * 1024 + 1024];
     // A *current* timestamp — `validate_timestamp`'s skew check runs even before the API key
     // lookup, so a stale/fixed one (e.g. a hardcoded past Unix timestamp) would fail there first
     // and mask the property this test actually wants to exercise.
@@ -257,21 +335,35 @@ async fn oversized_inbound_body_is_rejected_cleanly_before_signature_verificatio
         .uri("/api/destination-groups")
         .header("X-API-Key", master.plaintext_key.clone())
         .header("X-Timestamp", chrono::Utc::now().timestamp().to_string())
-        .header("X-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
+        .header(
+            "X-Signature-256",
+            "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+        )
         .header("Content-Type", "application/json")
         .body(axum::body::Body::from(oversized_body))
         .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
 
     let resp = app.oneshot(req).await.expect("response");
     // Not a 500, not a hang, not a bogus signature-mismatch 401 masking the real problem — the
     // size check runs before the (deliberately garbage) signature is ever evaluated.
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "an oversized body must be rejected cleanly (413) before signature verification is even attempted");
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an oversized body must be rejected cleanly (413) before signature verification is even attempted"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json body");
     assert!(
-        body["error"].as_str().is_some_and(|e| e.to_lowercase().contains("exceeds") || e.to_lowercase().contains("large")),
+        body["error"].as_str().is_some_and(
+            |e| e.to_lowercase().contains("exceeds") || e.to_lowercase().contains("large")
+        ),
         "the error message should explain the body was too large, got: {body}"
     );
 }
@@ -294,16 +386,26 @@ async fn a_declared_content_length_over_the_limit_is_rejected_without_reading_th
         .uri("/api/destination-groups")
         .header("X-API-Key", master.plaintext_key.clone())
         .header("X-Timestamp", chrono::Utc::now().timestamp().to_string())
-        .header("X-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
+        .header(
+            "X-Signature-256",
+            "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+        )
         .header("Content-Type", "application/json")
         .header("Content-Length", declared_len.to_string())
         .body(axum::body::Body::from("tiny"))
         .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
 
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "a declared Content-Length over the limit must be refused before the body is read");
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a declared Content-Length over the limit must be refused before the body is read"
+    );
 }
 
 /// Adapted from the same audited pattern: a malformed-but-appropriately-sized JSON body, sent with
@@ -339,11 +441,20 @@ async fn malformed_json_body_with_a_valid_signature_returns_the_standard_error_e
         .body(axum::body::Body::from(malformed_body.to_vec()))
         .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
 
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be valid JSON, not axum's default plain-text rejection");
-    assert!(body.get("error").is_some_and(|e| e.is_string()), "the standard {{\"error\": ...}} envelope must be used, got: {body}");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .expect("body must be valid JSON, not axum's default plain-text rejection");
+    assert!(
+        body.get("error").is_some_and(serde_json::Value::is_string),
+        "the standard {{\"error\": ...}} envelope must be used, got: {body}"
+    );
 }

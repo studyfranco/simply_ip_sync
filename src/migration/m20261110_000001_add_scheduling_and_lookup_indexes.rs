@@ -65,265 +65,248 @@ enum ExternalSources {
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // Destination groups: active scheduler lookups & temporal ordering
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_destination_groups_is_active")
-                    .table(DestinationGroups::Table)
-                    .col(DestinationGroups::IsActive)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_destination_groups_last_run_at")
-                    .table(DestinationGroups::Table)
-                    .col((DestinationGroups::LastRunAt, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_destination_groups_created_at")
-                    .table(DestinationGroups::Table)
-                    .col((DestinationGroups::CreatedAt, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        // Vault sync tasks: active scheduler lookups & temporal ordering
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_vault_sync_tasks_is_active")
-                    .table(VaultSyncTasks::Table)
-                    .col(VaultSyncTasks::IsActive)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_vault_sync_tasks_last_sync_at")
-                    .table(VaultSyncTasks::Table)
-                    .col((VaultSyncTasks::LastSyncAt, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_vault_sync_tasks_created_at")
-                    .table(VaultSyncTasks::Table)
-                    .col((VaultSyncTasks::CreatedAt, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        // Sync logs: status and job_type filtering with newest-first ordering
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_sync_logs_status_timestamp")
-                    .table(SyncLogs::Table)
-                    .col(SyncLogs::Status)
-                    .col((SyncLogs::Timestamp, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_sync_logs_job_type_timestamp")
-                    .table(SyncLogs::Table)
-                    .col(SyncLogs::JobType)
-                    .col((SyncLogs::Timestamp, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        // Permission lookup by resource
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_api_key_sync_permissions_resource")
-                    .table(ApiKeySyncPermissions::Table)
-                    .col(ApiKeySyncPermissions::ResourceType)
-                    .col(ApiKeySyncPermissions::ResourceId)
-                    .to_owned(),
-            )
-            .await?;
-
-        // API keys: master key checks & temporal ordering
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_api_keys_is_master")
-                    .table(ApiKeys::Table)
-                    .col(ApiKeys::IsMaster)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_api_keys_created_at")
-                    .table(ApiKeys::Table)
-                    .col((ApiKeys::CreatedAt, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        // Vault endpoints: temporal ordering
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_vault_endpoints_created_at")
-                    .table(VaultEndpoints::Table)
-                    .col((VaultEndpoints::CreatedAt, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        // External sources: temporal ordering
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_external_sources_created_at")
-                    .table(ExternalSources::Table)
-                    .col((ExternalSources::CreatedAt, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-
-        Ok(())
+        create_job_indexes(manager).await?;
+        create_lookup_indexes(manager).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_external_sources_created_at")
-                    .table(ExternalSources::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_vault_endpoints_created_at")
-                    .table(VaultEndpoints::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_api_keys_created_at")
-                    .table(ApiKeys::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_api_keys_is_master")
-                    .table(ApiKeys::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_api_key_sync_permissions_resource")
-                    .table(ApiKeySyncPermissions::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_sync_logs_job_type_timestamp")
-                    .table(SyncLogs::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_sync_logs_status_timestamp")
-                    .table(SyncLogs::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_vault_sync_tasks_created_at")
-                    .table(VaultSyncTasks::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_vault_sync_tasks_last_sync_at")
-                    .table(VaultSyncTasks::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_vault_sync_tasks_is_active")
-                    .table(VaultSyncTasks::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_destination_groups_created_at")
-                    .table(DestinationGroups::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_destination_groups_last_run_at")
-                    .table(DestinationGroups::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_destination_groups_is_active")
-                    .table(DestinationGroups::Table)
-                    .to_owned(),
-            )
-            .await
+        drop_lookup_indexes(manager).await?;
+        drop_job_indexes(manager).await
     }
+}
+
+async fn create_job_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_destination_groups_is_active")
+                .table(DestinationGroups::Table)
+                .col(DestinationGroups::IsActive)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_destination_groups_last_run_at")
+                .table(DestinationGroups::Table)
+                .col((DestinationGroups::LastRunAt, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_destination_groups_created_at")
+                .table(DestinationGroups::Table)
+                .col((DestinationGroups::CreatedAt, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_vault_sync_tasks_is_active")
+                .table(VaultSyncTasks::Table)
+                .col(VaultSyncTasks::IsActive)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_vault_sync_tasks_last_sync_at")
+                .table(VaultSyncTasks::Table)
+                .col((VaultSyncTasks::LastSyncAt, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_vault_sync_tasks_created_at")
+                .table(VaultSyncTasks::Table)
+                .col((VaultSyncTasks::CreatedAt, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await
+}
+
+async fn create_lookup_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_sync_logs_status_timestamp")
+                .table(SyncLogs::Table)
+                .col(SyncLogs::Status)
+                .col((SyncLogs::Timestamp, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_sync_logs_job_type_timestamp")
+                .table(SyncLogs::Table)
+                .col(SyncLogs::JobType)
+                .col((SyncLogs::Timestamp, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_api_key_sync_permissions_resource")
+                .table(ApiKeySyncPermissions::Table)
+                .col(ApiKeySyncPermissions::ResourceType)
+                .col(ApiKeySyncPermissions::ResourceId)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_api_keys_is_master")
+                .table(ApiKeys::Table)
+                .col(ApiKeys::IsMaster)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_api_keys_created_at")
+                .table(ApiKeys::Table)
+                .col((ApiKeys::CreatedAt, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_vault_endpoints_created_at")
+                .table(VaultEndpoints::Table)
+                .col((VaultEndpoints::CreatedAt, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("idx_external_sources_created_at")
+                .table(ExternalSources::Table)
+                .col((ExternalSources::CreatedAt, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await
+}
+
+async fn drop_lookup_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_external_sources_created_at")
+                .table(ExternalSources::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_vault_endpoints_created_at")
+                .table(VaultEndpoints::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_api_keys_created_at")
+                .table(ApiKeys::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_api_keys_is_master")
+                .table(ApiKeys::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_api_key_sync_permissions_resource")
+                .table(ApiKeySyncPermissions::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_sync_logs_job_type_timestamp")
+                .table(SyncLogs::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_sync_logs_status_timestamp")
+                .table(SyncLogs::Table)
+                .to_owned(),
+        )
+        .await
+}
+
+async fn drop_job_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_vault_sync_tasks_created_at")
+                .table(VaultSyncTasks::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_vault_sync_tasks_last_sync_at")
+                .table(VaultSyncTasks::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_vault_sync_tasks_is_active")
+                .table(VaultSyncTasks::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_destination_groups_created_at")
+                .table(DestinationGroups::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_destination_groups_last_run_at")
+                .table(DestinationGroups::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .name("idx_destination_groups_is_active")
+                .table(DestinationGroups::Table)
+                .to_owned(),
+        )
+        .await
 }

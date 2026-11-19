@@ -1,13 +1,15 @@
 //! System settings & introspection endpoint (`GET /api/settings`).
 //! Master-only: reports effective runtime configuration and entity counts.
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use axum::response::IntoResponse;
 use sea_orm::{EntityTrait, PaginatorTrait};
 use serde::Serialize;
 
-use crate::entities::{api_key, audit_log, destination_group, sync_log, vault_endpoint, vault_sync_task};
+use crate::entities::{
+    api_key, audit_log, destination_group, sync_log, vault_endpoint, vault_sync_task,
+};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -55,7 +57,12 @@ pub async fn get_settings(
     let audit_log_count = audit_log::Entity::find().count(&state.db).await?;
 
     Ok(Json(SettingsResponse {
-        trusted_proxies: state.trusted_proxies.matchers().iter().map(ToString::to_string).collect(),
+        trusted_proxies: state
+            .trusted_proxies
+            .matchers()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         encryption_enabled: state.cipher.is_encrypting(),
         max_decompressed_bytes: crate::config::max_decompressed_bytes(),
         outbound_http_timeout_secs: crate::config::outbound_http_timeout().as_secs(),

@@ -52,6 +52,7 @@ pub enum CryptoError {
 }
 
 /// Generates a fresh 256-bit HMAC signing secret, hex-encoded.
+#[must_use]
 pub fn generate_signing_secret() -> String {
     let bytes: [u8; 32] = rand::rng().random();
     hex::encode(bytes)
@@ -59,6 +60,7 @@ pub fn generate_signing_secret() -> String {
 
 /// Builds the `CANONICAL_V1` byte string: `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`, newline
 /// delimited, no trailing newline. `TARGET` must be the full request path plus query string.
+#[must_use]
 pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
     let mut message =
         Vec::with_capacity(method.len() + target.len() + timestamp.len() + body.len() + 3);
@@ -73,6 +75,10 @@ pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &
 }
 
 /// Computes `sha256=<hex>` over the `CANONICAL_V1` payload using `secret`.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] if initializing the HMAC context fails.
 pub fn compute_signature(
     secret: &str,
     method: &str,
@@ -95,6 +101,7 @@ pub fn compute_signature(
 /// bytes on success (for the replay guard to key on), `None` on any failure. Must only be called
 /// on the way to authenticating a request; the returned digest must not be recorded via the
 /// replay guard until verification has actually succeeded.
+#[must_use]
 pub fn verify_signature(
     secret: &str,
     method: &str,
@@ -123,6 +130,10 @@ pub enum SecretCipher {
 impl SecretCipher {
     /// Builds a cipher from `SYNC_ENCRYPTION_KEY`. `Ok(Plaintext)` if unset or empty;
     /// `Err(InvalidKey)` if set but not exactly 64 hex characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::InvalidKey`] if `SYNC_ENCRYPTION_KEY` is present but malformed.
     pub fn from_env() -> Result<Self, CryptoError> {
         let configured = crate::config::get_secret_or_env(ENCRYPTION_KEY_ENV);
         match configured {
@@ -132,6 +143,10 @@ impl SecretCipher {
     }
 
     /// Builds a `Sealed` cipher directly from a 64 hex character key. Exposed for tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::InvalidKey`] if `hex_key` is not 64 valid hex characters.
     pub fn from_hex_key(hex_key: &str) -> Result<Self, CryptoError> {
         let bytes = hex::decode(hex_key).map_err(|_| CryptoError::InvalidKey)?;
         if bytes.len() != KEY_LEN {
@@ -143,11 +158,16 @@ impl SecretCipher {
     }
 
     /// True when this cipher actually encrypts (i.e. `SYNC_ENCRYPTION_KEY` was configured).
+    #[must_use]
     pub fn is_encrypting(&self) -> bool {
         matches!(self, Self::Sealed(_))
     }
 
     /// Seals `plaintext` into its stored envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::EncryptionFailed`] if AEAD sealing fails.
     pub fn seal(&self, plaintext: &str) -> Result<String, CryptoError> {
         match self {
             Self::Plaintext => Ok(format!("{PLAINTEXT_PREFIX}{}", hex::encode(plaintext))),
@@ -168,6 +188,11 @@ impl SecretCipher {
 
     /// Opens a stored envelope back into plaintext. Fail-closed: only the two shapes `seal()` can
     /// produce are accepted; anything else is `MalformedCiphertext`, never returned verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError`] if the envelope prefix is unrecognised, hex decoding fails, or AEAD
+    /// authentication fails.
     pub fn open(&self, stored: &str) -> Result<String, CryptoError> {
         if let Some(encoded) = stored.strip_prefix(PLAINTEXT_PREFIX) {
             let bytes = hex::decode(encoded).map_err(|_| CryptoError::MalformedCiphertext)?;
@@ -196,6 +221,21 @@ impl SecretCipher {
         }
         Err(CryptoError::MalformedCiphertext)
     }
+
+    /// Opens a stored credential, accepting unprefixed legacy plaintext rows created before a
+    /// column was migrated to at-rest sealing while strictly verifying any envelope prefixed with
+    /// `v1.plain.` or `v1.xchacha20poly1305.`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError`] if an envelope-prefixed value fails validation or decryption.
+    pub fn open_legacy_or_sealed(&self, stored: &str) -> Result<String, CryptoError> {
+        if stored.starts_with(PLAINTEXT_PREFIX) || stored.starts_with(SEALED_PREFIX) {
+            self.open(stored)
+        } else {
+            Ok(stored.to_owned())
+        }
+    }
 }
 
 /// Result of the boot-time encryption-key canary.
@@ -219,6 +259,10 @@ pub enum KeyCanary {
 /// `sample` is any stored envelope (`api_key.signing_secret`); `None` means the database holds no
 /// sealed secrets yet. Pure and infallible-by-inspection so it can be unit-tested without a
 /// database.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] if `sample` cannot be opened with `cipher`.
 pub fn check_key_canary(
     cipher: &SecretCipher,
     sample: Option<&str>,

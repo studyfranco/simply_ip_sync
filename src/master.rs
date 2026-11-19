@@ -46,6 +46,7 @@ pub struct MasterPin {
 
 impl MasterPin {
     /// An unpinned handle.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             cell: OnceLock::new(),
@@ -53,6 +54,7 @@ impl MasterPin {
     }
 
     /// Test-only: builds a handle already pinned to `id`, without a database query.
+    #[must_use]
     pub fn pinned_to(id: Uuid) -> Self {
         let cell = OnceLock::new();
         let _ = cell.set(id);
@@ -60,6 +62,7 @@ impl MasterPin {
     }
 
     /// The pinned Master id, if this handle has been pinned yet.
+    #[must_use]
     pub fn get(&self) -> Option<Uuid> {
         self.cell.get().copied()
     }
@@ -68,6 +71,11 @@ impl MasterPin {
     /// and Master bootstrap, and before the listener binds — moving it later reopens the
     /// tampering window this module exists to close. Idempotent: a second call is a cheap
     /// `OnceLock` read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MasterPinError`] if no Master key, multiple Master keys, a missing uniqueness
+    /// index, or a database error is encountered.
     pub async fn pin_at_boot(&self, db: &DatabaseConnection) -> Result<Uuid, MasterPinError> {
         if let Some(pinned) = self.cell.get() {
             return Ok(*pinned);
@@ -82,10 +90,25 @@ impl MasterPin {
         Ok(pinned)
     }
 
-    /// Re-resolves the current sole Master from the database. Fails closed: any error, or zero /
-    /// multiple masters, yields `None` rather than propagating detail to a caller.
+    /// Returns the pinned Master id, resolving it from the database once if neither
+    /// [`Self::pin_at_boot`] nor [`Self::pinned_to`] has populated the cell yet.
+    ///
+    /// Once set, `self.cell` is authoritative for the lifetime of the process — subsequent runtime
+    /// `is_master` edits in the database cannot move the pin. Fails closed: any error, or zero /
+    /// multiple masters before pinning, yields `None` rather than propagating detail to a caller.
     pub async fn resolve(&self, db: &DatabaseConnection) -> Option<Uuid> {
-        Self::sole_master(db).await.ok()
+        if let Some(pinned) = self.cell.get().copied() {
+            return Some(pinned);
+        }
+        match self.pin_at_boot(db).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::error!(
+                    "Master identity is unresolvable, so no caller will be treated as Master: {e}"
+                );
+                None
+            }
+        }
     }
 
     /// The single choke point every authenticated request passes through. If `key.is_master` is
@@ -127,5 +150,89 @@ impl MasterPin {
 impl Default for MasterPin {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ActiveValue::Set, Database};
+    use sea_orm_migration::MigratorTrait;
+
+    #[tokio::test]
+    async fn resolve_ignores_runtime_is_master_promotion() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::migration::Migrator::up(&db, None).await.unwrap();
+
+        let original_id = Uuid::new_v4();
+        let promoted_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let original = api_key::ActiveModel {
+            id: Set(original_id),
+            name: Set("Master".to_owned()),
+            key_hash: Set("h1".to_owned()),
+            signing_secret: Set(Some("v1.plain.736563726574".to_owned())),
+            prefix: Set("11111111".to_owned()),
+            is_master: Set(true),
+            can_manage_keys: Set(true),
+            can_manage_sources: Set(true),
+            can_manage_vaults: Set(true),
+            parent_key_id: Set(None),
+            bound_ips: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        let other = api_key::ActiveModel {
+            id: Set(promoted_id),
+            name: Set("Attacker".to_owned()),
+            key_hash: Set("h2".to_owned()),
+            signing_secret: Set(Some("v1.plain.736563726574".to_owned())),
+            prefix: Set("22222222".to_owned()),
+            is_master: Set(false),
+            can_manage_keys: Set(false),
+            can_manage_sources: Set(false),
+            can_manage_vaults: Set(false),
+            parent_key_id: Set(Some(original_id)),
+            bound_ips: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        ApiKey::insert(original).exec(&db).await.unwrap();
+        ApiKey::insert(other).exec(&db).await.unwrap();
+
+        let pin = MasterPin::new();
+        assert_eq!(pin.pin_at_boot(&db).await.unwrap(), original_id);
+
+        // Simulate runtime tampering in DB: demote the original master and promote the attacker.
+        ApiKey::update_many()
+            .col_expr(
+                api_key::Column::IsMaster,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .filter(api_key::Column::Id.eq(original_id))
+            .exec(&db)
+            .await
+            .unwrap();
+        ApiKey::update_many()
+            .col_expr(
+                api_key::Column::IsMaster,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(api_key::Column::Id.eq(promoted_id))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(pin.resolve(&db).await, Some(original_id));
+
+        let mut forged = ApiKey::find_by_id(promoted_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(forged.is_master);
+        pin.authenticate(&db, &mut forged).await;
+        assert!(!forged.is_master, "runtime-promoted key must be demoted");
     }
 }

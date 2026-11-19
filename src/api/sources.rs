@@ -667,7 +667,7 @@ pub struct UpdateFeedPayload {
 
 /// Loads feed `feed_id`, confirms it belongs to `group_id` (so a client can't reach a different
 /// group's feed through a mismatched path pair), and returns it — `404` on either a missing feed
-/// or a feed/group mismatch, identical to a genuinely nonexistent id (RBAC_MODEL.md §4's oracle
+/// or a feed/group mismatch, identical to a genuinely nonexistent id (`RBAC_MODEL.md` §4's oracle
 /// discipline).
 async fn load_feed_in_group(
     db: &sea_orm::DatabaseConnection,
@@ -841,7 +841,7 @@ pub async fn delete_feed(
 
 /// `POST /api/sources/test-fetch` request: the same fields a feed create/update payload would
 /// carry for the fetch+parse pipeline, and nothing else — no `id`, no group, no target vaults.
-/// This is deliberately usable against values that have never been saved (the WebUI's "Test
+/// This is deliberately usable against values that have never been saved (the `WebUI`'s "Test
 /// Fetch" button in the New/Edit Feed form calls it with whatever is currently typed, before
 /// `Create` or `Save` is even clicked).
 #[derive(Debug, Deserialize)]
@@ -857,7 +857,7 @@ pub struct TestFetchPayload {
 }
 
 /// Cap on how many extracted addresses the response actually carries. A feed can legitimately
-/// contain hundreds of thousands of entries; the WebUI's whole purpose here is "does this
+/// Contain hundreds of thousands of entries; the `WebUI`'s whole purpose here is "does this
 /// config work and does it look right", not a full preview of the result set, so returning
 /// everything would make the request slow to transfer and the response unusable to actually read.
 const TEST_FETCH_SAMPLE_LIMIT: usize = 50;
@@ -890,9 +890,10 @@ pub async fn test_fetch_external_source(
         &payload.source_url,
         &payload.parser_type,
         payload.parser_config_json.as_deref(),
+        state.allow_private_ingest_urls,
     )
     .await;
-    let duration_ms = start.elapsed().as_millis() as i32;
+    let duration_ms = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
 
     let (status, total_extracted, sample, error) = match result {
         Ok(records) => {

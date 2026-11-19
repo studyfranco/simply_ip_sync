@@ -4,7 +4,7 @@
 //! 3. Active scheduler lookup on `destination_groups.is_active`: Sequential Scan vs Indexed Scan.
 //! 4. Log status querying on `sync_logs(status, timestamp DESC)`: Sequential Scan vs Indexed Scan.
 
-mod common;
+pub mod common;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -19,12 +19,12 @@ use simply_ip_sync::entities::{
 };
 use uuid::Uuid;
 
-#[tokio::test]
-async fn benchmark_destination_groups_n_plus_one_vs_batched() {
-    let (conn, _state, master) = common::setup().await;
+async fn seed_destination_groups_fixture(
+    conn: &sea_orm::DatabaseConnection,
+    master_id: Uuid,
+    count: usize,
+) {
     let now = Utc::now();
-
-    // 1. Setup vault endpoint
     let vault_id = Uuid::new_v4();
     let v_model = vault_endpoint::ActiveModel {
         id: Set(vault_id),
@@ -33,18 +33,14 @@ async fn benchmark_destination_groups_n_plus_one_vs_batched() {
         api_key: Set("key".to_owned()),
         signing_secret: Set("v1.plain.616263".to_owned()),
         description: Set(None),
-        owner_key_id: Set(Some(master.id)),
+        owner_key_id: Set(Some(master_id)),
         created_at: Set(now),
         updated_at: Set(now),
     };
-    v_model.insert(&conn).await.expect("insert vault");
+    v_model.insert(conn).await.expect("insert vault");
 
-    // 2. Seed 60 destination groups with targets and feeds
-    let count = 60;
-    let mut group_ids = Vec::with_capacity(count);
     for i in 0..count {
         let gid = Uuid::new_v4();
-        group_ids.push(gid);
         let g = destination_group::ActiveModel {
             id: Set(gid),
             name: Set(format!("BenchGroup_{i}")),
@@ -54,18 +50,18 @@ async fn benchmark_destination_groups_n_plus_one_vs_batched() {
             is_active: Set(true),
             skip_bogon_filtering: Set(false),
             last_run_at: Set(None),
-            owner_key_id: Set(Some(master.id)),
+            owner_key_id: Set(Some(master_id)),
             created_at: Set(now),
             updated_at: Set(now),
         };
-        g.insert(&conn).await.expect("insert group");
+        g.insert(conn).await.expect("insert group");
 
         let target = destination_group_vault_target::ActiveModel {
             destination_group_id: Set(gid),
             vault_endpoint_id: Set(vault_id),
             target_group_name: Set(None),
         };
-        target.insert(&conn).await.expect("insert target");
+        target.insert(conn).await.expect("insert target");
 
         let feed = external_source::ActiveModel {
             id: Set(Uuid::new_v4()),
@@ -79,12 +75,22 @@ async fn benchmark_destination_groups_n_plus_one_vs_batched() {
             created_at: Set(now),
             updated_at: Set(now),
         };
-        feed.insert(&conn).await.expect("insert feed");
+        feed.insert(conn).await.expect("insert feed");
     }
+}
+
+#[tokio::test]
+async fn benchmark_destination_groups_n_plus_one_vs_batched() {
+    let (conn, _state, master) = common::setup().await;
+    let count = 60;
+    seed_destination_groups_fixture(&conn, master.id, count).await;
 
     // ── BEFORE: N+1 sequential querying ─────────────────────────────────────
     let start_before = Instant::now();
-    let all_groups = destination_group::Entity::find().all(&conn).await.expect("all");
+    let all_groups = destination_group::Entity::find()
+        .all(&conn)
+        .await
+        .expect("all");
     let mut before_results = Vec::new();
     for g in all_groups {
         let targets = destination_group_vault_target::Entity::find()
@@ -103,7 +109,10 @@ async fn benchmark_destination_groups_n_plus_one_vs_batched() {
 
     // ── AFTER: Batched O(1) round-trip querying ─────────────────────────────
     let start_after = Instant::now();
-    let all_groups = destination_group::Entity::find().all(&conn).await.expect("all");
+    let all_groups = destination_group::Entity::find()
+        .all(&conn)
+        .await
+        .expect("all");
     let ids: Vec<Uuid> = all_groups.iter().map(|g| g.id).collect();
 
     let all_targets = destination_group_vault_target::Entity::find()
@@ -113,7 +122,10 @@ async fn benchmark_destination_groups_n_plus_one_vs_batched() {
         .expect("all targets");
     let mut targets_map: HashMap<Uuid, Vec<_>> = HashMap::new();
     for t in all_targets {
-        targets_map.entry(t.destination_group_id).or_default().push(t);
+        targets_map
+            .entry(t.destination_group_id)
+            .or_default()
+            .push(t);
     }
 
     let all_feeds = external_source::Entity::find()
@@ -206,7 +218,10 @@ async fn benchmark_sync_tasks_n_plus_one_vs_batched() {
 
     // ── BEFORE: N+1 sequential loading ───────────────────────────────────────
     let start_before = Instant::now();
-    let tasks = vault_sync_task::Entity::find().all(&conn).await.expect("tasks");
+    let tasks = vault_sync_task::Entity::find()
+        .all(&conn)
+        .await
+        .expect("tasks");
     let mut before_results = Vec::new();
     for t in tasks {
         let targets = vault_sync_task_target::Entity::find()
@@ -220,7 +235,10 @@ async fn benchmark_sync_tasks_n_plus_one_vs_batched() {
 
     // ── AFTER: Batched loading ───────────────────────────────────────────────
     let start_after = Instant::now();
-    let tasks = vault_sync_task::Entity::find().all(&conn).await.expect("tasks");
+    let tasks = vault_sync_task::Entity::find()
+        .all(&conn)
+        .await
+        .expect("tasks");
     let tids: Vec<Uuid> = tasks.iter().map(|t| t.id).collect();
     let all_targets = vault_sync_task_target::Entity::find()
         .filter(vault_sync_task_target::Column::VaultSyncTaskId.is_in(tids))

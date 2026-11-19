@@ -1,4 +1,4 @@
-//! `REGEX_LINE` parser: line-by-line text feeds (Spamhaus DROP lists, FireHOL, plain IP lists,
+//! `REGEX_LINE` parser: line-by-line text feeds (Spamhaus DROP lists, `FireHOL`, plain IP lists,
 //! SANS ISC's `block.txt`). Strips comments and extracts IPv4/IPv6 addresses and CIDR subnets.
 //!
 //! Decoded with [`String::from_utf8_lossy`], not a hard UTF-8 validation — a feed host serving
@@ -40,15 +40,18 @@ use regex::Regex;
 
 use super::{FeedParser, ParseError, ParsedRecord, normalize_ip_or_cidr};
 
-fn ip_token_pattern() -> &'static Regex {
-    static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| {
+fn ip_token_pattern() -> Result<&'static Regex, ParseError> {
+    static PATTERN: OnceLock<Result<Regex, String>> = OnceLock::new();
+    let res = PATTERN.get_or_init(|| {
         // IPv4 (optionally /N), or IPv6 (optionally /N). Deliberately permissive at the token
         // level — validity is decided by `normalize_ip_or_cidr` parsing the matched text, not by
         // this pattern, since a byte-perfect IP regex is both hard to get right and unnecessary
         // when every match is re-validated immediately after extraction.
         Regex::new(r"(?:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?:/[0-9]{1,2})?)|(?:[0-9a-fA-F:]{2,}(?:/[0-9]{1,3})?)")
-            .expect("static regex is valid")
+            .map_err(|e| e.to_string())
+    });
+    res.as_ref().map_err(|err| {
+        ParseError::InvalidConfig(format!("failed to compile IP token regex: {err}"))
     })
 }
 
@@ -92,7 +95,7 @@ pub struct RegexLineParser;
 impl FeedParser for RegexLineParser {
     fn parse(&self, raw: &[u8], _config: Option<&str>) -> Result<Vec<ParsedRecord>, ParseError> {
         let text = String::from_utf8_lossy(raw);
-        let pattern = ip_token_pattern();
+        let pattern = ip_token_pattern()?;
         let mut results = Vec::new();
         for line in text.lines() {
             let trimmed = strip_inline_comment(line).trim();

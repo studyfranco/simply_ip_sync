@@ -96,11 +96,16 @@ directory that contains a `.git` — see that script for the graceful offline-mo
 - **Backend:** Rust + Axum (0.8+) + Tokio (1.x).
 - **Default Port:** `3003` (`BIND_HOST` / `PORT`).
 - **Encryption Key:** `SYNC_ENCRYPTION_KEY` (XChaCha20-Poly1305, 64 hex characters).
-- **ORM (SQL-Agnostic):** SeaORM (2.0+). Defaults to **SQLite** for zero-config local development/testing, but MUST remain strictly **SQL-agnostic** (PostgreSQL-ready). **Never write vendor-specific raw SQL queries.**
-  - **Zero raw SQL for DML in `src/`.** Use typed entity methods (`Entity::find()`, `ActiveModel`) or SeaQuery builders.
-  - Exceptions: `src/migration/` for DDL generated columns, and SQLite `PRAGMA` setup in `src/db.rs`.
-- **Database Setup (`src/db.rs`):** SQLite connection pool pinned to `max_connections = 1` with 4 WAL session pragmas (`foreign_keys=ON`, `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`).
+- **ORM (SQL-Agnostic):** SeaORM (2.0+). Defaults to **SQLite** for zero-config local development/testing, but MUST remain strictly **SQL-agnostic** (PostgreSQL/MySQL-ready). **Never write vendor-specific raw SQL queries.**
+  - **Zero raw SQL in `src/` and `src/migration/` (only `"SELECT 1"` is permitted by `tests/source_hygiene.rs`).** Use typed entity methods (`Entity::find()`, `ActiveModel`), `SchemaManager`, or SeaQuery builders (`Query::select`, `Query::update`, `Query::insert().select_from(...)`, `ColumnDef::extra(...)`).
+- **Database Setup (`src/db.rs`):** SQLite connection pool pinned to `max_connections = 1` with session pragmas configured directly on `SqliteConnectOptions` (`foreign_keys=ON`, `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `temp_store=MEMORY`, `mmap_size`, `cache_size`, `analysis_limit`). Index inspection uses `SchemaManager::has_index`.
 - **Frontend:** STRICTLY Vanilla JS, HTML5, and CSS3. **NO external dependencies** (No React, Vue, Tailwind, Bootstrap, CDN links, or Axios). Native `fetch()` only.
+  - **UX & Modal Standard (Suite-Wide):**
+    - **Modals-Above-Lists:** Every primary Add/Create button (`+ New Destination Group`, `+ New Feed`, `+ New Task`, `+ New Vault`, `+ New Key`) sits in the `.list-header` **above** its table/list and opens a widened modal popup (`>= 720px` on desktop, `.modal-card-form`) for create/edit — never an inline form injected into the page body.
+    - **Contrast & Surfaces:** Form modals use a `#383e45` grey surface (`border: 1px solid #565b63`) with `#17191b` (`--bg-input`) dark inputs — never black-on-black!
+    - **Secret Reveal:** One-time API keys and signing secrets render in `#secret-reveal-modal` using `.key-reveal-value` with a **1-line ellipsis** (`white-space: nowrap; overflow: hidden; text-overflow: ellipsis`) and dedicated Copy buttons.
+    - **RBAC & Audit Parity:** Master privilege scope badge uses the red `.badge-scope-master` style, `.scope-badges` wraps with explicit `row-gap`/`line-height` spacing, and Audit Logs display the uniform 6-column layout (`Timestamp | API Key | Client IP | Action | Target | Details`).
+    - **No inline `onclick=`:** Use `addEventListener` / `data-*` delegation.
   - **Reverse-proxy subpath aware:** `static/app.js`'s `SyncClient` derives its request path from `window.location.pathname` (`deriveRequestBase`), so mounting the dashboard under a prefix (e.g. `https://host/ip_sync/`) needs no build-time configuration. A separate, operator-overridable `signingBase` (the "API base path override" login field, persisted in `localStorage`) covers the one thing the browser cannot discover: whether the proxy strips that prefix before forwarding to this service, which changes what path `middleware.rs::signed_target` actually verifies against.
 - **Quality & Safety:**
   - Zero compiler warnings, zero `clippy` warnings.

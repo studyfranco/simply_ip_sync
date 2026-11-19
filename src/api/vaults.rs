@@ -157,6 +157,7 @@ pub async fn create_vault_endpoint(
 ) -> Result<impl IntoResponse, AppError> {
     guard_resource_creation(&caller, caller.can_manage_vaults)?;
 
+    let sealed_api_key = state.cipher.seal(&payload.api_key)?;
     let sealed_secret = state.cipher.seal(&payload.signing_secret)?;
     let now = Utc::now();
     let id = Uuid::new_v4();
@@ -164,7 +165,7 @@ pub async fn create_vault_endpoint(
         id: Set(id),
         name: Set(payload.name.clone()),
         target_url: Set(payload.target_url),
-        api_key: Set(payload.api_key),
+        api_key: Set(sealed_api_key),
         signing_secret: Set(sealed_secret),
         description: Set(payload.description),
         owner_key_id: Set(Some(caller.id)),
@@ -226,7 +227,7 @@ pub async fn update_vault_endpoint(
         active.target_url = Set(target_url);
     }
     if let Some(api_key_val) = payload.api_key {
-        active.api_key = Set(api_key_val);
+        active.api_key = Set(state.cipher.seal(&api_key_val)?);
     }
     if let Some(secret) = payload.signing_secret {
         active.signing_secret = Set(state.cipher.seal(&secret)?);

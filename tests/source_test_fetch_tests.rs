@@ -3,26 +3,30 @@
 //! the response shape for each outcome (`SUCCESS`/`PARTIAL`/`FAILED`), sample truncation, and that
 //! nothing is persisted regardless of outcome.
 
-mod common;
+pub mod common;
+
+use std::fmt::Write as _;
 
 use axum::http::StatusCode;
 use sea_orm::EntityTrait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use simply_ip_sync::entities::{audit_log, external_source};
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn call(
-    app: axum::Router,
-    key: &common::TestKey,
-    body: Value,
-) -> (StatusCode, Value) {
-    let req = common::signed_request(key, "POST", "/api/sources/test-fetch", Some(body));
+async fn call(app: axum::Router, key: &common::TestKey, body: Value) -> (StatusCode, Value) {
+    let req = common::signed_request(key, "POST", "/api/sources/test-fetch", Some(&body));
     let resp = app.oneshot(req).await.expect("response");
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
-    let parsed: Value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).expect("json") };
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let parsed: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("json")
+    };
     (status, parsed)
 }
 
@@ -32,7 +36,7 @@ async fn call(
 #[tokio::test]
 async fn a_key_without_can_manage_sources_is_forbidden() {
     let (conn, state, _master) = common::setup().await;
-    let unprivileged = common::insert_key(&conn, "NoRights", false, false, false, false, None).await;
+    let unprivileged = common::insert_key(&conn, "NoRights", false, false, false, None).await;
     let app = simply_ip_sync::create_app(state);
 
     let (status, _) = call(
@@ -55,7 +59,7 @@ async fn a_key_with_can_manage_sources_is_accepted() {
         .respond_with(ResponseTemplate::new(200).set_body_string("203.0.113.9\n"))
         .mount(&feed_mock)
         .await;
-    let manager = common::insert_key(&conn, "SourceManager", false, false, true, false, None).await;
+    let manager = common::insert_key(&conn, "SourceManager", false, true, false, None).await;
     let app = simply_ip_sync::create_app(state);
 
     let (status, body) = call(
@@ -92,7 +96,10 @@ async fn a_working_regex_line_feed_reports_success_with_the_extracted_sample() {
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/feed.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("203.0.113.9\n198.51.100.4\n# comment\n203.0.113.9\n"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("203.0.113.9\n198.51.100.4\n# comment\n203.0.113.9\n"),
+        )
         .mount(&feed_mock)
         .await;
     let app = simply_ip_sync::create_app(state);
@@ -105,7 +112,10 @@ async fn a_working_regex_line_feed_reports_success_with_the_extracted_sample() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "SUCCESS");
-    assert_eq!(body["total_extracted"], 2, "the duplicate address must be deduplicated");
+    assert_eq!(
+        body["total_extracted"], 2,
+        "the duplicate address must be deduplicated"
+    );
     let sample = body["sample"].as_array().expect("sample array");
     assert_eq!(sample.len(), 2);
     assert!(sample.iter().any(|v| v == "203.0.113.9"));
@@ -114,9 +124,9 @@ async fn a_working_regex_line_feed_reports_success_with_the_extracted_sample() {
 }
 
 /// `JSON_PATH` with `array_path`/`target_address` (`$.`-prefixed) is exercised end-to-end here
-/// too, not just `REGEX_LINE` — this is exactly the AbuseIPDB-shaped config the WebUI's help text
+/// too, not just `REGEX_LINE` — this is exactly the `AbuseIPDB`-shaped config the `WebUI`'s help text
 /// points at.
-/// The fixture body below is a trimmed, real response from AbuseIPDB's own
+/// The fixture body below is a trimmed, real response from `AbuseIPDB`'s own
 /// `GET /api/v2/blacklist?ipVersion=4` (fetched once during development, per the live shape's own
 /// one-request-per-key-refresh rate limit — never hit that endpoint from an automated test, per
 /// AGENT.MD's "local fixtures... never against the live rate-limited source" rule), kept as-is
@@ -160,7 +170,7 @@ async fn a_working_json_path_feed_with_array_path_and_ip_field_reports_success()
     assert!(sample.iter().any(|v| v == "34.128.85.64"));
 }
 
-/// Same real-source pattern as the IPv4 test above, but for AbuseIPDB's IPv6 blacklist
+/// Same real-source pattern as the IPv4 test above, but for `AbuseIPDB`'s IPv6 blacklist
 /// (`GET /api/v2/blacklist?ipVersion=6`) -- a separately fetched, separately real fixture, since
 /// IPv6 address normalization (`::` compression, canonical form) has its own edge cases a purely
 /// synthetic fixture could accidentally not exercise.
@@ -201,7 +211,7 @@ async fn a_working_json_path_feed_with_real_ipv6_addresses_reports_success() {
     assert!(sample.iter().any(|v| v == "2a0f:ca80:b00b:9346::5"));
 }
 
-/// A custom header configured in `parser_config_json` (the same mechanism the WebUI's Custom
+/// A custom header configured in `parser_config_json` (the same mechanism the `WebUI`'s Custom
 /// Headers editor writes into) must actually reach the remote feed, exactly as a real scheduled
 /// run would send it -- the whole point of a "test" tool is that it exercises the same path.
 #[tokio::test]
@@ -227,7 +237,10 @@ async fn a_configured_custom_header_is_actually_sent_to_the_feed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "SUCCESS", "wiremock only matches the mocked route when the header is present");
+    assert_eq!(
+        body["status"], "SUCCESS",
+        "wiremock only matches the mocked route when the header is present"
+    );
 }
 
 /// A feed that never returns 2xx (host unreachable here — nothing listens on port 1) is reported
@@ -259,7 +272,9 @@ async fn a_feed_with_zero_extractable_entries_reports_partial() {
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/empty.html"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("<html><body>nothing here</body></html>"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("<html><body>nothing here</body></html>"),
+        )
         .mount(&feed_mock)
         .await;
     let app = simply_ip_sync::create_app(state);
@@ -282,7 +297,10 @@ async fn a_feed_with_zero_extractable_entries_reports_partial() {
 async fn a_feed_exceeding_the_sample_cap_reports_the_true_total_and_a_truncated_sample() {
     let (_conn, state, master) = common::setup().await;
     let feed_mock = MockServer::start().await;
-    let body_text: String = (0..75).map(|i| format!("10.0.{}.{}\n", i / 256, i % 256)).collect();
+    let mut body_text = String::new();
+    for i in 0..75 {
+        let _ = writeln!(body_text, "10.0.{}.{}", i / 256, i % 256);
+    }
     Mock::given(method("GET"))
         .and(path("/big.txt"))
         .respond_with(ResponseTemplate::new(200).set_body_string(body_text))
@@ -317,7 +335,11 @@ async fn no_source_row_or_audit_log_entry_is_created_by_a_test_fetch() {
         .await;
     let app = simply_ip_sync::create_app(state);
 
-    let audit_before = audit_log::Entity::find().all(&conn).await.expect("count audit logs").len();
+    let audit_before = audit_log::Entity::find()
+        .all(&conn)
+        .await
+        .expect("count audit logs")
+        .len();
     let (status, _) = call(
         app,
         &master,
@@ -326,8 +348,55 @@ async fn no_source_row_or_audit_log_entry_is_created_by_a_test_fetch() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let source_count = external_source::Entity::find().all(&conn).await.expect("count sources").len();
-    assert_eq!(source_count, 0, "test-fetch must never create an external_sources row");
-    let audit_after = audit_log::Entity::find().all(&conn).await.expect("count audit logs").len();
-    assert_eq!(audit_after, audit_before, "test-fetch is read-only and must not write an audit log entry");
+    let source_count = external_source::Entity::find()
+        .all(&conn)
+        .await
+        .expect("count sources")
+        .len();
+    assert_eq!(
+        source_count, 0,
+        "test-fetch must never create an external_sources row"
+    );
+    let audit_after = audit_log::Entity::find()
+        .all(&conn)
+        .await
+        .expect("count audit logs")
+        .len();
+    assert_eq!(
+        audit_after, audit_before,
+        "test-fetch is read-only and must not write an audit log entry"
+    );
+}
+
+#[tokio::test]
+async fn private_source_url_is_blocked_when_allow_private_ingest_urls_is_false() {
+    let (_conn, state, master) = common::setup().await;
+    let state = state.with_allow_private_ingest_urls(false);
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/secret.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("203.0.113.1\n"))
+        .mount(&feed_mock)
+        .await;
+    let app = simply_ip_sync::create_app(state);
+
+    let (status, body) = call(
+        app,
+        &master,
+        json!({
+            "source_url": format!("{}/secret.txt", feed_mock.uri()),
+            "parser_type": "REGEX_LINE"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "FAILED");
+    assert!(
+        feed_mock
+            .received_requests()
+            .await
+            .expect("received")
+            .is_empty(),
+        "SSRF guard must block loopback request before any HTTP call is sent"
+    );
 }

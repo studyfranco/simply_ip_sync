@@ -1,7 +1,7 @@
 //! Tests validating database query optimizations: batching/pre-fetching (eliminating N+1)
 //! and log status filtering across destination groups, sync tasks, vault endpoints, and sync logs.
 
-mod common;
+pub mod common;
 
 use axum::http::StatusCode;
 use chrono::Utc;
@@ -123,7 +123,7 @@ async fn test_destination_groups_batch_fetching_and_scoping() {
     let _g1 = seed_group(&conn, "Group1", Some(master.id), v1).await;
     let g2 = seed_group(&conn, "Group2", Some(master.id), v1).await;
 
-    let user_key = common::insert_key(&conn, "Operator", false, false, false, false, None).await;
+    let user_key = common::insert_key(&conn, "Operator", false, false, false, None).await;
 
     // Grant user_key permission on Group2 only
     let perm = api_key_sync_permission::ActiveModel {
@@ -140,9 +140,13 @@ async fn test_destination_groups_batch_fetching_and_scoping() {
 
     // 1. Master sees both groups with targets and feeds nested
     let req = common::signed_request(&master, "GET", "/api/destination-groups", None);
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("call");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("bytes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("bytes");
     let json: Vec<Value> = serde_json::from_slice(&body).expect("parse");
     assert_eq!(json.len(), 2);
     for group in &json {
@@ -156,9 +160,13 @@ async fn test_destination_groups_batch_fetching_and_scoping() {
 
     // 2. Operator key sees only Group2, with targets and feeds populated
     let req = common::signed_request(&user_key, "GET", "/api/destination-groups", None);
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("call");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("bytes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("bytes");
     let json: Vec<Value> = serde_json::from_slice(&body).expect("parse");
     assert_eq!(json.len(), 1);
     assert_eq!(json[0]["id"], g2.to_string());
@@ -176,7 +184,7 @@ async fn test_sync_tasks_batch_fetching_and_scoping() {
     let t1 = seed_task(&conn, "Task1", Some(master.id), v1, v2).await;
     let _t2 = seed_task(&conn, "Task2", Some(master.id), v1, v2).await;
 
-    let user_key = common::insert_key(&conn, "Viewer", false, false, false, false, None).await;
+    let user_key = common::insert_key(&conn, "Viewer", false, false, false, None).await;
 
     // Grant user_key permission on Task1 only
     let perm = api_key_sync_permission::ActiveModel {
@@ -193,9 +201,13 @@ async fn test_sync_tasks_batch_fetching_and_scoping() {
 
     // Master sees both tasks with targets
     let req = common::signed_request(&master, "GET", "/api/sync-tasks", None);
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("call");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("bytes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("bytes");
     let json: Vec<Value> = serde_json::from_slice(&body).expect("parse");
     assert_eq!(json.len(), 2);
     for task in &json {
@@ -206,9 +218,13 @@ async fn test_sync_tasks_batch_fetching_and_scoping() {
 
     // Viewer sees only Task1
     let req = common::signed_request(&user_key, "GET", "/api/sync-tasks", None);
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("call");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("bytes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("bytes");
     let json: Vec<Value> = serde_json::from_slice(&body).expect("parse");
     assert_eq!(json.len(), 1);
     assert_eq!(json[0]["id"], t1.to_string());
@@ -269,33 +285,45 @@ async fn test_sync_logs_filtering_by_status_and_batch_scoping() {
 
     // 1. Filter by status=SUCCESS
     let req = common::signed_request(&master, "GET", "/api/sync-logs?status=SUCCESS", None);
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("call");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("bytes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("bytes");
     let json: Vec<Value> = serde_json::from_slice(&body).expect("parse");
     assert_eq!(json.len(), 1);
     assert_eq!(json[0]["status"], "SUCCESS");
 
     // 2. Filter by status=FAILED
     let req = common::signed_request(&master, "GET", "/api/sync-logs?status=FAILED", None);
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("call");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("bytes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("bytes");
     let json: Vec<Value> = serde_json::from_slice(&body).expect("parse");
     assert_eq!(json.len(), 1);
     assert_eq!(json[0]["status"], "FAILED");
 
     // 3. Filter by status=PARTIAL
     let req = common::signed_request(&master, "GET", "/api/sync-logs?status=PARTIAL", None);
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("call");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("bytes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("bytes");
     let json: Vec<Value> = serde_json::from_slice(&body).expect("parse");
     assert_eq!(json.len(), 1);
     assert_eq!(json[0]["status"], "PARTIAL");
 
     // 4. Non-master scoping: give user_key permission on job2 only
-    let user_key = common::insert_key(&conn, "Auditor", false, false, false, false, None).await;
+    let user_key = common::insert_key(&conn, "Auditor", false, false, false, None).await;
     let perm = api_key_sync_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(user_key.id),
@@ -309,9 +337,13 @@ async fn test_sync_logs_filtering_by_status_and_batch_scoping() {
     perm.insert(&conn).await.expect("insert perm");
 
     let req = common::signed_request(&user_key, "GET", "/api/sync-logs", None);
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("call");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("bytes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("bytes");
     let json: Vec<Value> = serde_json::from_slice(&body).expect("parse");
     assert_eq!(json.len(), 1);
     assert_eq!(json[0]["job_id"], job2.to_string());

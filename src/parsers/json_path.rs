@@ -1,5 +1,5 @@
-//! `JSON_PATH` parser: structured JSON feeds (AbuseIPDB API responses, SANS ISC's
-//! `?json`-suffixed threat lists, pfSense exports, Spamhaus DROP lists).
+//! `JSON_PATH` parser: structured JSON feeds (`AbuseIPDB` API responses, SANS ISC's
+//! `?json`-suffixed threat lists, `pfSense` exports, Spamhaus DROP lists).
 //!
 //! Configured via `parser_config_json`:
 //! ```json
@@ -25,7 +25,7 @@
 //! **output**-side template substitution over a fixed, known set of event fields — there is
 //! nothing there to borrow for **input**-side field *selection* into an arbitrary third-party
 //! JSON document's own, unknown shape, which is what this parser configuration actually needs to
-//! express. The `$.` prefix used here is instead the ordinary JSONPath "root object" convention
+//! express. The `$.` prefix used here is instead the ordinary `JSONPath` "root object" convention
 //! (a `$` anchors the document root, `.field` walks into it) — a different, unrelated `$` idiom
 //! chosen because it recognizably marks "this is a field-selector expression", not because it was
 //! copied from the peer.
@@ -140,6 +140,10 @@ impl JsonPathConfig {
 /// selector is rejected with `400` at save time, not discovered later as a `FAILED` sync log
 /// entry. The parser itself re-validates at parse time regardless (defense in depth, the same
 /// two-layer pattern `scheduler::validate_cron_expression` already uses for `cron_schedule`).
+///
+/// # Errors
+///
+/// Returns an explanatory error string if `config` is absent or malformed JSON/`JSONPath`.
 pub fn validate_config(config: Option<&str>) -> Result<(), String> {
     let config_str = config.ok_or_else(|| {
         "JSON_PATH requires parser_config_json with a target_address selector".to_owned()
@@ -162,7 +166,7 @@ impl FeedParser for JsonPathParser {
         let config = JsonPathConfig::parse(config_str).map_err(ParseError::InvalidConfig)?;
 
         if config.jsonl {
-            return parse_jsonl(raw, &config);
+            return Ok(parse_jsonl(raw, &config));
         }
 
         let root: Value =
@@ -191,14 +195,14 @@ impl FeedParser for JsonPathParser {
 /// which then simply fails that one line's JSON parse (or its selector lookup) and gets skipped
 /// exactly like any other malformed line already is — never a hard failure for the whole body
 /// over one bad line.
-fn parse_jsonl(raw: &[u8], config: &JsonPathConfig) -> Result<Vec<ParsedRecord>, ParseError> {
+fn parse_jsonl(raw: &[u8], config: &JsonPathConfig) -> Vec<ParsedRecord> {
     let text = String::from_utf8_lossy(raw);
     let values = text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .filter_map(|line| serde_json::from_str::<Value>(line).ok());
-    Ok(extract_records(values, config))
+    extract_records(values, config)
 }
 
 fn extract_records<'a, I, T>(items: I, config: &JsonPathConfig) -> Vec<ParsedRecord>
@@ -347,7 +351,7 @@ mod tests {
         assert!(validate_config(None).is_err());
     }
 
-    /// Task 4: an optional `last_seen_at` selector, RFC 3339-shaped — the real AbuseIPDB
+    /// Task 4: an optional `last_seen_at` selector, RFC 3339-shaped — the real `AbuseIPDB`
     /// `lastReportedAt` format.
     #[test]
     fn last_seen_at_selector_parses_rfc3339_timestamps() {

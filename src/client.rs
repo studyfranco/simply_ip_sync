@@ -60,6 +60,7 @@ impl BatchMode {
     /// for anything else — callers should treat that as a validation failure, not silently fall
     /// back to a default; a typo'd mode must be caught at the API boundary
     /// (`api/sources.rs`/`api/sync_tasks.rs`), not reinterpreted here.
+    #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "upsert" => Some(Self::Upsert),
@@ -122,7 +123,7 @@ impl BatchRecordsResponse {
     /// Accumulates `other` into `self`, field-wise. Used when a single caller-provided chunk gets
     /// adaptively split (on `413`) into multiple sub-requests — the caller sees one combined
     /// summary, exactly as if the whole chunk had been accepted in one request.
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: &Self) {
         self.created += other.created;
         self.updated += other.updated;
         self.restored += other.restored;
@@ -171,6 +172,10 @@ pub struct IpRecordResponse {
 /// broken. Tests that need to control the timeout precisely (e.g. against a deliberately slow
 /// mock) should build their own `Client` and override `AppState.http` directly rather than going
 /// through the process-wide `OUTBOUND_HTTP_TIMEOUT_SECS` cache this function reads.
+///
+/// # Errors
+///
+/// Returns `reqwest::Error` if the TLS backend fails to initialize.
 pub fn build_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -185,11 +190,12 @@ fn signed_headers(
     target: &str,
     body: &[u8],
 ) -> Result<(String, String, String), ClientError> {
+    let api_key = cipher.open_legacy_or_sealed(&endpoint.api_key)?;
     let secret = cipher.open(&endpoint.signing_secret)?;
     let timestamp = Utc::now().timestamp().to_string();
     let signature = crypto::compute_signature(&secret, method, target, &timestamp, body)
         .map_err(|_| ClientError::Signing)?;
-    Ok((endpoint.api_key.clone(), timestamp, signature))
+    Ok((api_key, timestamp, signature))
 }
 
 /// Appends `path` (e.g. `/api/ips`) to `base`, keeping the entirety of `base`'s own path as a
@@ -211,6 +217,8 @@ fn join_endpoint(base: &Url, path: &str) -> Result<Url, ClientError> {
     Url::parse(&format!("{trimmed}{path}")).map_err(|e| ClientError::InvalidUrl(e.to_string()))
 }
 
+const RECORDS_BATCH_PATH: &str = "/api/records/batch";
+
 /// Sends one HTTP `POST {target_url}/api/records/batch` attempt, no retry and no splitting. The
 /// building block both [`post_batch`] and its retry loop are made of.
 async fn post_batch_once(
@@ -221,6 +229,12 @@ async fn post_batch_once(
     records: &[BatchRecordInput],
     mode: BatchMode,
 ) -> Result<BatchRecordsResponse, ClientError> {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        group_name: &'a str,
+        mode: BatchMode,
+        records: &'a [BatchRecordInput],
+    }
     let base =
         Url::parse(&endpoint.target_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
     // `target_url` may carry its own reverse-proxy subpath (e.g. `https://host/direct/ip_vault/`),
@@ -232,16 +246,9 @@ async fn post_batch_once(
     // (which includes `target_url`'s own subpath) produced a signature the remote vault could never
     // verify, rejected as "invalid X-Signature-256" even once the URL itself pointed at the right
     // place. Sign the literal endpoint path instead of reading it back off the constructed URL.
-    const RECORDS_BATCH_PATH: &str = "/api/records/batch";
     let url = join_endpoint(&base, RECORDS_BATCH_PATH)?;
     let target = RECORDS_BATCH_PATH.to_owned();
 
-    #[derive(Serialize)]
-    struct Payload<'a> {
-        group_name: &'a str,
-        mode: BatchMode,
-        records: &'a [BatchRecordInput],
-    }
     let payload = Payload {
         group_name,
         mode,
@@ -281,6 +288,24 @@ async fn post_batch_once(
 /// waits (`retry::backoff_with_jitter`) and retries with a freshly signed request, up to
 /// `config::outbound_max_retries()` times. `413` is deliberately **not** retried here — an
 /// oversized payload will still be oversized on attempt 2, and [`post_batch`]'s caller is
+/// Retry policy applied to outbound HTTP calls (`429`/`502`/`503`/`504` transient responses).
+#[derive(Clone, Copy, Debug)]
+pub struct RetryPolicy {
+    /// Maximum number of retry attempts after the initial request fails with a transient status.
+    pub max_retries: u32,
+    /// Base delay before the first retry (subsequent attempts apply exponential backoff + jitter).
+    pub base_backoff: std::time::Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: crate::config::outbound_max_retries(),
+            base_backoff: crate::config::outbound_retry_backoff(),
+        }
+    }
+}
+
 /// responsible for splitting it instead.
 async fn post_batch_with_retry(
     http: &Client,
@@ -289,8 +314,9 @@ async fn post_batch_with_retry(
     group_name: &str,
     records: &[BatchRecordInput],
     mode: BatchMode,
+    policy: RetryPolicy,
 ) -> Result<BatchRecordsResponse, ClientError> {
-    let max_retries = crate::config::outbound_max_retries();
+    let max_retries = policy.max_retries;
     let mut attempt: u32 = 0;
     loop {
         match post_batch_once(http, cipher, endpoint, group_name, records, mode).await {
@@ -299,7 +325,8 @@ async fn post_batch_with_retry(
                 if crate::retry::is_transient_status(status) && attempt < max_retries =>
             {
                 attempt += 1;
-                let delay = crate::retry::backoff_with_jitter(attempt);
+                let delay =
+                    crate::retry::backoff_with_jitter_from_base(policy.base_backoff, attempt);
                 tracing::warn!(
                     "vault '{}' returned {status} for a batch of {} record(s); retrying in {delay:?} (attempt {attempt}/{max_retries}): {body}",
                     endpoint.name,
@@ -310,6 +337,34 @@ async fn post_batch_with_retry(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Sends `records` to `POST {target_url}/api/records/batch` on `endpoint`, signed with
+/// `CANONICAL_V1`, using the process-wide default [`RetryPolicy`]. See
+/// [`post_batch_with_policy`] for retry and adaptive-splitting semantics.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if `endpoint.target_url` is invalid, secret decryption/signing fails, or
+/// all retries / chunk splits still fail against the remote vault.
+pub async fn post_batch(
+    http: &Client,
+    cipher: &SecretCipher,
+    endpoint: &vault_endpoint::Model,
+    group_name: &str,
+    records: &[BatchRecordInput],
+    mode: BatchMode,
+) -> Result<BatchRecordsResponse, ClientError> {
+    post_batch_with_policy(
+        http,
+        cipher,
+        endpoint,
+        group_name,
+        records,
+        mode,
+        RetryPolicy::default(),
+    )
+    .await
 }
 
 /// Sends `records` to `POST {target_url}/api/records/batch` on `endpoint`, signed with
@@ -330,13 +385,19 @@ async fn post_batch_with_retry(
 /// same reason [`crate::jobs::mode_for_chunk_index`] downgrades every chunk after the first at
 /// the job layer: a second `full_replace` write against a target that already received the first
 /// half would erase it.
-pub async fn post_batch(
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if `endpoint.target_url` is invalid, secret decryption/signing fails, or
+/// all retries / chunk splits still fail against the remote vault.
+pub async fn post_batch_with_policy(
     http: &Client,
     cipher: &SecretCipher,
     endpoint: &vault_endpoint::Model,
     group_name: &str,
     records: &[BatchRecordInput],
     mode: BatchMode,
+    policy: RetryPolicy,
 ) -> Result<BatchRecordsResponse, ClientError> {
     // A FIFO work queue rather than true recursion: async fns can't recurse without boxing the
     // future, and a queue makes the "only the very first piece keeps `mode`" rule easy to state
@@ -349,8 +410,12 @@ pub async fn post_batch(
     let mut aggregate = BatchRecordsResponse::default();
 
     while let Some((chunk, chunk_mode)) = queue.pop_front() {
-        match post_batch_with_retry(http, cipher, endpoint, group_name, &chunk, chunk_mode).await {
-            Ok(resp) => aggregate.merge(resp),
+        match post_batch_with_retry(
+            http, cipher, endpoint, group_name, &chunk, chunk_mode, policy,
+        )
+        .await
+        {
+            Ok(resp) => aggregate.merge(&resp),
             Err(ClientError::RemoteError { status, body })
                 if chunk.len() > 1
                     && (status == 413 || crate::retry::is_transient_status(status)) =>
@@ -371,11 +436,14 @@ pub async fn post_batch(
                 // backlog it's still draining), so pause briefly before hitting it again, on top
                 // of the chunk itself now being smaller.
                 if status != 413 {
-                    tokio::time::sleep(crate::retry::backoff_with_jitter(1)).await;
+                    tokio::time::sleep(crate::retry::backoff_with_jitter_from_base(
+                        policy.base_backoff,
+                        1,
+                    ))
+                    .await;
                 }
                 let second_mode = match chunk_mode {
-                    BatchMode::FullReplace => BatchMode::Upsert,
-                    BatchMode::Upsert => BatchMode::Upsert,
+                    BatchMode::FullReplace | BatchMode::Upsert => BatchMode::Upsert,
                 };
                 // Front-pushed in reverse delivery order so the queue processes `first_half`
                 // (which may still legitimately carry `full_replace`) strictly before
@@ -394,17 +462,21 @@ pub async fn post_batch(
 /// fetch and push sides of the pipeline move records in like-sized groups.
 const DELTA_PAGE_SIZE: u64 = 5_000;
 
+#[derive(Clone, Copy)]
+struct DeltaQuery<'a> {
+    base: &'a Url,
+    group_name: &'a str,
+    since: Option<DateTime<Utc>>,
+    include_deleted: bool,
+}
+
 /// Fetches one page of `GET {target_url}/api/ips`, no retry. Building block for
-/// [`get_ips_delta`]'s retry loop and pagination loop.
-#[allow(clippy::too_many_arguments)]
+/// [`get_ips_delta_with_policy`]'s retry loop and pagination loop.
 async fn get_ips_page(
     http: &Client,
     cipher: &SecretCipher,
     endpoint: &vault_endpoint::Model,
-    base: &Url,
-    group_name: &str,
-    since: Option<DateTime<Utc>>,
-    include_deleted: bool,
+    query: DeltaQuery<'_>,
     offset: u64,
 ) -> Result<Vec<IpRecordResponse>, ClientError> {
     // See post_batch_once's comment on RECORDS_BATCH_PATH: `target_url`'s own reverse-proxy
@@ -413,17 +485,21 @@ async fn get_ips_page(
     // matched on, `/api/ips`, regardless of what subpath the public-facing `target_url` uses to
     // reach it.
     const IPS_PATH: &str = "/api/ips";
-    let mut url = join_endpoint(base, IPS_PATH)?;
+    let mut url = join_endpoint(query.base, IPS_PATH)?;
     {
         let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("group_name", group_name);
+        pairs.append_pair("group_name", query.group_name);
         pairs.append_pair(
             "include_deleted",
-            if include_deleted { "true" } else { "false" },
+            if query.include_deleted {
+                "true"
+            } else {
+                "false"
+            },
         );
         pairs.append_pair("limit", &DELTA_PAGE_SIZE.to_string());
         pairs.append_pair("offset", &offset.to_string());
-        if let Some(since) = since {
+        if let Some(since) = query.since {
             pairs.append_pair("since", &since.timestamp().to_string());
         }
     }
@@ -458,39 +534,26 @@ async fn get_ips_page(
 
 /// [`get_ips_page`] wrapped in the same transient-failure retry loop as
 /// [`post_batch_with_retry`]: `429`/`502`/`503`/`504` are retried with backoff, up to
-/// `config::outbound_max_retries()` times.
-#[allow(clippy::too_many_arguments)]
+/// `policy.max_retries` times.
 async fn get_ips_page_with_retry(
     http: &Client,
     cipher: &SecretCipher,
     endpoint: &vault_endpoint::Model,
-    base: &Url,
-    group_name: &str,
-    since: Option<DateTime<Utc>>,
-    include_deleted: bool,
+    query: DeltaQuery<'_>,
     offset: u64,
+    policy: RetryPolicy,
 ) -> Result<Vec<IpRecordResponse>, ClientError> {
-    let max_retries = crate::config::outbound_max_retries();
+    let max_retries = policy.max_retries;
     let mut attempt: u32 = 0;
     loop {
-        match get_ips_page(
-            http,
-            cipher,
-            endpoint,
-            base,
-            group_name,
-            since,
-            include_deleted,
-            offset,
-        )
-        .await
-        {
+        match get_ips_page(http, cipher, endpoint, query, offset).await {
             Ok(page) => return Ok(page),
             Err(ClientError::RemoteError { status, body })
                 if crate::retry::is_transient_status(status) && attempt < max_retries =>
             {
                 attempt += 1;
-                let delay = crate::retry::backoff_with_jitter(attempt);
+                let delay =
+                    crate::retry::backoff_with_jitter_from_base(policy.base_backoff, attempt);
                 tracing::warn!(
                     "vault '{}' returned {status} fetching delta page at offset {offset}; retrying in {delay:?} (attempt {attempt}/{max_retries}): {body}",
                     endpoint.name
@@ -503,11 +566,12 @@ async fn get_ips_page_with_retry(
 }
 
 /// Queries `GET {target_url}/api/ips?group_name=...&since=...&include_deleted=...` on `endpoint`,
-/// signed with `CANONICAL_V1`, and pages through the full delta result set (the source vault
-/// paginates with `limit`/`offset`; a single request only returns one page). The signed target
-/// includes the query string on every page request, matching `simply_ip_vault`'s own rule that
-/// the signed target is path plus query. Each page is retried independently on a transient
-/// upstream failure — a 503 on page 3 of 4 does not require re-fetching pages 1 and 2.
+/// using the process-wide default [`RetryPolicy`]. See [`get_ips_delta_with_policy`].
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if `endpoint.target_url` is invalid, secret decryption/signing fails, or
+/// the remote vault returns an unretryable error or network failure.
 pub async fn get_ips_delta(
     http: &Client,
     cipher: &SecretCipher,
@@ -516,23 +580,51 @@ pub async fn get_ips_delta(
     since: Option<DateTime<Utc>>,
     include_deleted: bool,
 ) -> Result<Vec<IpRecordResponse>, ClientError> {
+    get_ips_delta_with_policy(
+        http,
+        cipher,
+        endpoint,
+        group_name,
+        since,
+        include_deleted,
+        RetryPolicy::default(),
+    )
+    .await
+}
+
+/// Queries `GET {target_url}/api/ips?group_name=...&since=...&include_deleted=...` on `endpoint`,
+/// signed with `CANONICAL_V1`, and pages through the full delta result set (the source vault
+/// paginates with `limit`/`offset`; a single request only returns one page). The signed target
+/// includes the query string on every page request, matching `simply_ip_vault`'s own rule that
+/// the signed target is path plus query. Each page is retried independently on a transient
+/// upstream failure — a 503 on page 3 of 4 does not require re-fetching pages 1 and 2.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] if `endpoint.target_url` is invalid, secret decryption/signing fails, or
+/// the remote vault returns an unretryable error or network failure.
+pub async fn get_ips_delta_with_policy(
+    http: &Client,
+    cipher: &SecretCipher,
+    endpoint: &vault_endpoint::Model,
+    group_name: &str,
+    since: Option<DateTime<Utc>>,
+    include_deleted: bool,
+    policy: RetryPolicy,
+) -> Result<Vec<IpRecordResponse>, ClientError> {
     let base =
         Url::parse(&endpoint.target_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    let query = DeltaQuery {
+        base: &base,
+        group_name,
+        since,
+        include_deleted,
+    };
     let mut all_records = Vec::new();
     let mut offset: u64 = 0;
 
     loop {
-        let page = get_ips_page_with_retry(
-            http,
-            cipher,
-            endpoint,
-            &base,
-            group_name,
-            since,
-            include_deleted,
-            offset,
-        )
-        .await?;
+        let page = get_ips_page_with_retry(http, cipher, endpoint, query, offset, policy).await?;
         let page_len = page.len() as u64;
         all_records.extend(page);
         if page_len < DELTA_PAGE_SIZE {

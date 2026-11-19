@@ -1,12 +1,13 @@
 //! Black-box tests for the `FeedParser` engine, driven only through the public `parsers` API.
 //!
 //! Two feeds referenced in `AGENT_NOTES.MD` are rate-limited/archived and unsuitable for a test
-//! that runs on every `cargo test`: StopForumSpam's IPv6 list (`listed_ip_30_ipv6.zip`) and
+//! that runs on every `cargo test`: `StopForumSpam`'s IPv6 list (`listed_ip_30_ipv6.zip`) and
 //! Spamhaus's DROP v6 list (`drop_v6.json`). Both were fetched once during development to inspect
 //! their real wire format (recorded in the doc comments below); the tests here build local
 //! fixtures reproducing those exact shapes rather than hitting the network, so they run
 //! deterministically offline and can never trigger a rate limit or IP ban.
 
+use std::fmt::Write as _;
 use std::io::Write;
 
 use simply_ip_sync::parsers::{self, ParsedRecord};
@@ -22,7 +23,14 @@ fn regex_line_strips_comments_and_extracts_addresses() {
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
     let body = b"# Spamhaus DROP list\n1.2.3.4/32\n; another comment\n10.0.0.0/8\n// js comment\n2001:db8::1\n";
     let records = parser.parse(body, None).expect("parse");
-    assert_eq!(addrs(records), vec!["1.2.3.4".to_owned(), "10.0.0.0/8".to_owned(), "2001:db8::1".to_owned()]);
+    assert_eq!(
+        addrs(records),
+        vec![
+            "1.2.3.4".to_owned(),
+            "10.0.0.0/8".to_owned(),
+            "2001:db8::1".to_owned()
+        ]
+    );
 }
 
 #[test]
@@ -31,7 +39,10 @@ fn json_path_extracts_configured_field() {
     let body = br#"{"data":[{"ipAddress":"203.0.113.9"},{"ipAddress":"203.0.113.10"}]}"#;
     let config = r#"{"array_path":"data","target_address":"$.ipAddress"}"#;
     let records = parser.parse(body, Some(config)).expect("parse");
-    assert_eq!(addrs(records), vec!["203.0.113.9".to_owned(), "203.0.113.10".to_owned()]);
+    assert_eq!(
+        addrs(records),
+        vec!["203.0.113.9".to_owned(), "203.0.113.10".to_owned()]
+    );
 }
 
 #[test]
@@ -56,7 +67,7 @@ fn build_zip_fixture(member_name: &str, contents: &[u8]) -> Vec<u8> {
     buf.into_inner()
 }
 
-/// StopForumSpam's `listed_ip_30_ipv6.zip` (inspected 2026-08 by fetching the real download):
+/// `StopForumSpam`'s `listed_ip_30_ipv6.zip` (inspected 2026-08 by fetching the real download):
 /// a single member `listed_ip_30_ipv6.txt`, one bare IPv6 address per line, no comments, no
 /// header. This fixture reproduces that shape (member name included) at a representative scale.
 #[test]
@@ -77,16 +88,28 @@ fn stopforumspam_ipv6_zip_fixture_decompresses_and_parses_via_regex_line() {
     // Read back from disk (not the in-memory `zip_bytes`) to exercise the same path a fetched
     // HTTP response body would take: bytes on disk/wire → decompress → parse.
     let fetched = std::fs::read(&fixture_path).expect("read zip fixture back");
-    assert!(simply_ip_sync::jobs::decompress::is_zip(&fetched), "fixture must be recognised as a zip archive");
-    let decompressed =
-        simply_ip_sync::jobs::decompress::decompress_if_zip(&fetched, simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES)
-            .expect("decompress zip fixture");
+    assert!(
+        simply_ip_sync::jobs::decompress::is_zip(&fetched),
+        "fixture must be recognised as a zip archive"
+    );
+    let decompressed = simply_ip_sync::jobs::decompress::decompress_if_zip(
+        &fetched,
+        simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES,
+    )
+    .expect("decompress zip fixture");
 
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
-    let records = addrs(parser.parse(&decompressed, None).expect("parse decompressed body"));
+    let records = addrs(
+        parser
+            .parse(&decompressed, None)
+            .expect("parse decompressed body"),
+    );
     assert_eq!(records.len(), addresses.len());
     for address in addresses {
-        assert!(records.contains(&address.to_owned()), "expected {address} in parsed output: {records:?}");
+        assert!(
+            records.contains(&address.to_owned()),
+            "expected {address} in parsed output: {records:?}"
+        );
     }
 
     // `tmp` (and the fixture file inside it) is removed automatically when it drops at the end of
@@ -102,10 +125,17 @@ fn spamhaus_drop_v6_json_fixture_parses_via_jsonl_mode_and_skips_the_metadata_fo
     let tmp = tempfile::tempdir().expect("tempdir");
     let fixture_path = tmp.path().join("drop_v6.json");
 
-    let cidrs = ["2001:678:254::/48", "2001:678:6c0::/48", "2001:678:724::/48"];
+    let cidrs = [
+        "2001:678:254::/48",
+        "2001:678:6c0::/48",
+        "2001:678:724::/48",
+    ];
     let mut fixture = String::new();
     for (i, cidr) in cidrs.iter().enumerate() {
-        fixture.push_str(&format!("{{\"cidr\":\"{cidr}\",\"sblid\":\"SBL{i}\",\"rir\":\"ripencc\"}}\n"));
+        let _ = writeln!(
+            fixture,
+            "{{\"cidr\":\"{cidr}\",\"sblid\":\"SBL{i}\",\"rir\":\"ripencc\"}}"
+        );
     }
     fixture.push_str(
         r#"{"type":"metadata","timestamp":1786614242,"size":123,"records":3,"copyright":"(c) 2026 The Spamhaus Project SLU"}"#,
@@ -118,10 +148,20 @@ fn spamhaus_drop_v6_json_fixture_parses_via_jsonl_mode_and_skips_the_metadata_fo
     let config = r#"{"jsonl":true,"target_address":"$.cidr"}"#;
     let records = addrs(parser.parse(&fetched, Some(config)).expect("parse"));
 
-    assert_eq!(records.len(), cidrs.len(), "the metadata footer line must be skipped, not counted or erroring");
+    assert_eq!(
+        records.len(),
+        cidrs.len(),
+        "the metadata footer line must be skipped, not counted or erroring"
+    );
     for cidr in cidrs {
-        assert!(records.contains(&cidr.to_owned()), "expected {cidr} in parsed output: {records:?}");
-        assert!(cidr.parse::<ipnet::IpNet>().is_ok(), "{cidr} must be a valid IPv6 CIDR");
+        assert!(
+            records.contains(&cidr.to_owned()),
+            "expected {cidr} in parsed output: {records:?}"
+        );
+        assert!(
+            cidr.parse::<ipnet::IpNet>().is_ok(),
+            "{cidr} must be a valid IPv6 CIDR"
+        );
     }
 }
 
@@ -131,8 +171,11 @@ fn spamhaus_drop_v6_json_fixture_parses_via_jsonl_mode_and_skips_the_metadata_fo
 fn plain_text_body_is_not_mistaken_for_a_zip_archive() {
     let plain = b"2001:db8::1\n2001:db8::2\n";
     assert!(!simply_ip_sync::jobs::decompress::is_zip(plain));
-    let result = simply_ip_sync::jobs::decompress::decompress_if_zip(plain, simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES)
-        .expect("passthrough");
+    let result = simply_ip_sync::jobs::decompress::decompress_if_zip(
+        plain,
+        simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES,
+    )
+    .expect("passthrough");
     assert_eq!(result, plain);
 }
 
@@ -182,8 +225,13 @@ const CAPTIVE_PORTAL_PAGE: &str = r#"<!DOCTYPE html>
 #[test]
 fn html_error_page_yields_zero_entries_from_regex_line_no_panic() {
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
-    let records = parser.parse(CLOUDFLARE_ERROR_PAGE.as_bytes(), None).expect("parse must not error");
-    assert!(records.is_empty(), "an HTML error page with no IP-shaped text must yield zero entries, got {records:?}");
+    let records = parser
+        .parse(CLOUDFLARE_ERROR_PAGE.as_bytes(), None)
+        .expect("parse must not error");
+    assert!(
+        records.is_empty(),
+        "an HTML error page with no IP-shaped text must yield zero entries, got {records:?}"
+    );
 }
 
 #[test]
@@ -191,17 +239,28 @@ fn html_error_page_is_a_hard_parse_failure_for_json_path() {
     let parser = parsers::for_type("JSON_PATH").expect("known parser type");
     let config = r#"{"target_address":"$.ip"}"#;
     let result = parser.parse(CLOUDFLARE_ERROR_PAGE.as_bytes(), Some(config));
-    assert!(result.is_err(), "HTML is not valid JSON and must be reported as a parse error, not silently empty");
+    assert!(
+        result.is_err(),
+        "HTML is not valid JSON and must be reported as a parse error, not silently empty"
+    );
 }
 
 #[test]
 fn captive_portal_page_extracts_the_embedded_address_without_crashing() {
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
-    let records = addrs(parser.parse(CAPTIVE_PORTAL_PAGE.as_bytes(), None).expect("parse must not error"));
+    let records = addrs(
+        parser
+            .parse(CAPTIVE_PORTAL_PAGE.as_bytes(), None)
+            .expect("parse must not error"),
+    );
     // The line-oriented scanner has no concept of HTML syntax, so an IP-shaped substring inside a
     // URL or script tag is still picked up — documented behavior, not a bug: normalize_ip_or_cidr
     // re-validates every candidate, so this can never smuggle in something that isn't a real IP.
-    assert!(records.iter().all(|r| r.parse::<std::net::IpAddr>().is_ok() || r.parse::<ipnet::IpNet>().is_ok()));
+    assert!(
+        records
+            .iter()
+            .all(|r| r.parse::<std::net::IpAddr>().is_ok() || r.parse::<ipnet::IpNet>().is_ok())
+    );
 }
 
 /// A large HTML body (well beyond a single packet/buffer's worth) must still parse in bounded
@@ -210,19 +269,29 @@ fn captive_portal_page_extracts_the_embedded_address_without_crashing() {
 /// an actual profiler attached.
 #[test]
 fn large_html_body_parses_quickly_with_zero_matches() {
+    use std::fmt::Write as _;
     let mut big_html = String::from("<!DOCTYPE html><html><body>\n");
     for i in 0..50_000 {
-        big_html.push_str(&format!("<div class=\"row-{i}\">Not a threat feed entry, just markup.</div>\n"));
+        let _ = writeln!(
+            big_html,
+            "<div class=\"row-{i}\">Not a threat feed entry, just markup.</div>"
+        );
     }
     big_html.push_str("</body></html>");
 
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
     let start = std::time::Instant::now();
-    let records = parser.parse(big_html.as_bytes(), None).expect("parse must not error");
+    let records = parser
+        .parse(big_html.as_bytes(), None)
+        .expect("parse must not error");
     let elapsed = start.elapsed();
 
     assert!(records.is_empty());
-    assert!(elapsed < std::time::Duration::from_secs(5), "parsing ~{} bytes took {elapsed:?}, expected well under 5s", big_html.len());
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "parsing ~{} bytes took {elapsed:?}, expected well under 5s",
+        big_html.len()
+    );
 }
 
 /// Deterministic (not `rand`-dependent, so this test is reproducible byte-for-byte) pseudo-random
@@ -230,7 +299,9 @@ fn large_html_body_parses_quickly_with_zero_matches() {
 /// invalid-continuation-byte patterns — a stand-in for a corrupted-in-transit or genuinely raw
 /// binary feed response.
 fn pseudo_random_binary_bytes(len: usize) -> Vec<u8> {
-    (0..len).map(|i| ((i * 137 + 59) % 256) as u8).collect()
+    (0..len)
+        .map(|i| u8::try_from((i * 137 + 59) % 256).unwrap_or(0))
+        .collect()
 }
 
 /// Task 3: a raw binary feed body (random bytes, no structure at all) must not panic either parser
@@ -243,12 +314,18 @@ fn raw_binary_buffer_does_not_panic_either_parser_type() {
 
     let regex_parser = parsers::for_type("REGEX_LINE").expect("known parser type");
     let result = regex_parser.parse(&binary, None);
-    assert!(result.is_ok(), "REGEX_LINE must degrade gracefully on raw binary, not error");
+    assert!(
+        result.is_ok(),
+        "REGEX_LINE must degrade gracefully on raw binary, not error"
+    );
 
     let json_parser = parsers::for_type("JSON_PATH").expect("known parser type");
     let config = r#"{"target_address":"$.ip"}"#;
     let result = json_parser.parse(&binary, Some(config));
-    assert!(result.is_err(), "raw binary is not valid JSON and JSON_PATH must reject it cleanly, not panic");
+    assert!(
+        result.is_err(),
+        "raw binary is not valid JSON and JSON_PATH must reject it cleanly, not panic"
+    );
 }
 
 /// A feed encoded in Latin-1 (ISO-8859-1) rather than UTF-8 — plausible for an older or
@@ -264,8 +341,15 @@ fn latin1_encoded_feed_extracts_every_valid_ip_despite_the_encoding_mismatch() {
     body.extend_from_slice(b"2001:db8::5\n");
 
     let parser = parsers::for_type("REGEX_LINE").expect("known parser type");
-    let records = addrs(parser.parse(&body, None).expect("must not error on Latin-1 bytes"));
-    assert_eq!(records, vec!["198.51.100.5".to_owned(), "2001:db8::5".to_owned()]);
+    let records = addrs(
+        parser
+            .parse(&body, None)
+            .expect("must not error on Latin-1 bytes"),
+    );
+    assert_eq!(
+        records,
+        vec!["198.51.100.5".to_owned(), "2001:db8::5".to_owned()]
+    );
 }
 
 /// The `JSON_PATH` `jsonl` mode equivalent of the above: one line corrupted with raw non-UTF-8
@@ -282,8 +366,18 @@ fn jsonl_feed_with_one_non_utf8_line_still_extracts_the_well_formed_lines() {
 
     let parser = parsers::for_type("JSON_PATH").expect("known parser type");
     let config = r#"{"jsonl":true,"target_address":"$.cidr"}"#;
-    let records = addrs(parser.parse(&body, Some(config)).expect("must not error on one bad line"));
-    assert_eq!(records, vec!["2001:678:254::/48".to_owned(), "2001:678:6c0::/48".to_owned()]);
+    let records = addrs(
+        parser
+            .parse(&body, Some(config))
+            .expect("must not error on one bad line"),
+    );
+    assert_eq!(
+        records,
+        vec![
+            "2001:678:254::/48".to_owned(),
+            "2001:678:6c0::/48".to_owned()
+        ]
+    );
 }
 
 #[test]
@@ -295,7 +389,11 @@ fn regex_line_parser_handles_trailing_inline_comments_and_spaces() {
 2001:db8::cafe/128 // IPv6 probe
 ";
     let parser = parsers::for_type("REGEX_LINE").expect("REGEX_LINE parser");
-    let records = addrs(parser.parse(body, None).expect("parse regex line with comments"));
+    let records = addrs(
+        parser
+            .parse(body, None)
+            .expect("parse regex line with comments"),
+    );
     assert_eq!(
         records,
         vec![
@@ -321,9 +419,6 @@ fn json_path_parser_extracts_from_deeply_nested_structures_with_mixed_v4_and_v6(
     let records = addrs(parser.parse(body, Some(config)).expect("parse nested JSON"));
     assert_eq!(
         records,
-        vec![
-            "198.51.100.0/24".to_owned(),
-            "2001:db8:a::/48".to_owned(),
-        ]
+        vec!["198.51.100.0/24".to_owned(), "2001:db8:a::/48".to_owned(),]
     );
 }

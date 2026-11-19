@@ -45,15 +45,48 @@ pub enum AppError {
     Internal,
 }
 
+/// Whether a [`sea_orm::DbErr`] is a transient lock/contention failure (`SQLITE_BUSY`,
+/// `SQLITE_LOCKED`, pool timeout, or PostgreSQL lock/serialization conflict).
+fn is_transient_lock_error(err: &sea_orm::DbErr) -> bool {
+    if matches!(err, sea_orm::DbErr::ConnectionAcquire(_)) {
+        return true;
+    }
+    let (sea_orm::DbErr::Conn(runtime_err)
+    | sea_orm::DbErr::Exec(runtime_err)
+    | sea_orm::DbErr::Query(runtime_err)) = err
+    else {
+        return false;
+    };
+    let sea_orm::RuntimeErr::SqlxError(sqlx_err) = runtime_err else {
+        return false;
+    };
+    match sqlx_err.as_ref() {
+        sea_orm::SqlxError::PoolTimedOut => true,
+        sea_orm::SqlxError::Database(db_err) => match db_err.code().as_deref() {
+            Some("55P03" | "40001" | "40P01") => true,
+            Some(code) => code.parse::<u32>().is_ok_and(|n| matches!(n & 0xFF, 5 | 6)),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
             AppError::DbError(err) => {
                 tracing::error!("database error: {err}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({ "error": "Internal server error" }),
-                )
+                if is_transient_lock_error(&err) {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json!({ "error": "Database busy or query timeout, please retry" }),
+                    )
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({ "error": "Internal server error" }),
+                    )
+                }
             }
             AppError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, json!({ "error": msg })),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, json!({ "error": msg })),
@@ -88,5 +121,35 @@ impl From<crate::crypto::CryptoError> for AppError {
     fn from(err: crate::crypto::CryptoError) -> Self {
         tracing::error!("crypto error: {err}");
         AppError::Internal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_lock_and_pool_errors_map_to_503() {
+        let pool_timeout = AppError::DbError(sea_orm::DbErr::Query(
+            sea_orm::RuntimeErr::SqlxError(std::sync::Arc::new(sea_orm::SqlxError::PoolTimedOut)),
+        ));
+        assert_eq!(
+            pool_timeout.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let conn_acquire = AppError::DbError(sea_orm::DbErr::ConnectionAcquire(
+            sea_orm::ConnAcquireErr::Timeout,
+        ));
+        assert_eq!(
+            conn_acquire.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let generic = AppError::DbError(sea_orm::DbErr::Custom("boom".to_owned()));
+        assert_eq!(
+            generic.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

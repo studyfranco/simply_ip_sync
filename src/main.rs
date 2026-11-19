@@ -15,7 +15,9 @@ const BOOTSTRAP_SUBNET: &str = "0.0.0.0/0,::/0";
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     dotenvy::dotenv().ok();
 
     if let Err(e) = run().await {
@@ -29,9 +31,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "sqlite://simply_ip_sync.db?mode=rwc".to_owned());
 
     let db = simply_ip_sync::db::connect(&database_url).await?;
-    simply_ip_sync::db::apply_sqlite_pragmas(&db).await;
     simply_ip_sync::db::run_migrations(&db).await?;
-    simply_ip_sync::db::run_sqlite_optimize(&db).await?;
 
     bootstrap_master_key(&db).await?;
     verify_encryption_key(&db).await?;
@@ -70,16 +70,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Detached, not drained on shutdown: a retention sweep is a bounded, idempotent DELETE, unlike
     // the in-flight HTTP requests graceful shutdown below actually needs to wait for. See
     // `retention::run_retention_worker`'s doc comment.
-    tokio::spawn(simply_ip_sync::retention::run_retention_worker(state.db.clone()));
+    tokio::spawn(simply_ip_sync::retention::run_retention_worker(
+        state.db.clone(),
+    ));
 
     let app = simply_ip_sync::create_app(state);
     let addr = simply_ip_sync::config::resolve_bind_addr();
     tracing::info!("simply_ip_sync listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }
@@ -102,7 +107,9 @@ async fn verify_encryption_key(db: &DatabaseConnection) -> Result<(), Box<dyn st
 
     match simply_ip_sync::crypto::check_key_canary(&cipher, sample.as_deref()) {
         Ok(simply_ip_sync::crypto::KeyCanary::Verified) => {
-            tracing::info!("Encryption key canary passed: secrets at rest open with the configured key.");
+            tracing::info!(
+                "Encryption key canary passed: secrets at rest open with the configured key."
+            );
             Ok(())
         }
         Ok(simply_ip_sync::crypto::KeyCanary::NoSealedSecrets) => {
@@ -134,12 +141,18 @@ async fn verify_encryption_key(db: &DatabaseConnection) -> Result<(), Box<dyn st
 /// is *that* — the unusual path — that gets a warning, matching `simply_ip_vault`'s convention:
 /// setting either in a real deployment is the thing worth a human noticing, not their absence.
 async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
-    let existing = ApiKey::find().filter(api_key::Column::IsMaster.eq(true)).count(db).await?;
+    const BANNER_WIDTH: usize = 82;
+    let existing = ApiKey::find()
+        .filter(api_key::Column::IsMaster.eq(true))
+        .count(db)
+        .await?;
     if existing > 0 {
         return Ok(());
     }
 
-    let plaintext_key = match simply_ip_sync::config::get_secret_or_env(simply_ip_sync::config::INITIAL_MASTER_KEY_ENV) {
+    let plaintext_key = match simply_ip_sync::config::get_secret_or_env(
+        simply_ip_sync::config::INITIAL_MASTER_KEY_ENV,
+    ) {
         Some(raw) if !raw.is_empty() => {
             simply_ip_sync::config::validate_initial_master_key(&raw).map_err(|e| {
                 tracing::error!("Refusing to start: {e}");
@@ -157,7 +170,9 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     };
 
     let cipher = simply_ip_sync::crypto::SecretCipher::from_env()?;
-    let signing_secret = match simply_ip_sync::config::get_secret_or_env(simply_ip_sync::config::INITIAL_MASTER_SIGNING_SECRET_ENV) {
+    let signing_secret = match simply_ip_sync::config::get_secret_or_env(
+        simply_ip_sync::config::INITIAL_MASTER_SIGNING_SECRET_ENV,
+    ) {
         Some(raw) if !raw.is_empty() => {
             simply_ip_sync::config::validate_initial_master_signing_secret(&raw).map_err(|e| {
                 tracing::error!("Refusing to start: {e}");
@@ -197,9 +212,8 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     // refused for the Master key through the API (RBAC §5), so there is no way to recover them
     // later. The box is drawn against an explicit inner width rather than hardcoded runs of `═`,
     // so the borders stay aligned around a 64-hex-character credential.
-    const W: usize = 82;
-    let border = "═".repeat(W);
-    let body: String = [
+    let border = "═".repeat(BANNER_WIDTH);
+    let body = [
         format!("X-API-Key      : {plaintext_key}"),
         format!("Signing secret : {signing_secret}"),
         format!("Bound IPs      : {BOOTSTRAP_SUBNET}"),
@@ -208,19 +222,20 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
         "They will NOT be shown again — store them securely!".to_owned(),
     ]
     .iter()
-    .map(|row| format!("║ {row:<W$} ║\n"))
-    .collect();
+    .fold(String::new(), |mut acc, row| {
+        let _ = std::fmt::Write::write_fmt(&mut acc, format_args!("║ {row:<BANNER_WIDTH$} ║\n"));
+        acc
+    });
 
     tracing::info!(
-        "\n╔{border}╗\n║ {:<W$} ║\n╠{border}╣\n{body}╚{border}╝",
+        "\n╔{border}╗\n║ {:<BANNER_WIDTH$} ║\n╠{border}╣\n{body}╚{border}╝",
         "BOOTSTRAP: Master API Key Generated"
     );
 
     // tracing's fmt subscriber buffers writes; flushing makes the banner's appearance in a
     // redirected/tailed log deterministic rather than a short race against the next log line.
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    std::io::stderr().flush().ok();
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    std::io::Write::flush(&mut std::io::stderr()).ok();
 
     Ok(())
 }
@@ -235,7 +250,7 @@ async fn shutdown_signal() {
             Ok(()) => {}
             Err(e) => {
                 tracing::error!("failed to install Ctrl+C handler: {e}; ignoring SIGINT");
-                std::future::pending::<()>().await
+                std::future::pending::<()>().await;
             }
         }
     };
@@ -248,7 +263,7 @@ async fn shutdown_signal() {
             }
             Err(e) => {
                 tracing::error!("failed to install SIGTERM handler: {e}; ignoring SIGTERM");
-                std::future::pending::<()>().await
+                std::future::pending::<()>().await;
             }
         }
     };

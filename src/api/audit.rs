@@ -98,7 +98,7 @@ pub async fn list_audit_logs(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        find = find.filter(audit_log::Column::Timestamp.lt(parse_rfc3339("until", until)?));
+        find = find.filter(audit_log::Column::Timestamp.lte(parse_rfc3339("until", until)?));
     }
     let rows = find
         .order_by_desc(audit_log::Column::Timestamp)

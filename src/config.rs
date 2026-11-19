@@ -33,12 +33,12 @@ pub const INITIAL_MASTER_SIGNING_SECRET_ENV: &str = "INITIAL_MASTER_SIGNING_SECR
 pub fn get_secret_or_env(var_name: &str) -> Option<String> {
     if let Ok(file_path) = std::env::var(format!("{var_name}_FILE")) {
         let trimmed = file_path.trim();
-        if !trimmed.is_empty() {
-            if let Ok(content) = std::fs::read_to_string(trimmed) {
-                let trimmed_content = content.trim().to_owned();
-                if !trimmed_content.is_empty() {
-                    return Some(trimmed_content);
-                }
+        if !trimmed.is_empty()
+            && let Ok(content) = std::fs::read_to_string(trimmed)
+        {
+            let trimmed_content = content.trim().to_owned();
+            if !trimmed_content.is_empty() {
+                return Some(trimmed_content);
             }
         }
     }
@@ -105,11 +105,13 @@ pub struct InvalidInitialMasterSigningSecret {
 /// Unwraps an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4 form. Several `is_*` checks
 /// on `Ipv6Addr` (e.g. `is_loopback`) are false for the mapped form even when the underlying
 /// address is loopback.
+#[must_use]
 pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     ip.to_canonical()
 }
 
 /// True if `ip` falls within any network in `trusted`.
+#[must_use]
 pub fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
     trusted.iter().any(|net| net.contains(&ip))
 }
@@ -276,6 +278,7 @@ pub struct TrustedProxies {
 
 impl TrustedProxies {
     /// Builds from an already-parsed matcher list.
+    #[must_use]
     pub fn new(matchers: Vec<ProxyMatcher>) -> Self {
         let networks: Vec<IpNet> = matchers
             .iter()
@@ -311,6 +314,10 @@ impl TrustedProxies {
     ///
     /// An **unset** variable is not an error. That is the zero-configuration case, and it means
     /// "trust nothing", which is the safe posture rather than an ambiguous one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidTrustedProxies`] if any entry is malformed.
     pub fn from_env() -> Result<Self, InvalidTrustedProxies> {
         let Ok(raw) = std::env::var(TRUSTED_PROXIES_ENV) else {
             return Ok(Self::default());
@@ -339,6 +346,7 @@ impl TrustedProxies {
     /// Overrides both DNS reuse windows. Test-facing: a suite cannot wait 30 seconds to observe
     /// that a re-resolution happened, nor 5 to observe that one was suppressed.
     #[cfg(test)]
+    #[must_use]
     pub fn with_ttls(mut self, positive: Duration, negative: Duration) -> Self {
         self.positive_ttl = positive;
         self.negative_ttl = negative;
@@ -346,11 +354,13 @@ impl TrustedProxies {
     }
 
     /// Whether anything at all is trusted. An empty configuration ignores forwarding headers.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.matchers.is_empty()
     }
 
     /// The configured matchers, for startup logging.
+    #[must_use]
     pub fn matchers(&self) -> &[ProxyMatcher] {
         &self.matchers
     }
@@ -560,6 +570,10 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNet> {
 ///
 /// The check is purely syntactic and does no I/O: a well-formed hostname is accepted here whether
 /// or not it currently resolves, which is what keeps a DNS outage from becoming a refusal to boot.
+///
+/// # Errors
+///
+/// Returns every invalid entry found in `raw`.
 pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<InvalidProxyEntry>> {
     let mut matchers = Vec::new();
     let mut invalid = Vec::new();
@@ -657,18 +671,22 @@ pub fn resolve_client_ip(
     if !is_trusted(peer, trusted) {
         return peer;
     }
-    if let Some(forwarded) = headers.get("X-Forwarded-For").and_then(|h| h.to_str().ok()) {
-        let client = forwarded
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse::<IpAddr>().ok())
-            .map(normalize_ip)
-            .rev()
-            .find(|ip| !is_trusted(*ip, trusted));
-        if let Some(client) = client {
-            return client;
-        }
+    let forwarded_chain: Vec<IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .flat_map(|val| val.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .map(normalize_ip)
+        .collect();
+    if let Some(client) = forwarded_chain
+        .into_iter()
+        .rev()
+        .find(|ip| !is_trusted(*ip, trusted))
+    {
+        return client;
     }
     if let Some(real_ip) = headers
         .get("X-Real-IP")
@@ -683,6 +701,9 @@ pub fn resolve_client_ip(
 
 /// Validates an operator-supplied `INITIAL_MASTER_KEY`. Fatal on failure: this credential
 /// administers every other credential in the service.
+/// # Errors
+///
+/// Returns [`InvalidInitialMasterKey`] if `raw` is not 64 hex characters.
 pub fn validate_initial_master_key(raw: &str) -> Result<(), InvalidInitialMasterKey> {
     let is_hex = raw.chars().all(|c| c.is_ascii_hexdigit());
     if raw.len() == MASTER_KEY_HEX_LEN && is_hex {
@@ -702,6 +723,9 @@ pub fn validate_initial_master_key(raw: &str) -> Result<(), InvalidInitialMaster
 /// reason as `validate_initial_master_key`: a malformed value here would otherwise boot with a
 /// broken Master identity that can never sign a request, and rotation is refused for the Master
 /// key through the API (RBAC §5), so there would be no recovery path short of deleting the row.
+/// # Errors
+///
+/// Returns [`InvalidInitialMasterSigningSecret`] if `raw` is not 64 hex characters.
 pub fn validate_initial_master_signing_secret(
     raw: &str,
 ) -> Result<(), InvalidInitialMasterSigningSecret> {
@@ -729,13 +753,20 @@ pub fn resolve_bind_addr() -> SocketAddr {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3003);
-    match host.parse::<IpAddr>() {
-        Ok(ip) => SocketAddr::new(ip, port),
-        Err(_) => {
-            tracing::warn!("BIND_HOST '{host}' is not a valid IP address, defaulting to 0.0.0.0");
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
-        }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        SocketAddr::new(ip, port)
+    } else {
+        tracing::warn!("BIND_HOST '{host}' is not a valid IP address, defaulting to 0.0.0.0");
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
     }
+}
+
+/// Test-only escape hatch allowing external feed ingestion against loopback/private targets when
+/// `ALLOW_PRIVATE_INGEST_URLS_FOR_TEST=true` is explicitly set. Defaults to `false` in production.
+#[must_use]
+pub fn allow_private_ingest_urls() -> bool {
+    std::env::var("ALLOW_PRIVATE_INGEST_URLS_FOR_TEST")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
 }
 
 fn max_body_bytes_cell() -> &'static OnceLock<usize> {
@@ -747,6 +778,7 @@ fn max_body_bytes_cell() -> &'static OnceLock<usize> {
 /// [`DEFAULT_MAX_BODY_MIB`], clamped to at least 1 MiB). Called by both the router's
 /// `DefaultBodyLimit` and the inbound auth middleware's signed-body buffer cap, so the two layers
 /// can never drift into a band of sizes one accepts and the other refuses.
+#[must_use]
 pub fn max_body_bytes() -> usize {
     *max_body_bytes_cell().get_or_init(|| {
         let mib = std::env::var("MAX_BODY_SIZE_MIB")
@@ -779,6 +811,7 @@ fn outbound_http_timeout_cell() -> &'static OnceLock<u64> {
 /// security boundary, so a malformed setting fails soft to the default with a logged warning
 /// rather than refusing to boot. A hung remote target must never stall a scheduled job
 /// indefinitely; this is the bound that guarantees it eventually gives up and reports `FAILED`.
+#[must_use]
 pub fn outbound_http_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(*outbound_http_timeout_cell().get_or_init(|| {
         std::env::var("OUTBOUND_HTTP_TIMEOUT_SECS")
@@ -810,18 +843,38 @@ pub const DEFAULT_OUTBOUND_RETRY_BACKOFF_MS: u64 = 500;
 /// extra `env::var` read is immaterial, and staying uncached is what lets a test set this value
 /// and see it take effect immediately rather than being stuck with whatever the first caller in
 /// the process happened to observe.
+fn parse_outbound_max_retries(raw: Option<&str>) -> u32 {
+    if let Some(val) = raw.and_then(|v| v.parse::<u32>().ok()) {
+        val
+    } else {
+        if raw.is_some() {
+            tracing::warn!(
+                "OUTBOUND_MAX_RETRIES is not a valid non-negative integer, using default of {DEFAULT_OUTBOUND_MAX_RETRIES}"
+            );
+        }
+        DEFAULT_OUTBOUND_MAX_RETRIES
+    }
+}
+
+fn parse_outbound_retry_backoff(raw: Option<&str>) -> std::time::Duration {
+    let ms = if let Some(val) = raw.and_then(|v| v.parse::<u64>().ok()).filter(|v| *v >= 1) {
+        val
+    } else {
+        if raw.is_some() {
+            tracing::warn!(
+                "OUTBOUND_RETRY_BACKOFF_MS is not a valid positive integer, using default of {DEFAULT_OUTBOUND_RETRY_BACKOFF_MS}ms"
+            );
+        }
+        DEFAULT_OUTBOUND_RETRY_BACKOFF_MS
+    };
+    std::time::Duration::from_millis(ms)
+}
+
+/// Maximum retry attempts for a transient outbound failure (`retry::is_transient_status`) before
+/// giving up, read fresh from `OUTBOUND_MAX_RETRIES` (default [`DEFAULT_OUTBOUND_MAX_RETRIES`]).
+#[must_use]
 pub fn outbound_max_retries() -> u32 {
-    std::env::var("OUTBOUND_MAX_RETRIES")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or_else(|| {
-            if std::env::var("OUTBOUND_MAX_RETRIES").is_ok() {
-                tracing::warn!(
-                    "OUTBOUND_MAX_RETRIES is not a valid non-negative integer, using default of {DEFAULT_OUTBOUND_MAX_RETRIES}"
-                );
-            }
-            DEFAULT_OUTBOUND_MAX_RETRIES
-        })
+    parse_outbound_max_retries(std::env::var("OUTBOUND_MAX_RETRIES").ok().as_deref())
 }
 
 /// Base delay before the first retry of a transient outbound failure; subsequent attempts back
@@ -829,20 +882,9 @@ pub fn outbound_max_retries() -> u32 {
 /// `OUTBOUND_RETRY_BACKOFF_MS` (default [`DEFAULT_OUTBOUND_RETRY_BACKOFF_MS`], clamped to at
 /// least 1ms) fresh on every call — see `outbound_max_retries`'s doc comment for why this
 /// deliberately isn't `OnceLock`-cached.
+#[must_use]
 pub fn outbound_retry_backoff() -> std::time::Duration {
-    let ms = std::env::var("OUTBOUND_RETRY_BACKOFF_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or_else(|| {
-            if std::env::var("OUTBOUND_RETRY_BACKOFF_MS").is_ok() {
-                tracing::warn!(
-                    "OUTBOUND_RETRY_BACKOFF_MS is not a valid positive integer, using default of {DEFAULT_OUTBOUND_RETRY_BACKOFF_MS}ms"
-                );
-            }
-            DEFAULT_OUTBOUND_RETRY_BACKOFF_MS
-        });
-    std::time::Duration::from_millis(ms)
+    parse_outbound_retry_backoff(std::env::var("OUTBOUND_RETRY_BACKOFF_MS").ok().as_deref())
 }
 
 /// Default ceiling, in bytes, on a decompressed feed body before ingestion aborts, when
@@ -864,6 +906,7 @@ fn max_decompressed_bytes_cell() -> &'static OnceLock<u64> {
 /// `jobs::decompress::read_capped_body` (streaming the HTTP response body) and
 /// `jobs::decompress::decompress_if_zip` (streaming each ZIP member) — both abort as soon as the
 /// running total crosses this ceiling, so the oversized remainder is never actually materialized.
+#[must_use]
 pub fn max_decompressed_bytes() -> u64 {
     *max_decompressed_bytes_cell().get_or_init(|| {
         std::env::var("MAX_DECOMPRESSED_BYTES")
@@ -1148,22 +1191,44 @@ mod tests {
 
     #[test]
     fn outbound_max_retries_defaults_when_unset() {
-        // SAFETY: test-only env mutation; this key is not read anywhere else concurrently within
-        // this single-threaded assertion.
-        unsafe {
-            std::env::remove_var("OUTBOUND_MAX_RETRIES");
-        }
-        assert_eq!(outbound_max_retries(), DEFAULT_OUTBOUND_MAX_RETRIES);
+        assert_eq!(
+            parse_outbound_max_retries(None),
+            DEFAULT_OUTBOUND_MAX_RETRIES
+        );
+        assert_eq!(
+            parse_outbound_max_retries(Some("invalid")),
+            DEFAULT_OUTBOUND_MAX_RETRIES
+        );
+        assert_eq!(parse_outbound_max_retries(Some("5")), 5);
     }
 
     #[test]
     fn outbound_retry_backoff_defaults_when_unset() {
-        unsafe {
-            std::env::remove_var("OUTBOUND_RETRY_BACKOFF_MS");
-        }
         assert_eq!(
-            outbound_retry_backoff(),
+            parse_outbound_retry_backoff(None),
             std::time::Duration::from_millis(DEFAULT_OUTBOUND_RETRY_BACKOFF_MS)
+        );
+        assert_eq!(
+            parse_outbound_retry_backoff(Some("0")),
+            std::time::Duration::from_millis(DEFAULT_OUTBOUND_RETRY_BACKOFF_MS)
+        );
+        assert_eq!(
+            parse_outbound_retry_backoff(Some("250")),
+            std::time::Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn resolve_client_ip_collects_multiple_xff_headers() {
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        headers.append("x-forwarded-for", "10.0.0.5".parse().unwrap());
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &trusted),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
         );
     }
 }

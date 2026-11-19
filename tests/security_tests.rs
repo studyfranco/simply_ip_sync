@@ -1,7 +1,7 @@
 //! Named-attack tests: inbound HMAC verification, anti-replay, and outbound signature generation
 //! against a mock `simply_ip_vault` endpoint.
 
-mod common;
+pub mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -31,7 +31,10 @@ async fn missing_signature_header_is_rejected() {
         .body(Body::empty())
         .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -41,7 +44,12 @@ async fn tampered_signature_is_rejected() {
     let (_conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
     let mut req = common::signed_request(&master, "GET", "/api/auth/me", None);
-    req.headers_mut().insert("X-Signature-256", "sha256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".parse().unwrap());
+    req.headers_mut().insert(
+        "X-Signature-256",
+        "sha256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            .parse()
+            .unwrap(),
+    );
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -52,9 +60,14 @@ async fn stale_timestamp_outside_skew_window_is_rejected() {
     let app = simply_ip_sync::create_app(state);
 
     let stale_ts = (chrono::Utc::now().timestamp() - 3600).to_string();
-    let signature =
-        simply_ip_sync::crypto::compute_signature(&master.signing_secret, "GET", "/api/auth/me", &stale_ts, b"")
-            .expect("sign");
+    let signature = simply_ip_sync::crypto::compute_signature(
+        &master.signing_secret,
+        "GET",
+        "/api/auth/me",
+        &stale_ts,
+        b"",
+    )
+    .expect("sign");
     let mut req = Request::builder()
         .method("GET")
         .uri("/api/auth/me")
@@ -64,7 +77,10 @@ async fn stale_timestamp_outside_skew_window_is_rejected() {
         .body(Body::empty())
         .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -78,7 +94,9 @@ async fn replayed_signature_is_rejected_on_second_use() {
     // is byte-identical to the first (a genuinely fresh request would carry a new timestamp).
     let target = "/api/keys";
     let ts = chrono::Utc::now().timestamp().to_string();
-    let sig = simply_ip_sync::crypto::compute_signature(&master.signing_secret, "GET", target, &ts, b"").unwrap();
+    let sig =
+        simply_ip_sync::crypto::compute_signature(&master.signing_secret, "GET", target, &ts, b"")
+            .unwrap();
     let build = || {
         let mut req = Request::builder()
             .method("GET")
@@ -89,14 +107,25 @@ async fn replayed_signature_is_rejected_on_second_use() {
             .body(Body::empty())
             .expect("build");
         req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                55555,
+            ))));
         req
     };
 
     let resp_first = app.clone().oneshot(build()).await.expect("response");
-    assert_eq!(resp_first.status(), StatusCode::OK, "first use of a signature must be accepted");
+    assert_eq!(
+        resp_first.status(),
+        StatusCode::OK,
+        "first use of a signature must be accepted"
+    );
     let resp_second = app.oneshot(build()).await.expect("response");
-    assert_eq!(resp_second.status(), StatusCode::UNAUTHORIZED, "a replayed signature must be rejected");
+    assert_eq!(
+        resp_second.status(),
+        StatusCode::UNAUTHORIZED,
+        "a replayed signature must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -105,7 +134,8 @@ async fn bound_ips_restricts_access_to_permitted_cidr() {
     let (conn, state, master) = common::setup().await;
 
     // A daughter key bound to a CIDR that excludes the test harness's fixed loopback source.
-    let daughter = common::insert_key(&conn, "Restricted", false, false, false, false, Some(master.id)).await;
+    let daughter =
+        common::insert_key(&conn, "Restricted", false, false, false, Some(master.id)).await;
     let key_row = simply_ip_sync::entities::prelude::ApiKey::find_by_id(daughter.id)
         .one(&conn)
         .await
@@ -142,7 +172,9 @@ fn signed_request_from_peer(
     }
     let mut req = builder.body(Body::empty()).expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(peer, 55555)));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+            peer, 55555,
+        )));
     req
 }
 
@@ -155,15 +187,23 @@ async fn trusted_proxy_forwarded_client_ip_is_checked_against_bound_ips() {
     use sea_orm::{ActiveModelTrait, IntoActiveModel};
     let (conn, mut state, master) = common::setup().await;
 
-    let daughter = common::insert_key(&conn, "ProxiedCaller", false, false, false, false, Some(master.id)).await;
-    let key_row = simply_ip_sync::entities::prelude::ApiKey::find_by_id(daughter.id).one(&conn).await.unwrap().unwrap();
+    let daughter =
+        common::insert_key(&conn, "ProxiedCaller", false, false, false, Some(master.id)).await;
+    let key_row = simply_ip_sync::entities::prelude::ApiKey::find_by_id(daughter.id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
     let mut active = key_row.into_active_model();
     active.bound_ips = sea_orm::Set(Some("203.0.113.0/24".to_owned()));
     active.update(&conn).await.unwrap();
 
     // The peer (127.0.0.1) is a trusted load balancer; the real client sits behind it.
     state.trusted_proxies = simply_ip_sync::config::TrustedProxies::new(vec![
-        "127.0.0.1/32".parse().map(simply_ip_sync::config::ProxyMatcher::Network).unwrap(),
+        "127.0.0.1/32"
+            .parse()
+            .map(simply_ip_sync::config::ProxyMatcher::Network)
+            .unwrap(),
     ]);
 
     let app = simply_ip_sync::create_app(state);
@@ -186,8 +226,13 @@ async fn spoofed_forwarded_for_from_an_untrusted_peer_does_not_bypass_bound_ips(
     use sea_orm::{ActiveModelTrait, IntoActiveModel};
     let (conn, mut state, master) = common::setup().await;
 
-    let daughter = common::insert_key(&conn, "SpoofAttempt", false, false, false, false, Some(master.id)).await;
-    let key_row = simply_ip_sync::entities::prelude::ApiKey::find_by_id(daughter.id).one(&conn).await.unwrap().unwrap();
+    let daughter =
+        common::insert_key(&conn, "SpoofAttempt", false, false, false, Some(master.id)).await;
+    let key_row = simply_ip_sync::entities::prelude::ApiKey::find_by_id(daughter.id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
     let mut active = key_row.into_active_model();
     active.bound_ips = sea_orm::Set(Some("203.0.113.0/24".to_owned()));
     active.update(&conn).await.unwrap();
@@ -261,9 +306,16 @@ async fn outbound_post_batch_signs_correctly() {
         last_seen_at: None,
         deleted_at: None,
     }];
-    let result = simply_ip_sync::client::post_batch(&http, &cipher, &endpoint, "test-group", &records, simply_ip_sync::client::BatchMode::Upsert)
-        .await
-        .expect("post_batch succeeds");
+    let result = simply_ip_sync::client::post_batch(
+        &http,
+        &cipher,
+        &endpoint,
+        "test-group",
+        &records,
+        simply_ip_sync::client::BatchMode::Upsert,
+    )
+    .await
+    .expect("post_batch succeeds");
     assert_eq!(result.created, 1);
 }
 
@@ -318,9 +370,16 @@ async fn outbound_get_ips_delta_signs_correctly_with_since_and_include_deleted()
         updated_at: chrono::Utc::now(),
     };
     let http = simply_ip_sync::client::build_http_client().expect("http client");
-    let records = simply_ip_sync::client::get_ips_delta(&http, &cipher, &endpoint, "delta-group", Some(since), true)
-        .await
-        .expect("get_ips_delta succeeds");
+    let records = simply_ip_sync::client::get_ips_delta(
+        &http,
+        &cipher,
+        &endpoint,
+        "delta-group",
+        Some(since),
+        true,
+    )
+    .await
+    .expect("get_ips_delta succeeds");
     assert!(records.is_empty());
 }
 
@@ -356,13 +415,36 @@ async fn outbound_get_ips_delta_preserves_a_reverse_proxy_subpath_in_target_url(
         // The request itself must still carry the subpath -- this is where the proxy expects it.
         .and(path("/direct/ip_vault/api/ips"))
         .respond_with(move |req: &wiremock::Request| {
-            let sig_header = req.headers.get("X-Signature-256").expect("signature header present").to_str().expect("utf8");
-            let ts_header = req.headers.get("X-Timestamp").expect("timestamp header present").to_str().expect("utf8");
+            let sig_header = req
+                .headers
+                .get("X-Signature-256")
+                .expect("signature header present")
+                .to_str()
+                .expect("utf8");
+            let ts_header = req
+                .headers
+                .get("X-Timestamp")
+                .expect("timestamp header present")
+                .to_str()
+                .expect("utf8");
             // But the SIGNED target must be the bare endpoint path -- matching what a real vault's
             // own router (stripped-prefix, the only working config) actually verifies against.
-            let target = format!("/api/ips?{}", req.url.query().expect("query string present"));
-            let digest = simply_ip_sync::crypto::verify_signature(shared_secret, "GET", &target, ts_header, b"", sig_header);
-            assert!(digest.is_some(), "remote side must be able to verify the outbound signature against the bare path");
+            let target = format!(
+                "/api/ips?{}",
+                req.url.query().expect("query string present")
+            );
+            let digest = simply_ip_sync::crypto::verify_signature(
+                shared_secret,
+                "GET",
+                &target,
+                ts_header,
+                b"",
+                sig_header,
+            );
+            assert!(
+                digest.is_some(),
+                "remote side must be able to verify the outbound signature against the bare path"
+            );
             ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new())
         })
         .mount(&mock_server)
@@ -382,9 +464,10 @@ async fn outbound_get_ips_delta_preserves_a_reverse_proxy_subpath_in_target_url(
         updated_at: chrono::Utc::now(),
     };
     let http = simply_ip_sync::client::build_http_client().expect("http client");
-    let records = simply_ip_sync::client::get_ips_delta(&http, &cipher, &endpoint, "delta-group", None, true)
-        .await
-        .expect("get_ips_delta succeeds");
+    let records =
+        simply_ip_sync::client::get_ips_delta(&http, &cipher, &endpoint, "delta-group", None, true)
+            .await
+            .expect("get_ips_delta succeeds");
     assert!(records.is_empty());
 }
 
@@ -439,9 +522,16 @@ async fn outbound_post_batch_preserves_a_reverse_proxy_subpath_in_target_url() {
         last_seen_at: None,
         deleted_at: None,
     }];
-    let result = simply_ip_sync::client::post_batch(&http, &cipher, &endpoint, "test-group", &records, simply_ip_sync::client::BatchMode::Upsert)
-        .await
-        .expect("post_batch succeeds");
+    let result = simply_ip_sync::client::post_batch(
+        &http,
+        &cipher,
+        &endpoint,
+        "test-group",
+        &records,
+        simply_ip_sync::client::BatchMode::Upsert,
+    )
+    .await
+    .expect("post_batch succeeds");
     assert_eq!(result.created, 1);
 }
 
@@ -469,7 +559,10 @@ async fn tampering_a_single_byte_deep_in_a_large_body_is_still_detected() {
         "targets": targets,
     });
     let body_bytes = serde_json::to_vec(&payload).expect("serialize");
-    assert!(body_bytes.len() > 100_000, "the payload must be large enough that a prefix-only signature bug wouldn't be caught by chance");
+    assert!(
+        body_bytes.len() > 100_000,
+        "the payload must be large enough that a prefix-only signature bug wouldn't be caught by chance"
+    );
 
     let timestamp = chrono::Utc::now().timestamp().to_string();
     let valid_signature = simply_ip_sync::crypto::compute_signature(
@@ -497,10 +590,17 @@ async fn tampering_a_single_byte_deep_in_a_large_body_is_still_detected() {
         .body(Body::from(tampered_body))
         .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
 
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a signature computed over the untampered body must not verify a body mutated deep in its middle");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a signature computed over the untampered body must not verify a body mutated deep in its middle"
+    );
 }
 
 /// Two genuinely concurrent, distinctly-signed requests replaying the exact same
@@ -518,7 +618,9 @@ async fn two_concurrent_replays_of_the_same_signature_only_one_succeeds() {
 
     let target = "/api/auth/me";
     let ts = chrono::Utc::now().timestamp().to_string();
-    let sig = simply_ip_sync::crypto::compute_signature(&master.signing_secret, "GET", target, &ts, b"").expect("sign");
+    let sig =
+        simply_ip_sync::crypto::compute_signature(&master.signing_secret, "GET", target, &ts, b"")
+            .expect("sign");
     let build = || {
         let mut req = Request::builder()
             .method("GET")
@@ -529,7 +631,10 @@ async fn two_concurrent_replays_of_the_same_signature_only_one_succeeds() {
             .body(Body::empty())
             .expect("build");
         req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                55555,
+            ))));
         req
     };
 
@@ -540,10 +645,152 @@ async fn two_concurrent_replays_of_the_same_signature_only_one_succeeds() {
     let status_b = resp_b.expect("response b").status();
 
     let mut statuses = vec![status_a, status_b];
-    statuses.sort_by_key(|s| s.as_u16());
+    statuses.sort_by_key(axum::http::StatusCode::as_u16);
     assert_eq!(
         statuses,
         vec![StatusCode::OK, StatusCode::UNAUTHORIZED],
         "exactly one of two genuinely concurrent requests carrying the identical signature must succeed, the other rejected as a replay"
+    );
+}
+
+#[tokio::test]
+async fn vault_endpoint_api_key_is_sealed_at_rest_and_legacy_plaintext_opens() {
+    use sea_orm::{ActiveModelTrait, ColumnTrait, QueryFilter, Set};
+
+    let (conn, mut state, master) = common::setup().await;
+    let cipher_arc = std::sync::Arc::new(
+        simply_ip_sync::crypto::SecretCipher::from_hex_key(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .expect("valid key"),
+    );
+    state.cipher = cipher_arc.clone();
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .and(header("X-API-Key", "sealed-remote-api-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&mock)
+        .await;
+
+    let app = simply_ip_sync::create_app(state);
+    let create_req = common::signed_request(
+        &master,
+        "POST",
+        "/api/vaults",
+        Some(&serde_json::json!({
+            "name": "encrypted-vault",
+            "target_url": mock.uri(),
+            "api_key": "sealed-remote-api-key",
+            "signing_secret": "sealed-remote-signing-secret"
+        })),
+    );
+    let create_resp = app.oneshot(create_req).await.expect("create vault resp");
+    assert_eq!(create_resp.status(), StatusCode::OK);
+
+    let stored = simply_ip_sync::entities::vault_endpoint::Entity::find()
+        .filter(simply_ip_sync::entities::vault_endpoint::Column::Name.eq("encrypted-vault"))
+        .one(&conn)
+        .await
+        .expect("query")
+        .expect("vault present");
+
+    assert!(
+        stored.api_key.starts_with("v1.xchacha20poly1305."),
+        "vault_endpoints.api_key must be sealed at rest, got {}",
+        stored.api_key
+    );
+    assert!(
+        stored.signing_secret.starts_with("v1.xchacha20poly1305."),
+        "vault_endpoints.signing_secret must be sealed at rest"
+    );
+
+    let http = simply_ip_sync::client::build_http_client().expect("http client");
+    let fetched = simply_ip_sync::client::get_ips_delta(
+        &http,
+        cipher_arc.as_ref(),
+        &stored,
+        "bans",
+        None,
+        false,
+    )
+    .await
+    .expect("sealed endpoint call succeeds");
+    assert!(fetched.is_empty());
+
+    // Backward compatibility: pre-encryption DB rows stored raw plaintext api_key.
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .and(header("X-API-Key", "legacy-raw-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&mock)
+        .await;
+
+    let legacy_row = simply_ip_sync::entities::vault_endpoint::ActiveModel {
+        id: Set(uuid::Uuid::new_v4()),
+        name: Set("legacy-vault".to_owned()),
+        target_url: Set(mock.uri()),
+        api_key: Set("legacy-raw-key".to_owned()),
+        signing_secret: Set(cipher_arc.seal("legacy-secret").expect("seal")),
+        description: Set(None),
+        owner_key_id: Set(Some(master.id)),
+        created_at: Set(chrono::Utc::now()),
+        updated_at: Set(chrono::Utc::now()),
+    }
+    .insert(&conn)
+    .await
+    .expect("insert legacy");
+
+    let fetched_legacy = simply_ip_sync::client::get_ips_delta(
+        &http,
+        cipher_arc.as_ref(),
+        &legacy_row,
+        "bans",
+        None,
+        false,
+    )
+    .await
+    .expect("legacy unprefixed api_key must remain readable");
+    assert!(fetched_legacy.is_empty());
+}
+
+#[tokio::test]
+async fn audit_logs_until_filter_is_inclusive() {
+    use sea_orm::{ActiveModelTrait, Set};
+
+    let (conn, state, master) = common::setup().await;
+    let exact_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
+    let exact_ts = chrono::DateTime::from_timestamp(exact_ts.timestamp(), 0).expect("ts");
+
+    simply_ip_sync::entities::audit_log::ActiveModel {
+        id: Set(uuid::Uuid::new_v4()),
+        api_key_id: Set(Some(master.id)),
+        api_key_name: Set("Master".to_owned()),
+        api_key_prefix: Set(master.plaintext_key.chars().take(8).collect()),
+        action: Set("INCLUSIVE_PROBE".to_owned()),
+        target_resource: Set(None),
+        client_ip: Set("127.0.0.1".to_owned()),
+        details: Set(None),
+        timestamp: Set(exact_ts),
+    }
+    .insert(&conn)
+    .await
+    .expect("insert audit row");
+
+    let app = simply_ip_sync::create_app(state);
+    let until_str = exact_ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let uri = format!("/api/audit-logs?action=INCLUSIVE_PROBE&until={until_str}");
+    let req = common::signed_request(&master, "GET", &uri, None);
+    let resp = app.oneshot(req).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        rows.len(),
+        1,
+        "until filter must include rows at the exact boundary timestamp (<=)"
     );
 }

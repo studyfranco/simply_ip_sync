@@ -115,8 +115,8 @@ conjunction rules.
 | Method & Path | Auth / RBAC | Request Body | Response |
 | :--- | :--- | :--- | :--- |
 | `GET /api/keys/{id}/permissions` | Master, self, or `id`'s direct parent (same visibility rule as `GET /api/keys/{id}`); otherwise `404`. | — | `200` — raw `api_key_sync_permissions` rows for `id` (`Vec<Model>`, unfiltered field set: `id, api_key_id, resource_type, resource_id, can_sync, can_manage, can_view_logs, created_at`). |
-| `PUT /api/keys/{id}/permissions` | `can_manage_keys` (`guard_manage_keys`) **and** RBAC R2 on the target resource (global `can_manage_keys` + a `can_manage=true` row the *caller* holds on that resource) **and** R1/R7 (the caller may only grant a verb — `can_sync`/`can_manage`/`can_view_logs` — that it holds itself on that same resource). Master bypasses all three. | `GrantPermissionPayload` (§3.7) | `200` — the created or updated `api_key_sync_permissions` row (upsert: keyed on `(api_key_id, resource_type, resource_id)`). `400` if `resource_type` isn't one of `external_source`/`sync_task`/`vault_endpoint`. |
-| `DELETE /api/keys/{id}/permissions/{permission_id}` | `can_manage_keys` + RBAC R2/R6 (manage rights on the resource the permission targets; the revoker need **not** hold the verb being removed). | — | `204 No Content`. `404` if the permission doesn't belong to `id`, or if a concurrent revoke already removed it (TOCTOU-safe). |
+| `PUT /api/keys/{id}/permissions` | Requires global `can_manage_keys`. A non-Master caller needs `can_manage=true` on the resource (R2). Creating a row or widening permissions additionally requires matching held verbs (R1/R7), and a caller may not widen its own permissions. Pure reductions require R2 under R6. | `GrantPermissionPayload` (§3.7) | `200` — the created or updated permission row. `400` for a Master target or a resource type other than `destination_group`, `sync_task`, or `vault_endpoint`. |
+| `DELETE /api/keys/{id}/permissions/{permission_id}` | `can_manage_keys` + RBAC R2/R6 (manage rights on the resource the permission targets; the revoker need **not** hold the verb being removed). | — | `204 No Content`. `404` if the permission doesn't belong to `id`, or if a concurrent revoke already removed it (TOCTOU-safe). `400` for a Master target. |
 
 ### 3.4 Query Parameters
 
@@ -173,7 +173,7 @@ Every `api_keys` read returns this shape. `key_hash` and `signing_secret` are **
 
 | Field | Type | Required | Default | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `resource_type` | string | yes | — | Must be `"external_source"`, `"sync_task"`, or `"vault_endpoint"` |
+| `resource_type` | string | yes | — | Must be `"destination_group"`, `"sync_task"`, or `"vault_endpoint"` |
 | `resource_id` | UUID | yes | — | |
 | `can_sync` | bool | no | `false` | |
 | `can_manage` | bool | no | `false` | |
@@ -438,6 +438,10 @@ Resource model: `audit_logs` (read-only, Master-only). Handler: `src/api/audit.r
 | Name | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `action` | string | no | none (no filter) | Exact-match on the `action` column (e.g. `KEY_CREATE`, `VAULT_DELETE`, `GROUP_TRIGGER`, `PERMISSION_GRANT` — see §9 for the full action taxonomy) |
+| `client_ip` | string | no | none | Substring match on the client IP |
+| `api_key` | string | no | none | Substring match on the acting key name or prefix, or an exact UUID match |
+| `since` | RFC 3339 timestamp | no | none | Inclusive lower timestamp bound |
+| `until` | RFC 3339 timestamp | no | none | Inclusive upper timestamp bound |
 | `limit` | integer | no | `100` | Clamped to a maximum of `1000` |
 | `offset` | integer | no | `0` | |
 

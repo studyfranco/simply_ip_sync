@@ -16,6 +16,11 @@ use crate::state::AppState;
 /// `last_sync_at` (including soft-deleted tombstones), chunks it, and pushes to every configured
 /// target vault. `last_sync_at` only advances when **every** target succeeds — a partial delivery
 /// must not skip the undelivered records on the next run.
+///
+/// # Errors
+///
+/// Returns [`AppError::NotFound`] if the task no longer exists or [`AppError::DbError`] on
+/// database failures.
 pub async fn run(state: &AppState, task_id: Uuid) -> Result<JobSummary, AppError> {
     let started_at = Utc::now();
 
@@ -56,55 +61,17 @@ pub async fn run(state: &AppState, task_id: Uuid) -> Result<JobSummary, AppError
     Ok(summary)
 }
 
-async fn execute(
-    state: &AppState,
-    task: &vault_sync_task::Model,
-    source_vault: Option<&vault_endpoint::Model>,
-    targets: &[(vault_sync_task_target::Model, Option<vault_endpoint::Model>)],
-) -> (JobSummary, bool) {
-    let start = std::time::Instant::now();
+struct SyncPushOutcome {
+    chunks_sent: i32,
+    errors: Vec<String>,
+    any_success: bool,
+    all_succeeded: bool,
+}
 
-    let Some(source_vault) = source_vault else {
-        return (
-            JobSummary {
-                status: "FAILED",
-                items_processed: 0,
-                chunks_sent: 0,
-                duration_ms: start.elapsed().as_millis() as i32,
-                error_message: Some("source vault endpoint no longer exists".to_owned()),
-            },
-            false,
-        );
-    };
-
-    let delta = match client::get_ips_delta(
-        &state.http,
-        &state.cipher,
-        source_vault,
-        &task.source_group_name,
-        task.last_sync_at,
-        true,
-    )
-    .await
-    {
-        Ok(records) => records,
-        Err(e) => {
-            return (
-                JobSummary {
-                    status: "FAILED",
-                    items_processed: 0,
-                    chunks_sent: 0,
-                    duration_ms: start.elapsed().as_millis() as i32,
-                    error_message: Some(format!(
-                        "delta fetch from '{}' failed: {e}",
-                        source_vault.name
-                    )),
-                },
-                false,
-            );
-        }
-    };
-
+fn sanitize_sync_delta(
+    delta: Vec<crate::client::IpRecordResponse>,
+    skip_bogon_filtering: bool,
+) -> (Vec<BatchRecordInput>, bool, usize) {
     let mapped: Vec<BatchRecordInput> = delta
         .into_iter()
         .map(|record| BatchRecordInput {
@@ -117,39 +84,26 @@ async fn execute(
             deleted_at: record.deleted_at,
         })
         .collect();
+    let raw_empty = mapped.is_empty();
+    if skip_bogon_filtering {
+        return (mapped, raw_empty, 0);
+    }
+    let addresses: Vec<String> = mapped.iter().map(|r| r.target_address.clone()).collect();
+    let (kept, removed) = crate::bogon::sanitize(addresses);
+    let kept: std::collections::HashSet<&str> = kept.iter().map(String::as_str).collect();
+    let filtered = mapped
+        .into_iter()
+        .filter(|r| kept.contains(r.target_address.as_str()))
+        .collect();
+    (filtered, raw_empty, removed)
+}
 
-    // A *first* sync (`last_sync_at` still unset, so the delta fetch above carried no `since` at
-    // all and asked the source for its entire group) fetching literally zero raw records is a
-    // much stronger signal than the same count on a later run: this run has nothing to be
-    // incremental *about*, so an empty result means either the source group genuinely has no
-    // records in it, or — just as plausible, and silent otherwise — `source_group_name` doesn't
-    // match the source vault's group at all (a typo or a case mismatch; group names are matched
-    // case-sensitively there). Checked against the raw delta, before the bogon filter below, so a
-    // first sync that fetched real records but had every one of them filtered out is reported
-    // through `bogons_removed` instead, not conflated with this case.
-    let is_first_sync = task.last_sync_at.is_none();
-    let anomalous_empty_first_sync = is_first_sync && mapped.is_empty();
-
-    // Same pre-push sanitization `jobs::external_ingestion` applies, for the same reason: a
-    // source vault's own group can accumulate a loopback/private/link-local entry (a bad manual
-    // ban), and relaying it on unchanged just converts a target's own `400` into this task's own
-    // `sync_logs` failure instead of preventing it. `task.skip_bogon_filtering` bypasses this for
-    // a task deliberately replicating internal/lab address space between vaults.
-    let (mapped, bogons_removed) = if task.skip_bogon_filtering {
-        (mapped, 0usize)
-    } else {
-        let addresses: Vec<String> = mapped.iter().map(|r| r.target_address.clone()).collect();
-        let (kept, removed) = crate::bogon::sanitize(addresses);
-        let kept: std::collections::HashSet<&str> = kept.iter().map(String::as_str).collect();
-        let filtered = mapped
-            .into_iter()
-            .filter(|r| kept.contains(r.target_address.as_str()))
-            .collect();
-        (filtered, removed)
-    };
-    let items_processed = mapped.len();
-
-    let chunks = chunk_records(mapped, MAX_BATCH_SIZE);
+async fn push_sync_chunks(
+    state: &AppState,
+    task: &vault_sync_task::Model,
+    targets: &[(vault_sync_task_target::Model, Option<vault_endpoint::Model>)],
+    chunks: &[Vec<BatchRecordInput>],
+) -> SyncPushOutcome {
     let mut chunks_sent = 0i32;
     let mut errors: Vec<String> = Vec::new();
     let mut any_success = targets.is_empty();
@@ -170,7 +124,7 @@ async fn execute(
             .unwrap_or_else(|| task.target_group_name.clone());
 
         let mut target_ok = true;
-        for chunk in &chunks {
+        for chunk in chunks {
             match client::post_batch(
                 &state.http,
                 &state.cipher,
@@ -196,8 +150,76 @@ async fn execute(
         }
     }
 
-    let status = if !errors.is_empty() {
-        if any_success { "PARTIAL" } else { "FAILED" }
+    SyncPushOutcome {
+        chunks_sent,
+        errors,
+        any_success,
+        all_succeeded,
+    }
+}
+
+async fn execute(
+    state: &AppState,
+    task: &vault_sync_task::Model,
+    source_vault: Option<&vault_endpoint::Model>,
+    targets: &[(vault_sync_task_target::Model, Option<vault_endpoint::Model>)],
+) -> (JobSummary, bool) {
+    let start = std::time::Instant::now();
+    let elapsed_ms = || i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
+
+    let Some(source_vault) = source_vault else {
+        return (
+            JobSummary {
+                status: "FAILED",
+                items_processed: 0,
+                chunks_sent: 0,
+                duration_ms: elapsed_ms(),
+                error_message: Some("source vault endpoint no longer exists".to_owned()),
+            },
+            false,
+        );
+    };
+
+    let delta = match client::get_ips_delta(
+        &state.http,
+        &state.cipher,
+        source_vault,
+        &task.source_group_name,
+        task.last_sync_at,
+        true,
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(e) => {
+            return (
+                JobSummary {
+                    status: "FAILED",
+                    items_processed: 0,
+                    chunks_sent: 0,
+                    duration_ms: elapsed_ms(),
+                    error_message: Some(format!(
+                        "delta fetch from '{}' failed: {e}",
+                        source_vault.name
+                    )),
+                },
+                false,
+            );
+        }
+    };
+
+    let (mapped, raw_empty, bogons_removed) = sanitize_sync_delta(delta, task.skip_bogon_filtering);
+    let anomalous_empty_first_sync = task.last_sync_at.is_none() && raw_empty;
+    let items_processed = mapped.len();
+    let chunks = chunk_records(mapped, MAX_BATCH_SIZE);
+    let outcome = push_sync_chunks(state, task, targets, &chunks).await;
+
+    let status = if !outcome.errors.is_empty() {
+        if outcome.any_success {
+            "PARTIAL"
+        } else {
+            "FAILED"
+        }
     } else if anomalous_empty_first_sync {
         "PARTIAL"
     } else {
@@ -218,20 +240,20 @@ async fn execute(
             "{bogons_removed} bogon/private/reserved address(es) sanitized before push"
         ));
     }
-    message_parts.extend(errors);
+    message_parts.extend(outcome.errors);
 
     (
         JobSummary {
             status,
-            items_processed: items_processed as i32,
-            chunks_sent,
-            duration_ms: start.elapsed().as_millis() as i32,
+            items_processed: i32::try_from(items_processed).unwrap_or(i32::MAX),
+            chunks_sent: outcome.chunks_sent,
+            duration_ms: elapsed_ms(),
             error_message: if message_parts.is_empty() {
                 None
             } else {
                 Some(message_parts.join("; "))
             },
         },
-        all_succeeded,
+        outcome.all_succeeded,
     )
 }

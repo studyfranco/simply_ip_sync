@@ -2,8 +2,6 @@
 //! keys directly against the database, a `CANONICAL_V1` request signer matching what a real
 //! client computes, and [`MockVault`] — a *stateful* stand-in for a remote `simply_ip_vault`.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -30,26 +28,47 @@ pub struct TestKey {
 /// Builds an in-memory database with migrations applied, a pinned Master key, and `AppState`
 /// wired to a `Plaintext` cipher (so `insert_key`'s sealed secrets round-trip without needing a
 /// real `SYNC_ENCRYPTION_KEY`).
+///
+/// # Panics
+/// If the database, migrations, or test state cannot be initialized.
 pub async fn setup() -> (DatabaseConnection, AppState, TestKey) {
     let conn = Database::connect("sqlite::memory:").await.expect("connect");
     db::run_migrations(&conn).await.expect("migrate");
-    let master = insert_key(&conn, "Master", true, true, true, true, None).await;
-    let state = AppState::for_tests(conn.clone(), master.id).await;
+    let master = insert_key_inner(&conn, "Master", true, (true, true, true), None).await;
+    let state = AppState::for_tests(conn.clone(), master.id)
+        .await
+        .expect("build test state");
     (conn, state, master)
 }
 
-/// Inserts a key directly against the database (bypassing the HTTP API, the way an integration
-/// suite is expected to mint credentials for its scenarios).
-#[allow(clippy::too_many_arguments)]
+/// Inserts a non-master key directly against the database (bypassing the HTTP API, the way an
+/// integration suite is expected to mint credentials for its scenarios).
 pub async fn insert_key(
     conn: &DatabaseConnection,
     name: &str,
-    is_master: bool,
     can_manage_keys: bool,
     can_manage_sources: bool,
     can_manage_vaults: bool,
     parent_key_id: Option<Uuid>,
 ) -> TestKey {
+    insert_key_inner(
+        conn,
+        name,
+        false,
+        (can_manage_keys, can_manage_sources, can_manage_vaults),
+        parent_key_id,
+    )
+    .await
+}
+
+async fn insert_key_inner(
+    conn: &DatabaseConnection,
+    name: &str,
+    is_master: bool,
+    scopes: (bool, bool, bool),
+    parent_key_id: Option<Uuid>,
+) -> TestKey {
+    let (can_manage_keys, can_manage_sources, can_manage_vaults) = scopes;
     let plaintext_key = api::generate_random_key();
     let signing_secret = crypto::generate_signing_secret();
     let id = Uuid::new_v4();
@@ -81,6 +100,10 @@ pub async fn insert_key(
 }
 
 /// Computes the three `CANONICAL_V1` headers a real client would send for `method`/`target`/`body`.
+///
+/// # Panics
+/// If the test credentials cannot sign the request.
+#[must_use]
 pub fn sign(key: &TestKey, method: &str, target: &str, body: &[u8]) -> (String, String, String) {
     let timestamp = Utc::now().timestamp().to_string();
     let signature =
@@ -92,13 +115,17 @@ pub fn sign(key: &TestKey, method: &str, target: &str, body: &[u8]) -> (String, 
 /// Builds a fully signed request against `target` (path plus query string), ready for
 /// `tower::ServiceExt::oneshot` against the real router. Manually inserts a `ConnectInfo`
 /// extension since the test harness never binds a real listener.
+///
+/// # Panics
+/// If the test body cannot be serialized or the request cannot be signed or built.
+#[must_use]
 pub fn signed_request(
     key: &TestKey,
     method: &str,
     target: &str,
-    body: Option<serde_json::Value>,
+    body: Option<&serde_json::Value>,
 ) -> axum::http::Request<axum::body::Body> {
-    let body_bytes = match &body {
+    let body_bytes = match body {
         Some(v) => serde_json::to_vec(v).expect("serialize body"),
         None => Vec::new(),
     };
@@ -202,6 +229,7 @@ struct VaultData {
 /// For the plain IPv4 host addresses these tests use this is the identity function; it exists so
 /// the "no duplicates after canonicalisation" assertion is genuinely testing a canonical key rather
 /// than raw string equality.
+#[must_use]
 pub fn canonicalize_address(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Ok(ip) = IpAddr::from_str(trimmed) {
@@ -272,6 +300,7 @@ impl MockVault {
     }
 
     /// Base URL to store in a `vault_endpoints.target_url`.
+    #[must_use]
     pub fn uri(&self) -> String {
         self.server.uri()
     }
@@ -322,6 +351,9 @@ impl MockVault {
     ///
     /// Panics if an address is not present — a test that soft-deletes a record it never seeded is
     /// asserting against a fixture that does not exist, and should fail loudly at setup.
+    ///
+    /// # Panics
+    /// If the group or any supplied address is missing from the fixture.
     pub fn soft_delete(&self, group: &str, addresses: &[String], deleted_at: DateTime<Utc>) {
         let stamp = deleted_at.naive_utc();
         let mut data = self.lock();
@@ -341,6 +373,7 @@ impl MockVault {
     }
 
     /// Every record in `group`, live and tombstoned, keyed by canonical address.
+    #[must_use]
     pub fn records(&self, group: &str) -> BTreeMap<String, StoredRecord> {
         self.lock().groups.get(group).cloned().unwrap_or_default()
     }
@@ -351,6 +384,7 @@ impl MockVault {
     }
 
     /// Canonical addresses in `group` that are currently tombstoned.
+    #[must_use]
     pub fn deleted_addresses(&self, group: &str) -> Vec<String> {
         self.lock()
             .groups
@@ -365,6 +399,7 @@ impl MockVault {
     }
 
     /// Canonical addresses in `group` that are currently live.
+    #[must_use]
     pub fn live_addresses(&self, group: &str) -> Vec<String> {
         self.lock()
             .groups
@@ -379,11 +414,13 @@ impl MockVault {
     }
 
     /// Every `GET /api/ips` this vault has served, in order.
+    #[must_use]
     pub fn gets(&self) -> Vec<RecordedGet> {
         self.lock().gets.clone()
     }
 
     /// Every `POST /api/records/batch` this vault has served, in order.
+    #[must_use]
     pub fn batches(&self) -> Vec<RecordedBatch> {
         self.lock().batches.clone()
     }
@@ -447,9 +484,11 @@ impl MockVault {
             }
         }
 
-        let start = offset.unwrap_or(0) as usize;
+        let start = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
         let end = match limit {
-            Some(l) => start.saturating_add(l as usize).min(matched.len()),
+            Some(l) => start
+                .saturating_add(usize::try_from(l).unwrap_or(usize::MAX))
+                .min(matched.len()),
             None => matched.len(),
         };
         let page: Vec<serde_json::Value> = if start >= matched.len() {
@@ -470,29 +509,96 @@ impl MockVault {
         ResponseTemplate::new(200).set_body_json(page)
     }
 
+    fn apply_batch_records(
+        entries: &mut BTreeMap<String, StoredRecord>,
+        records: Vec<MockBatchRecord>,
+        now: NaiveDateTime,
+    ) -> (Vec<String>, u64, u64, u64, u64) {
+        let mut present: Vec<String> = Vec::with_capacity(records.len());
+        let mut created = 0u64;
+        let mut updated = 0u64;
+        let mut restored = 0u64;
+        let mut soft_deleted = 0u64;
+
+        for record in records {
+            let key = canonicalize_address(&record.target_address);
+            present.push(key.clone());
+            let is_deleted = record.is_deleted.unwrap_or(false);
+
+            if let Some(existing) = entries.get_mut(&key) {
+                if existing.is_deleted && !is_deleted {
+                    restored += 1;
+                }
+                if !existing.is_deleted && is_deleted {
+                    soft_deleted += 1;
+                }
+                if record.cause.is_some() {
+                    existing.cause = record.cause;
+                }
+                existing.is_deleted = is_deleted;
+                existing.deleted_at = if is_deleted {
+                    record.deleted_at.or(Some(now))
+                } else {
+                    None
+                };
+                existing.updated_at = record.updated_at.unwrap_or(now);
+                existing.last_seen_at = record.last_seen_at.unwrap_or(existing.last_seen_at);
+                updated += 1;
+            } else {
+                entries.insert(
+                    key.clone(),
+                    StoredRecord {
+                        target_address: key,
+                        cause: record.cause,
+                        is_deleted,
+                        deleted_at: if is_deleted {
+                            record.deleted_at.or(Some(now))
+                        } else {
+                            None
+                        },
+                        created_at: record.created_at.unwrap_or(now),
+                        updated_at: record.updated_at.unwrap_or(now),
+                        last_seen_at: record.last_seen_at.unwrap_or(now),
+                    },
+                );
+                created += 1;
+            }
+        }
+
+        (present, created, updated, restored, soft_deleted)
+    }
+
+    fn apply_full_replace(
+        entries: &mut BTreeMap<String, StoredRecord>,
+        present: &[String],
+        now: NaiveDateTime,
+    ) -> u64 {
+        let omitted: Vec<String> = entries
+            .keys()
+            .filter(|k| !present.contains(k))
+            .cloned()
+            .collect();
+        let mut soft_deleted = 0u64;
+        for key in omitted {
+            if let Some(record) = entries.get_mut(&key)
+                && !record.is_deleted
+            {
+                record.is_deleted = true;
+                record.deleted_at = Some(now);
+                record.updated_at = now;
+                soft_deleted += 1;
+            }
+        }
+        soft_deleted
+    }
+
     fn handle_batch(data: &Arc<Mutex<VaultData>>, req: &wiremock::Request) -> ResponseTemplate {
         #[derive(serde::Deserialize)]
         struct BatchPayload {
             group_name: String,
             #[serde(default)]
             mode: Option<String>,
-            records: Vec<BatchRecord>,
-        }
-        #[derive(serde::Deserialize)]
-        struct BatchRecord {
-            target_address: String,
-            #[serde(default)]
-            cause: Option<String>,
-            #[serde(default)]
-            is_deleted: Option<bool>,
-            #[serde(default)]
-            created_at: Option<NaiveDateTime>,
-            #[serde(default)]
-            updated_at: Option<NaiveDateTime>,
-            #[serde(default)]
-            last_seen_at: Option<NaiveDateTime>,
-            #[serde(default)]
-            deleted_at: Option<NaiveDateTime>,
+            records: Vec<MockBatchRecord>,
         }
 
         let Ok(payload) = req.body_json::<BatchPayload>() else {
@@ -522,78 +628,11 @@ impl MockVault {
         });
 
         let entries = guard.groups.entry(payload.group_name.clone()).or_default();
-        let mut created = 0u64;
-        let mut updated = 0u64;
-        let mut restored = 0u64;
-        let mut soft_deleted = 0u64;
-        let mut present: Vec<String> = Vec::with_capacity(payload.records.len());
-
-        for record in payload.records {
-            let key = canonicalize_address(&record.target_address);
-            present.push(key.clone());
-            let is_deleted = record.is_deleted.unwrap_or(false);
-
-            match entries.get_mut(&key) {
-                Some(existing) => {
-                    if existing.is_deleted && !is_deleted {
-                        restored += 1;
-                    }
-                    if !existing.is_deleted && is_deleted {
-                        soft_deleted += 1;
-                    }
-                    // An omitted `cause` leaves the stored value alone rather than clearing it.
-                    if record.cause.is_some() {
-                        existing.cause = record.cause;
-                    }
-                    existing.is_deleted = is_deleted;
-                    existing.deleted_at = if is_deleted {
-                        record.deleted_at.or(Some(now))
-                    } else {
-                        None
-                    };
-                    existing.updated_at = record.updated_at.unwrap_or(now);
-                    existing.last_seen_at = record.last_seen_at.unwrap_or(existing.last_seen_at);
-                    updated += 1;
-                }
-                None => {
-                    entries.insert(
-                        key.clone(),
-                        StoredRecord {
-                            target_address: key,
-                            cause: record.cause,
-                            is_deleted,
-                            deleted_at: if is_deleted {
-                                record.deleted_at.or(Some(now))
-                            } else {
-                                None
-                            },
-                            // `created_at` is honoured only for genuinely new rows.
-                            created_at: record.created_at.unwrap_or(now),
-                            updated_at: record.updated_at.unwrap_or(now),
-                            last_seen_at: record.last_seen_at.unwrap_or(now),
-                        },
-                    );
-                    created += 1;
-                }
-            }
-        }
+        let (present, created, updated, restored, mut soft_deleted) =
+            Self::apply_batch_records(entries, payload.records, now);
 
         if mode == "full_replace" {
-            let omitted: Vec<String> = entries
-                .keys()
-                .filter(|k| !present.contains(k))
-                .cloned()
-                .collect();
-            for key in omitted {
-                if let Some(record) = entries.get_mut(&key)
-                    && !record.is_deleted
-                {
-                    record.is_deleted = true;
-                    record.deleted_at = Some(now);
-                    record.updated_at = now;
-                    soft_deleted += 1;
-                }
-            }
+            soft_deleted += Self::apply_full_replace(entries, &present, now);
         }
 
         let linked = created + updated;
@@ -606,4 +645,21 @@ impl MockVault {
             "linked": linked,
         }))
     }
+}
+
+#[derive(serde::Deserialize)]
+struct MockBatchRecord {
+    target_address: String,
+    #[serde(default)]
+    cause: Option<String>,
+    #[serde(default)]
+    is_deleted: Option<bool>,
+    #[serde(default)]
+    created_at: Option<NaiveDateTime>,
+    #[serde(default)]
+    updated_at: Option<NaiveDateTime>,
+    #[serde(default)]
+    last_seen_at: Option<NaiveDateTime>,
+    #[serde(default)]
+    deleted_at: Option<NaiveDateTime>,
 }

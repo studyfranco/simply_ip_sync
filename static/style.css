@@ -50,6 +50,7 @@ body {
     font-family: var(--font-sans);
     line-height: 1.6;
     min-height: 100vh;
+    overflow-x: clip;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 }
@@ -105,7 +106,7 @@ body {
     width: 100vw;
     height: 100vh;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
     background-color: var(--bg-main);
     z-index: 10000;
@@ -119,6 +120,7 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 2.5rem 2rem;
+    margin: auto;
     width: 100%;
     max-width: 420px;
     box-shadow: var(--shadow-lg);
@@ -361,9 +363,14 @@ body {
 }
 
 .btn-cancel {
-    background-color: transparent;
+    background-color: var(--bg-surface);
     color: var(--text-muted);
     border-color: var(--border);
+}
+
+.btn-cancel:hover:not(:disabled) {
+    background-color: var(--border);
+    color: var(--text-main);
 }
 
 /* ─── Forms ─────────────────────────────────────────────── */
@@ -559,6 +566,8 @@ textarea.input-field {
 
 .data-table th {
     color: var(--text-muted);
+    background-color: var(--bg-surface);
+    border-bottom: 2px solid var(--border);
     font-size: 0.75rem;
     font-weight: 600;
     text-transform: uppercase;
@@ -581,6 +590,7 @@ textarea.input-field {
 .row-actions {
     white-space: nowrap;
     vertical-align: middle;
+    width: 1%;
 }
 
 .row-actions-group {
@@ -593,8 +603,11 @@ textarea.input-field {
 .scope-badges {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.4rem;
+    gap: 0.35rem;
+    row-gap: 0.45rem;
     align-items: center;
+    line-height: 1.5;
+    padding: 0.15rem 0;
 }
 
 .empty-state {
@@ -616,6 +629,7 @@ textarea.input-field {
     letter-spacing: 0.02em;
     text-transform: uppercase;
     line-height: 1.4;
+    white-space: nowrap;
 }
 
 /* RBAC tier chip (Master / Parent / Daughter, per RBAC_MODEL.md §1). Also used for the header
@@ -727,7 +741,7 @@ textarea.input-field {
 
 .toast-container {
     position: fixed;
-    top: 1.5rem;
+    top: 5.25rem;
     right: 1.5rem;
     z-index: 9999;
     display: flex;
@@ -1037,29 +1051,37 @@ textarea.input-field {
 }
 
 .modal-card-form {
-    max-width: clamp(600px, 56vw, 960px);
+    background-color: #383e45;
+    border-color: #565b63;
+    max-width: clamp(720px, 60vw, 1020px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
+}
+
+.modal-card-form .permissions-grid {
+    background-color: var(--bg-input);
+}
+
+.modal-card-form .btn-cancel {
+    background-color: #2b3036;
+    border-color: #565b63;
+}
+
+.modal-card-form .form-actions {
+    justify-content: flex-end;
 }
 
 #secret-reveal-modal .modal-card {
     max-width: clamp(580px, 48vw, 860px);
 }
 
-#create-key-modal .modal-card-form {
-    max-width: clamp(620px, 56vw, 960px);
+#secret-reveal-key-row,
+#secret-reveal-secret-row {
+    min-width: 0;
 }
 
-#group-form-slot form,
-#feed-form-slot form,
-#task-form-slot form,
-#vault-form-slot form {
-    background-color: #383e45;
-    border: 1px solid #565b63;
-    border-radius: var(--radius);
-    padding: 1.25rem;
-    margin-bottom: 1.25rem;
-    box-shadow: var(--shadow);
+#create-key-modal .modal-card-form {
+    max-width: clamp(720px, 60vw, 1020px);
 }
 
 .modal-header {
@@ -1084,6 +1106,15 @@ textarea.input-field {
 .btn-modal-close:hover {
     color: var(--text-main);
     background-color: rgba(255, 255, 255, 0.06);
+}
+
+input[type="datetime-local"] {
+    color-scheme: dark;
+}
+
+input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+    filter: invert(0.8);
+    cursor: pointer;
 }
 
 

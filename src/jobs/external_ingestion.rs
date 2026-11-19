@@ -4,6 +4,7 @@
 //! single batch sequence.
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -23,6 +24,11 @@ use crate::state::AppState;
 /// aggregates the results into one deduplicated set, sanitizes and pushes it to every configured
 /// target vault. Always writes one `sync_logs` row and updates `destination_groups.last_run_at`,
 /// regardless of outcome — "last execution" means the group ran, not that it ran successfully.
+///
+/// # Errors
+///
+/// Returns [`AppError::NotFound`] if the group no longer exists or [`AppError::DbError`] on
+/// database failures.
 pub async fn run(state: &AppState, group_id: Uuid) -> Result<JobSummary, AppError> {
     let started_at = Utc::now();
 
@@ -61,11 +67,91 @@ pub async fn run(state: &AppState, group_id: Uuid) -> Result<JobSummary, AppErro
     Ok(summary)
 }
 
+pub(crate) fn is_ssrf_blocked_ip(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+                || v4.octets()[0] == 0
+                || v4.octets()[..3] == [192, 0, 0]
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18)
+                || v4.octets()[0] >= 240
+        }
+        IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (segs[0] & 0xfe00) == 0xfc00
+                || (segs[0] & 0xffc0) == 0xfe80
+                || (segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0)
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+                || (segs[0] == 0x0064
+                    && segs[1] == 0xff9b
+                    && segs[2] == 0
+                    && segs[3] == 0
+                    && segs[4] == 0
+                    && segs[5] == 0)
+        }
+    }
+}
+
+pub(crate) async fn validate_feed_url(url_str: &str, allow_private: bool) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url_str).map_err(|e| format!("invalid source URL: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("blocked source URL: only http and https schemes are permitted".to_owned());
+    }
+    let Some(raw_host) = parsed.host_str() else {
+        return Err("blocked source URL: missing host".to_owned());
+    };
+    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return Err("blocked source URL: empty host".to_owned());
+    }
+    if allow_private {
+        return Ok(());
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_ssrf_blocked_ip(ip) {
+            return Err(format!(
+                "blocked source URL: target IP '{ip}' is in a restricted/private range"
+            ));
+        }
+        return Ok(());
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<IpAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("blocked source URL: DNS lookup failed for '{host}': {e}"))?
+        .map(|sock| sock.ip())
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!(
+            "blocked source URL: '{host}' resolved to no addresses"
+        ));
+    }
+    if let Some(blocked) = addrs.into_iter().find(|ip| is_ssrf_blocked_ip(*ip)) {
+        return Err(format!(
+            "blocked source URL: '{host}' resolved to restricted/private address '{blocked}'"
+        ));
+    }
+    Ok(())
+}
+
 /// Fetches `source_url` (with `parser_config_json`'s `headers`/`user_agent`, if any, applied —
 /// see [`FetchOptions`]) and runs it through the `parser_type` parser, returning the raw
 /// (non-deduplicated) extracted records. This is the entire "does this feed actually work"
 /// question — fetch, decompress, parse — with no push to any vault, which is exactly the subset
-/// [`execute`] (per child feed) and the WebUI's "Test Fetch" preview
+/// [`execute`] (per child feed) and the `WebUI`'s "Test Fetch" preview
 /// (`api::test_fetch_external_source`) both need; factored out once so there is exactly one
 /// implementation of the fetch/decompress/parse pipeline, not two that could quietly drift apart.
 ///
@@ -76,8 +162,10 @@ pub(crate) async fn fetch_and_parse(
     source_url: &str,
     parser_type: &str,
     parser_config_json: Option<&str>,
+    allow_private_urls: bool,
 ) -> Result<Vec<ParsedRecord>, String> {
     let source_url = source_url.trim();
+    validate_feed_url(source_url, allow_private_urls).await?;
     let fetch_options = FetchOptions::from_config(parser_config_json);
     let build_request = |http: &reqwest::Client| {
         let mut request = http.get(source_url);
@@ -152,6 +240,7 @@ async fn fetch_all_feeds_concurrently(
     state: &AppState,
     feeds: &[external_source::Model],
 ) -> Vec<FeedResult> {
+    let allow_private_urls = state.allow_private_ingest_urls;
     let handles: Vec<_> = feeds
         .iter()
         .map(|feed| {
@@ -166,6 +255,7 @@ async fn fetch_all_feeds_concurrently(
                     &source_url,
                     &parser_type,
                     parser_config_json.as_deref(),
+                    allow_private_urls,
                 )
                 .await;
                 FeedResult { feed_name, records }
@@ -207,31 +297,22 @@ fn apply_temporal_filter(
         .collect()
 }
 
-async fn execute(
-    state: &AppState,
-    group: &destination_group::Model,
+struct AggregatedFeeds {
+    addresses: Vec<String>,
+    feed_errors: Vec<String>,
+    bogons_removed: usize,
+}
+
+fn aggregate_feed_results(
+    feed_results: Vec<FeedResult>,
     feeds: &[external_source::Model],
-    targets: &[(
-        destination_group_vault_target::Model,
-        Option<vault_endpoint::Model>,
-    )],
-) -> JobSummary {
-    let start = std::time::Instant::now();
-
-    let feed_results = fetch_all_feeds_concurrently(state, feeds).await;
-
-    // Per feed, in order: apply that feed's own temporal filter (`max_age_days`), then that feed's
-    // own *effective* bogon policy (its own `skip_bogon_filtering` override if set, else the
-    // group's) — both **before** merging into the shared aggregated pool. Doing this per-feed
-    // rather than once on the merged set is what lets a feed explicitly marked
-    // "clean/private-capable" keep its private addresses even when a sibling feed in the same
-    // group is bogon-filtered, and vice versa; by the time records are merged, "which feed did
-    // this come from" would otherwise be lost. Exact deduplication only (a `HashSet<String>` on
-    // the normalized address) — never supernetting/aggregating adjacent CIDRs into a larger block.
+    default_skip_bogon: bool,
+) -> AggregatedFeeds {
     let mut seen = HashSet::new();
-    let mut aggregated: Vec<String> = Vec::new();
+    let mut addresses: Vec<String> = Vec::new();
     let mut feed_errors: Vec<String> = Vec::new();
     let mut bogons_removed = 0usize;
+
     for FeedResult { feed_name, records } in feed_results {
         match records {
             Ok(records) => {
@@ -239,22 +320,22 @@ async fn execute(
                 let max_age_days = feed.and_then(|f| f.max_age_days);
                 let skip_bogon_filtering = feed
                     .and_then(|f| f.skip_bogon_filtering)
-                    .unwrap_or(group.skip_bogon_filtering);
+                    .unwrap_or(default_skip_bogon);
 
                 let temporally_filtered = apply_temporal_filter(records, max_age_days);
-                let addresses: Vec<String> =
+                let raw_addresses: Vec<String> =
                     temporally_filtered.into_iter().map(|r| r.address).collect();
                 let sanitized = if skip_bogon_filtering {
-                    addresses
+                    raw_addresses
                 } else {
-                    let (kept, removed) = crate::bogon::sanitize(addresses);
+                    let (kept, removed) = crate::bogon::sanitize(raw_addresses);
                     bogons_removed += removed;
                     kept
                 };
 
                 for address in sanitized {
                     if seen.insert(address.clone()) {
-                        aggregated.push(address);
+                        addresses.push(address);
                     }
                 }
             }
@@ -262,25 +343,26 @@ async fn execute(
         }
     }
 
-    let feed_error_count = feed_errors.len();
-    let items_processed = aggregated.len();
-    let chunks = chunk_records(aggregated, MAX_BATCH_SIZE);
-    let mut chunks_sent = 0i32;
-    let mut errors: Vec<String> = feed_errors;
-    let mut any_success = targets.is_empty();
+    AggregatedFeeds {
+        addresses,
+        feed_errors,
+        bogons_removed,
+    }
+}
 
-    // `group.mode` is validated to be "upsert"/"full_replace" at the API boundary
-    // (api/sources.rs), so a value that fails to parse here can only mean the row predates that
-    // validation or was edited directly in the database — fail closed to the non-destructive
-    // choice rather than silently defaulting to full_replace's delete-anything-unmentioned
-    // behavior on a misread.
-    let base_mode = BatchMode::parse(&group.mode).unwrap_or_else(|| {
-        tracing::warn!(
-            "destination_groups.mode '{}' is not a recognised value; treating as upsert",
-            group.mode
-        );
-        BatchMode::Upsert
-    });
+async fn push_aggregated_chunks(
+    state: &AppState,
+    group: &destination_group::Model,
+    targets: &[(
+        destination_group_vault_target::Model,
+        Option<vault_endpoint::Model>,
+    )],
+    chunks: &[Vec<String>],
+    base_mode: BatchMode,
+) -> (i32, Vec<String>, bool) {
+    let mut chunks_sent = 0i32;
+    let mut errors = Vec::new();
+    let mut any_success = targets.is_empty();
 
     for (target, vault) in targets {
         let Some(vault) = vault else {
@@ -309,9 +391,6 @@ async fn execute(
                     deleted_at: None,
                 })
                 .collect();
-            // Only chunk 0 of *this target's* sequence may carry `full_replace` — see
-            // `jobs::mode_for_chunk_index`'s doc comment for why every later chunk must downgrade
-            // to `upsert` regardless of the group's configured mode.
             let chunk_mode = super::mode_for_chunk_index(base_mode, chunk_index);
             match client::post_batch(
                 &state.http,
@@ -336,27 +415,43 @@ async fn execute(
         }
     }
 
-    // Every configured feed failing to even fetch/parse is a hard failure regardless of how many
-    // targets are configured — `any_success` below defaults to `true` when there are zero targets
-    // (nothing to fail *at push time*), which must not be read as "the group's run succeeded" when
-    // nothing was actually fetched at all. A single-feed group whose one feed hits a decompression
-    // bomb or a parse error is exactly this case, and must report FAILED, not PARTIAL.
-    let all_feeds_failed = !feeds.is_empty() && feed_error_count == feeds.len();
+    (chunks_sent, errors, any_success)
+}
 
+async fn execute(
+    state: &AppState,
+    group: &destination_group::Model,
+    feeds: &[external_source::Model],
+    targets: &[(
+        destination_group_vault_target::Model,
+        Option<vault_endpoint::Model>,
+    )],
+) -> JobSummary {
+    let start = std::time::Instant::now();
+    let feed_results = fetch_all_feeds_concurrently(state, feeds).await;
+    let aggregated = aggregate_feed_results(feed_results, feeds, group.skip_bogon_filtering);
+
+    let feed_error_count = aggregated.feed_errors.len();
+    let items_processed = aggregated.addresses.len();
+    let chunks = chunk_records(aggregated.addresses, MAX_BATCH_SIZE);
+    let base_mode = BatchMode::parse(&group.mode).unwrap_or_else(|| {
+        tracing::warn!(
+            "destination_groups.mode '{}' is not a recognised value; treating as upsert",
+            group.mode
+        );
+        BatchMode::Upsert
+    });
+
+    let (chunks_sent, push_errors, any_success) =
+        push_aggregated_chunks(state, group, targets, &chunks, base_mode).await;
+    let mut errors = aggregated.feed_errors;
+    errors.extend(push_errors);
+
+    let all_feeds_failed = !feeds.is_empty() && feed_error_count == feeds.len();
     let status = if all_feeds_failed {
         "FAILED"
     } else if errors.is_empty() {
         if items_processed == 0 {
-            // A syntactically successful fetch and parse that yields *zero* records is not
-            // trustworthy the way "zero new records" is for a delta sync (jobs::vault_sync) — this
-            // pipeline fetches every feed's full current content on every run, not an incremental
-            // diff, so a real threat-intelligence set going from N entries to genuinely 0 between
-            // runs is itself an anomaly. It is also exactly what a captive portal, an
-            // authentication redirect a client silently follows, or a CDN/WAF error page served
-            // with `200 OK` and an HTML body looks like to `REGEX_LINE`: no parse *error* (HTML is
-            // valid UTF-8 text), just no IP-shaped tokens on any line. Flagging this as PARTIAL
-            // rather than SUCCESS keeps it visible in `sync_logs` for an operator to notice,
-            // without treating a fetch/parse that technically completed as a hard FAILED.
             "PARTIAL"
         } else {
             "SUCCESS"
@@ -366,10 +461,12 @@ async fn execute(
     } else {
         "FAILED"
     };
+
     let mut error_parts = Vec::new();
-    if bogons_removed > 0 {
+    if aggregated.bogons_removed > 0 {
         error_parts.push(format!(
-            "{bogons_removed} bogon/private/reserved address(es) sanitized before push"
+            "{} bogon/private/reserved address(es) sanitized before push",
+            aggregated.bogons_removed
         ));
     }
     if items_processed == 0 && errors.is_empty() {
@@ -380,18 +477,17 @@ async fn execute(
         );
     }
     error_parts.extend(errors);
-    let error_message = if error_parts.is_empty() {
-        None
-    } else {
-        Some(error_parts.join("; "))
-    };
 
     JobSummary {
         status,
-        items_processed: items_processed as i32,
+        items_processed: i32::try_from(items_processed).unwrap_or(i32::MAX),
         chunks_sent,
-        duration_ms: start.elapsed().as_millis() as i32,
-        error_message,
+        duration_ms: i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX),
+        error_message: if error_parts.is_empty() {
+            None
+        } else {
+            Some(error_parts.join("; "))
+        },
     }
 }
 
@@ -430,5 +526,43 @@ impl FetchOptions {
             user_agent,
             headers,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn validate_feed_url_blocks_private_loopback_cgnat_and_non_http() {
+        for blocked in [
+            "http://127.0.0.1/feed.txt",
+            "http://10.0.0.5/feed.txt",
+            "http://172.16.0.1/feed.txt",
+            "http://192.168.1.1/feed.txt",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.64.0.1/feed.txt",
+            "http://[::1]/feed.txt",
+            "http://[fc00::1]/feed.txt",
+            "http://[fe80::1]/feed.txt",
+            "http://[::ffff:127.0.0.1]/feed.txt",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validate_feed_url(blocked, false).await.is_err(),
+                "{blocked} must be blocked by SSRF guard"
+            );
+        }
+        assert!(
+            validate_feed_url("https://1.1.1.1/feed.txt", false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_feed_url("http://127.0.0.1/feed.txt", true)
+                .await
+                .is_ok()
+        );
+        assert!(validate_feed_url("file:///etc/passwd", true).await.is_err());
     }
 }

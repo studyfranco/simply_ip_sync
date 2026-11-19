@@ -3,7 +3,7 @@
 //! error/captive-portal page served with `200 OK`), transparent response decompression, slow/hung
 //! remote handling, and the concurrent-trigger guard.
 
-mod common;
+pub mod common;
 
 use std::io::Write;
 use std::time::Duration;
@@ -263,10 +263,10 @@ async fn mixed_notation_duplicate_addresses_canonicalize_and_dedupe_to_one_recor
 /// wiping out chunk 1's just-delivered records before chunk 3 even lands.
 #[tokio::test]
 async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_replace() {
+    let total_records: u32 = 12_000;
     let (conn, state, _master) = common::setup().await;
 
-    const TOTAL_RECORDS: u32 = 12_000;
-    let feed_body: String = (0..TOTAL_RECORDS)
+    let feed_body: String = (0..total_records)
         .map(synth_ip)
         .collect::<Vec<_>>()
         .join("\n");
@@ -300,7 +300,8 @@ async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_repl
         .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
     assert_eq!(
-        summary.items_processed, TOTAL_RECORDS as i32,
+        summary.items_processed,
+        total_records.cast_signed(),
         "every record from the feed must be processed, none dropped mid-chunking"
     );
     assert_eq!(
@@ -322,7 +323,8 @@ async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_repl
         modes.push(body["mode"].as_str().expect("mode field").to_owned());
     }
     assert_eq!(
-        total_delivered, TOTAL_RECORDS as usize,
+        total_delivered,
+        usize::try_from(total_records).expect("fits usize"),
         "all 12,000 records must land on the target, none lost across chunks"
     );
     assert_eq!(
@@ -349,12 +351,11 @@ async fn full_replace_source_only_marks_the_first_of_several_chunks_as_full_repl
 /// the previous run's outcome, so "the next scheduled run performs a complete re-sync" — the
 /// safety property Task 2 asks for — already holds structurally here. `last_run_at` is still
 /// recorded unconditionally, since it only ever means "the job executed", not "the job succeeded".
-#[tokio::test]
-async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_partial() {
-    let (conn, state, _master) = common::setup().await;
-
-    const TOTAL_RECORDS: u32 = 12_000;
-    let feed_body: String = (0..TOTAL_RECORDS)
+async fn setup_mid_run_feed_and_targets(
+    conn: &sea_orm::DatabaseConnection,
+) -> (Uuid, MockServer, MockServer, MockServer) {
+    let total_records: u32 = 12_000;
+    let feed_body: String = (0..total_records)
         .map(synth_ip)
         .collect::<Vec<_>>()
         .join("\n");
@@ -381,12 +382,8 @@ async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_par
         .respond_with(move |_req: &wiremock::Request| {
             let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
-                // Chunk 1: succeeds, carrying full_replace — the target's authoritative content
-                // has now legitimately been cleared-and-set to chunk 1's records.
                 ResponseTemplate::new(200).set_body_json(batch_response())
             } else {
-                // Chunk 2: a fatal server error. If chunk 3 were ever sent it would land here too
-                // — the request-count assertion below proves it was never attempted at all.
                 ResponseTemplate::new(500)
             }
         })
@@ -394,16 +391,25 @@ async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_par
         .await;
 
     let source_id = insert_source_with_mode(
-        &conn,
+        conn,
         &format!("{}/feed.txt", feed_mock.uri()),
         "group",
         "full_replace",
     )
     .await;
-    let good_vault_id = insert_vault(&conn, "good-target", &good_target_mock.uri()).await;
-    let bad_vault_id = insert_vault(&conn, "bad-target", &bad_target_mock.uri()).await;
-    insert_target(&conn, source_id, good_vault_id, None).await;
-    insert_target(&conn, source_id, bad_vault_id, None).await;
+    let good_vault_id = insert_vault(conn, "good-target", &good_target_mock.uri()).await;
+    let bad_vault_id = insert_vault(conn, "bad-target", &bad_target_mock.uri()).await;
+    insert_target(conn, source_id, good_vault_id, None).await;
+    insert_target(conn, source_id, bad_vault_id, None).await;
+
+    (source_id, feed_mock, good_target_mock, bad_target_mock)
+}
+
+#[tokio::test]
+async fn full_replace_mid_run_chunk_failure_stops_further_chunks_and_reports_partial() {
+    let (conn, state, _master) = common::setup().await;
+    let (source_id, _feed_mock, good_target_mock, bad_target_mock) =
+        setup_mid_run_feed_and_targets(&conn).await;
 
     let summary = simply_ip_sync::jobs::external_ingestion::run(&state, source_id)
         .await
@@ -627,8 +633,12 @@ async fn gzip_compressed_feed_response_is_transparently_decompressed() {
 async fn oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buffering_it_fully() {
     let (conn, state, _master) = common::setup().await;
 
-    let oversized =
-        vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES as usize + 1024];
+    let oversized = vec![
+        b'a';
+        usize::try_from(simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("fits usize")
+            + 1024
+    ];
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder
         .write_all(&oversized)
@@ -684,8 +694,12 @@ async fn oversized_gzip_response_is_rejected_as_a_decompression_bomb_without_buf
 async fn oversized_zip_member_is_rejected_as_a_decompression_bomb() {
     let (conn, state, _master) = common::setup().await;
 
-    let oversized =
-        vec![b'a'; simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES as usize + 1024];
+    let oversized = vec![
+        b'a';
+        usize::try_from(simply_ip_sync::config::DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("fits usize")
+            + 1024
+    ];
     let mut zip_buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut zip_buf);
@@ -884,16 +898,70 @@ fn job_guard_refuses_concurrent_claims_on_the_same_id_and_releases_on_drop() {
     );
 }
 
-/// Phase 1.4 Verification: End-to-end AbuseIPDB v2 JSON ingestion with authenticated custom
+/// Phase 1.4 Verification: End-to-end `AbuseIPDB` v2 JSON ingestion with authenticated custom
 /// headers (`Key`, `Accept: application/json`), `JSON_PATH` extraction (`array_path: "data"`,
 /// `target_address: "$.ipAddress"`, `last_seen_at: "$.lastReportedAt"`), bogon filtering, URL
 /// whitespace trimming, and batch push to `simply_ip_vault`.
+async fn seed_abuseipdb_group_and_feed(
+    conn: &sea_orm::DatabaseConnection,
+    feed_uri: &str,
+    vault_uri: &str,
+) -> Uuid {
+    let group_id = Uuid::new_v4();
+    let now = Utc::now();
+    let group = destination_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("AbuseIPDB Feed Group".to_owned()),
+        target_group_name: Set("abuseipdb".to_owned()),
+        cron_schedule: Set("0 */6 * * *".to_owned()),
+        mode: Set("full_replace".to_owned()),
+        is_active: Set(true),
+        skip_bogon_filtering: Set(false),
+        last_run_at: Set(None),
+        owner_key_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    group.insert(conn).await.expect("insert destination group");
+
+    let parser_cfg = serde_json::json!({
+        "array_path": "data",
+        "target_address": "$.ipAddress",
+        "last_seen_at": "$.lastReportedAt",
+        "headers": {
+            "Key": "abuseipdb-secret-token-xyz",
+            "Accept": "application/json"
+        }
+    })
+    .to_string();
+
+    // Intentionally include leading/trailing whitespace in source_url to verify trimming
+    let feed = external_source::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        destination_group_id: Set(group_id),
+        name: Set("AbuseIPDB v2 Blacklist".to_owned()),
+        source_url: Set(format!(
+            " \t{feed_uri}/api/v2/blacklist?confidenceMinimum=90 "
+        )),
+        parser_type: Set("JSON_PATH".to_owned()),
+        parser_config_json: Set(Some(parser_cfg)),
+        max_age_days: Set(None),
+        skip_bogon_filtering: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    feed.insert(conn).await.expect("insert AbuseIPDB feed");
+
+    let vault_id = insert_vault(conn, "MainVault", vault_uri).await;
+    insert_target(conn, group_id, vault_id, None).await;
+    group_id
+}
+
 #[tokio::test]
 async fn abuseipdb_v2_json_feed_with_authenticated_headers_ingests_and_pushes_to_vault() {
     use wiremock::matchers::header;
 
     let (conn, state, _master) = common::setup().await;
-
     let abuseipdb_payload = serde_json::json!({
         "meta": {
             "generatedAt": "2026-11-08T01:00:00+00:00"
@@ -936,55 +1004,7 @@ async fn abuseipdb_v2_json_feed_with_authenticated_headers_ingests_and_pushes_to
         .mount(&vault_mock)
         .await;
 
-    let group_id = Uuid::new_v4();
-    let now = Utc::now();
-    let group = destination_group::ActiveModel {
-        id: Set(group_id),
-        name: Set("AbuseIPDB Feed Group".to_owned()),
-        target_group_name: Set("abuseipdb".to_owned()),
-        cron_schedule: Set("0 */6 * * *".to_owned()),
-        mode: Set("full_replace".to_owned()),
-        is_active: Set(true),
-        skip_bogon_filtering: Set(false),
-        last_run_at: Set(None),
-        owner_key_id: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
-    };
-    group.insert(&conn).await.expect("insert destination group");
-
-    let feed_id = Uuid::new_v4();
-    let parser_cfg = serde_json::json!({
-        "array_path": "data",
-        "target_address": "$.ipAddress",
-        "last_seen_at": "$.lastReportedAt",
-        "headers": {
-            "Key": "abuseipdb-secret-token-xyz",
-            "Accept": "application/json"
-        }
-    })
-    .to_string();
-
-    // Intentionally include leading/trailing whitespace in source_url to verify trimming
-    let feed = external_source::ActiveModel {
-        id: Set(feed_id),
-        destination_group_id: Set(group_id),
-        name: Set("AbuseIPDB v2 Blacklist".to_owned()),
-        source_url: Set(format!(
-            " \t{}/api/v2/blacklist?confidenceMinimum=90 ",
-            feed_mock.uri()
-        )),
-        parser_type: Set("JSON_PATH".to_owned()),
-        parser_config_json: Set(Some(parser_cfg)),
-        max_age_days: Set(None),
-        skip_bogon_filtering: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
-    };
-    feed.insert(&conn).await.expect("insert AbuseIPDB feed");
-
-    let vault_id = insert_vault(&conn, "MainVault", &vault_mock.uri()).await;
-    insert_target(&conn, group_id, vault_id, None).await;
+    let group_id = seed_abuseipdb_group_and_feed(&conn, &feed_mock.uri(), &vault_mock.uri()).await;
 
     let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id)
         .await

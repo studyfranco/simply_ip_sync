@@ -56,7 +56,13 @@ const BOGON_LITERALS: &[&str] = &[
 fn parse_literals(literals: &[&str]) -> Vec<IpNet> {
     literals
         .iter()
-        .map(|s| s.parse().expect("static bogon literal is a valid CIDR"))
+        .filter_map(|s| match s.parse::<IpNet>() {
+            Ok(net) => Some(net),
+            Err(err) => {
+                tracing::error!(literal = s, error = %err, "invalid static bogon CIDR literal");
+                None
+            }
+        })
         .collect()
 }
 
@@ -78,6 +84,7 @@ fn overlaps(a: &IpNet, b: &IpNet) -> bool {
 
 /// Returns `true` if `candidate` overlaps any reserved (loopback/private/bogon) range at all —
 /// the address or CIDR is not safe to hand to a target vault as a real, bannable entry.
+#[must_use]
 pub fn is_bogon(candidate: &IpNet) -> bool {
     RESERVED_RANGES
         .iter()
@@ -96,6 +103,7 @@ fn parse_ip_or_net(s: &str) -> Option<IpNet> {
 /// either) is dropped and counted. `records` are expected already-normalized (see
 /// `parsers::normalize_ip_or_cidr`), so the parse here is just re-establishing the typed
 /// `IpNet` needed for the overlap check, not re-validating shape.
+#[must_use]
 pub fn sanitize(records: Vec<String>) -> (Vec<String>, usize) {
     let mut kept = Vec::with_capacity(records.len());
     let mut removed = 0usize;

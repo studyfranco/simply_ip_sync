@@ -2,7 +2,7 @@
 //!
 //! `master_marker` is deliberately **not** a field on this `Model`. The column exists in the
 //! database as `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` under a unique
-//! index (see `migration::m20260101_013241_derive_master_marker`); SeaORM builds explicit column
+//! index (see `migration::m20260101_013241_derive_master_marker`); `SeaORM` builds explicit column
 //! lists from the entity, so omitting the field is what guarantees no query ever names it, and
 //! every supported engine rejects a write to a generated column. Do not add it back.
 
@@ -11,6 +11,10 @@ use sea_orm::entity::prelude::*;
 /// The `api_keys` row.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "api_keys")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "SeaORM DeriveEntityModel requires flat 1:1 fields for SQL BOOLEAN columns"
+)]
 pub struct Model {
     /// Primary key.
     #[sea_orm(primary_key, auto_increment = false)]

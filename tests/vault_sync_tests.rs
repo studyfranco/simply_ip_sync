@@ -1,7 +1,7 @@
 //! Inter-vault delta replication: tombstone propagation and `last_sync_at` advancing only on
 //! full success across every configured target.
 
-mod common;
+pub mod common;
 
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
@@ -13,7 +13,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn insert_vault(conn: &sea_orm::DatabaseConnection, name: &str, target_url: &str) -> Uuid {
     let id = Uuid::new_v4();
     let now = Utc::now();
-    let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext.seal("shared-secret").unwrap();
+    let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext
+        .seal("shared-secret")
+        .unwrap();
     let model = vault_endpoint::ActiveModel {
         id: Set(id),
         name: Set(name.to_owned()),
@@ -147,29 +149,67 @@ async fn multi_vault_sync_pushes_to_every_target_on_success() {
     let target2_id = insert_vault(&conn, "target2", &target2_mock.uri()).await;
     let task_id = insert_task_multi(&conn, source_id, &[target1_id, target2_id]).await;
 
-    let before = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
+    let before = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(before.last_sync_at.is_none());
     let job_start = Utc::now();
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
-    assert_eq!(summary.chunks_sent, 2, "one chunk must be sent to each of the two targets");
+    assert_eq!(
+        summary.chunks_sent, 2,
+        "one chunk must be sent to each of the two targets"
+    );
 
-    let target1_received = target1_mock.received_requests().await.expect("recording enabled");
-    let target2_received = target2_mock.received_requests().await.expect("recording enabled");
-    assert_eq!(target1_received.len(), 1, "target 1 must receive exactly one batch");
-    assert_eq!(target2_received.len(), 1, "target 2 must receive exactly one batch");
+    let target1_received = target1_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    let target2_received = target2_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(
+        target1_received.len(),
+        1,
+        "target 1 must receive exactly one batch"
+    );
+    assert_eq!(
+        target2_received.len(),
+        1,
+        "target 2 must receive exactly one batch"
+    );
 
     for received in [&target1_received[0], &target2_received[0]] {
-        let signature = received.headers.get("X-Signature-256").expect("signature header present");
-        assert!(signature.to_str().expect("utf8").starts_with("sha256="), "must carry a CANONICAL_V1 signature");
+        let signature = received
+            .headers
+            .get("X-Signature-256")
+            .expect("signature header present");
+        assert!(
+            signature.to_str().expect("utf8").starts_with("sha256="),
+            "must carry a CANONICAL_V1 signature"
+        );
         let body: serde_json::Value = serde_json::from_slice(&received.body).expect("json body");
         assert_eq!(body["group_name"], serde_json::json!("target-group"));
     }
 
-    let after = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    let last_sync_at = after.last_sync_at.expect("last_sync_at must advance once every target succeeds");
-    assert!(last_sync_at >= job_start, "last_sync_at must be set to (at least) the job's own start time");
+    let after = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let last_sync_at = after
+        .last_sync_at
+        .expect("last_sync_at must advance once every target succeeds");
+    assert!(
+        last_sync_at >= job_start,
+        "last_sync_at must be set to (at least) the job's own start time"
+    );
 }
 
 /// Task 1: a delta containing a mix of real and bogon (loopback/private/reserved) addresses must
@@ -244,22 +284,44 @@ async fn pre_push_bogon_filtering_strips_reserved_addresses_unless_the_task_opts
     .await
     .expect("insert task target");
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
-    assert_eq!(summary.items_processed, 1, "only the one real, non-bogon address must survive the pre-push filter");
-    let message = summary.error_message.expect("the sanitized count must be reported");
-    assert!(message.contains('2'), "must report exactly 2 addresses sanitized, got: {message}");
+    assert_eq!(
+        summary.items_processed, 1,
+        "only the one real, non-bogon address must survive the pre-push filter"
+    );
+    let message = summary
+        .error_message
+        .expect("the sanitized count must be reported");
+    assert!(
+        message.contains('2'),
+        "must report exactly 2 addresses sanitized, got: {message}"
+    );
 
-    let received = target_mock.received_requests().await.expect("recording enabled");
+    let received = target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
     assert_eq!(received.len(), 1);
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
     let addresses: Vec<String> = body["records"]
         .as_array()
         .expect("records array")
         .iter()
-        .map(|r| r["target_address"].as_str().expect("target_address").to_owned())
+        .map(|r| {
+            r["target_address"]
+                .as_str()
+                .expect("target_address")
+                .to_owned()
+        })
         .collect();
-    assert_eq!(addresses, vec!["8.8.8.8".to_owned()], "the loopback and private addresses must never reach the target");
+    assert_eq!(
+        addresses,
+        vec!["8.8.8.8".to_owned()],
+        "the loopback and private addresses must never reach the target"
+    );
 }
 
 /// Partial failure across multiple targets: one target accepting the batch while another fails
@@ -299,23 +361,48 @@ async fn multi_vault_sync_reports_partial_and_withholds_last_sync_at_when_one_ta
     let failing_id = insert_vault(&conn, "failing-target", &failing_target_mock.uri()).await;
     let task_id = insert_task_multi(&conn, source_id, &[healthy_id, failing_id]).await;
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
-    assert_eq!(summary.status, "PARTIAL", "one success + one failure must report PARTIAL, not SUCCESS or FAILED");
-    assert!(summary.error_message.is_some(), "the failing target's error must be captured");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
+    assert_eq!(
+        summary.status, "PARTIAL",
+        "one success + one failure must report PARTIAL, not SUCCESS or FAILED"
+    );
+    assert!(
+        summary.error_message.is_some(),
+        "the failing target's error must be captured"
+    );
 
     // Persisted to sync_logs, not just returned in the trigger response.
-    let logs = simply_ip_sync::entities::sync_log::Entity::find().all(&conn).await.expect("query logs");
+    let logs = simply_ip_sync::entities::sync_log::Entity::find()
+        .all(&conn)
+        .await
+        .expect("query logs");
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].status, "PARTIAL");
     assert_eq!(logs[0].job_id, task_id);
 
-    let after = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    assert!(after.last_sync_at.is_none(), "a partial delivery must not advance the high-water mark either");
+    let after = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        after.last_sync_at.is_none(),
+        "a partial delivery must not advance the high-water mark either"
+    );
 
     // The healthy target still received its batch even though its sibling failed — a partial
     // failure on one target must not prevent delivery to the others.
-    let healthy_received = healthy_target_mock.received_requests().await.expect("recording enabled");
-    assert_eq!(healthy_received.len(), 1, "the healthy target must still have received its batch");
+    let healthy_received = healthy_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(
+        healthy_received.len(),
+        1,
+        "the healthy target must still have received its batch"
+    );
 }
 
 #[tokio::test]
@@ -363,23 +450,39 @@ async fn tombstones_propagate_and_last_sync_at_advances_on_success() {
     let target_id = insert_vault(&conn, "target", &target_mock.uri()).await;
     let task_id = insert_task(&conn, source_id, target_id).await;
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
     assert_eq!(summary.items_processed, 2);
     assert_eq!(summary.chunks_sent, 1);
 
     // The pushed batch must carry the tombstone through: is_deleted / deleted_at preserved.
-    let received = target_mock.received_requests().await.expect("recording enabled");
+    let received = target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
     assert_eq!(received.len(), 1);
-    let sent_body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    let sent_body: serde_json::Value =
+        serde_json::from_slice(&received[0].body).expect("json body");
     let records = sent_body["records"].as_array().expect("records array");
     assert_eq!(records.len(), 2);
-    let tombstone = records.iter().find(|r| r["target_address"] == "198.51.100.2").expect("tombstone present");
+    let tombstone = records
+        .iter()
+        .find(|r| r["target_address"] == "198.51.100.2")
+        .expect("tombstone present");
     assert_eq!(tombstone["is_deleted"], serde_json::json!(true));
-    assert!(tombstone["deleted_at"].is_string(), "deleted_at must survive replication");
+    assert!(
+        tombstone["deleted_at"].is_string(),
+        "deleted_at must survive replication"
+    );
 
     // last_sync_at only advances once every target has succeeded.
-    let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
+    let updated_task = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(updated_task.last_sync_at.is_some());
 }
 
@@ -392,15 +495,17 @@ async fn last_sync_at_does_not_advance_when_a_target_fails() {
 
     Mock::given(method("GET"))
         .and(path("/api/ips"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-            "id": Uuid::new_v4(),
-            "target_address": "198.51.100.1",
-            "group_name": "source-group",
-            "is_deleted": false,
-            "created_at": "2026-01-01T00:00:00",
-            "updated_at": "2026-01-01T00:00:00",
-            "last_seen_at": "2026-01-01T00:00:00"
-        }])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": Uuid::new_v4(),
+                "target_address": "198.51.100.1",
+                "group_name": "source-group",
+                "is_deleted": false,
+                "created_at": "2026-01-01T00:00:00",
+                "updated_at": "2026-01-01T00:00:00",
+                "last_seen_at": "2026-01-01T00:00:00"
+            }])),
+        )
         .mount(&source_mock)
         .await;
 
@@ -414,11 +519,20 @@ async fn last_sync_at_does_not_advance_when_a_target_fails() {
     let target_id = insert_vault(&conn, "target", &target_mock.uri()).await;
     let task_id = insert_task(&conn, source_id, target_id).await;
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "FAILED");
 
-    let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    assert!(updated_task.last_sync_at.is_none(), "a failed delivery must not advance the high-water mark");
+    let updated_task = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        updated_task.last_sync_at.is_none(),
+        "a failed delivery must not advance the high-water mark"
+    );
 }
 
 /// A task-target with an explicit `target_group_name` override (`vault_sync_task_targets`, per
@@ -449,7 +563,8 @@ async fn per_target_group_name_override_is_honored_independently_of_the_default(
 
     let source_id = insert_vault(&conn, "source", &source_mock.uri()).await;
     let default_target_id = insert_vault(&conn, "default-target", &default_target_mock.uri()).await;
-    let override_target_id = insert_vault(&conn, "override-target", &override_target_mock.uri()).await;
+    let override_target_id =
+        insert_vault(&conn, "override-target", &override_target_mock.uri()).await;
 
     let task_id = Uuid::new_v4();
     let now = Utc::now();
@@ -486,15 +601,29 @@ async fn per_target_group_name_override_is_honored_independently_of_the_default(
     .await
     .expect("insert override target");
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
 
-    let default_received = default_target_mock.received_requests().await.expect("recording enabled");
-    let default_body: serde_json::Value = serde_json::from_slice(&default_received[0].body).expect("json");
-    assert_eq!(default_body["group_name"], serde_json::json!("DEFAULT_GROUP"), "no override falls back to the task's default target_group_name");
+    let default_received = default_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    let default_body: serde_json::Value =
+        serde_json::from_slice(&default_received[0].body).expect("json");
+    assert_eq!(
+        default_body["group_name"],
+        serde_json::json!("DEFAULT_GROUP"),
+        "no override falls back to the task's default target_group_name"
+    );
 
-    let override_received = override_target_mock.received_requests().await.expect("recording enabled");
-    let override_body: serde_json::Value = serde_json::from_slice(&override_received[0].body).expect("json");
+    let override_received = override_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    let override_body: serde_json::Value =
+        serde_json::from_slice(&override_received[0].body).expect("json");
     assert_eq!(
         override_body["group_name"],
         serde_json::json!("OVERRIDDEN_GROUP"),
@@ -546,7 +675,9 @@ async fn slow_target_vault_is_aborted_and_last_sync_at_is_withheld() {
     let task_id = insert_task(&conn, source_id, target_id).await;
 
     let start = std::time::Instant::now();
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job completes rather than hanging");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job completes rather than hanging");
     let elapsed = start.elapsed();
 
     assert_eq!(summary.status, "FAILED");
@@ -555,8 +686,15 @@ async fn slow_target_vault_is_aborted_and_last_sync_at_is_withheld() {
         "the job must abort on the client's own timeout, not wait out the mock's 5s delay; took {elapsed:?}"
     );
 
-    let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    assert!(updated_task.last_sync_at.is_none(), "a timed-out delivery must not advance the high-water mark");
+    let updated_task = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        updated_task.last_sync_at.is_none(),
+        "a timed-out delivery must not advance the high-water mark"
+    );
 }
 
 /// Synthesizes a deterministic, valid IPv4 address for delta-record index `i`, staying within
@@ -573,9 +711,8 @@ fn synth_ip(i: u32) -> String {
 /// just a round multiple.
 #[tokio::test]
 async fn source_vault_delta_spanning_multiple_pages_is_fetched_completely() {
+    let total_records: u32 = 15_001;
     let (conn, state, _master) = common::setup().await;
-
-    const TOTAL_RECORDS: u32 = 15_001;
 
     let source_mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -593,7 +730,7 @@ async fn source_vault_delta_spanning_multiple_pages_is_fetched_completely() {
                 .find(|(k, _)| k == "limit")
                 .and_then(|(_, v)| v.parse().ok())
                 .unwrap_or(5000);
-            let page_len = limit.min(TOTAL_RECORDS.saturating_sub(offset));
+            let page_len = limit.min(total_records.saturating_sub(offset));
             let page: Vec<serde_json::Value> = (0..page_len)
                 .map(|i| {
                     let idx = offset + i;
@@ -626,20 +763,40 @@ async fn source_vault_delta_spanning_multiple_pages_is_fetched_completely() {
     let target_id = insert_vault(&conn, "target", &target_mock.uri()).await;
     let task_id = insert_task(&conn, source_id, target_id).await;
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
 
     assert_eq!(summary.status, "SUCCESS");
     assert_eq!(
-        summary.items_processed, TOTAL_RECORDS as i32,
+        summary.items_processed,
+        total_records.cast_signed(),
         "every record across every page must be fetched, not just the first page"
     );
-    assert_eq!(summary.chunks_sent, 4, "15,001 records at a 5,000-record push chunk size means 4 batch requests");
+    assert_eq!(
+        summary.chunks_sent, 4,
+        "15,001 records at a 5,000-record push chunk size means 4 batch requests"
+    );
 
-    let source_requests = source_mock.received_requests().await.expect("recording enabled");
-    assert_eq!(source_requests.len(), 4, "4 pages of 5000+5000+5000+1 means exactly 4 GET /api/ips calls");
+    let source_requests = source_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(
+        source_requests.len(),
+        4,
+        "4 pages of 5000+5000+5000+1 means exactly 4 GET /api/ips calls"
+    );
 
-    let target_requests = target_mock.received_requests().await.expect("recording enabled");
-    assert_eq!(target_requests.len(), 4, "the fetched delta must be pushed in the same 4 chunks it was assembled from");
+    let target_requests = target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(
+        target_requests.len(),
+        4,
+        "the fetched delta must be pushed in the same 4 chunks it was assembled from"
+    );
     let total_pushed: usize = target_requests
         .iter()
         .map(|req| {
@@ -647,27 +804,23 @@ async fn source_vault_delta_spanning_multiple_pages_is_fetched_completely() {
             body["records"].as_array().expect("records array").len()
         })
         .sum();
-    assert_eq!(total_pushed, TOTAL_RECORDS as usize, "the full paginated delta, not just one page, must reach the target");
+    assert_eq!(
+        total_pushed, total_records as usize,
+        "the full paginated delta, not just one page, must reach the target"
+    );
 
-    let updated_task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    assert!(updated_task.last_sync_at.is_some(), "a fully successful multi-page sync must still advance last_sync_at");
+    let updated_task = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        updated_task.last_sync_at.is_some(),
+        "a fully successful multi-page sync must still advance last_sync_at"
+    );
 }
 
-/// Task 2: a failure on chunk 2 of a target's own 3-chunk push sequence — *after* chunk 1 already
-/// landed — must stop that target's sequence immediately (chunk 3 is never attempted), the overall
-/// job must report `PARTIAL` (one target, `good_target`, fully succeeds; the other,
-/// `bad_target`, partially fails), and `last_sync_at` must remain withheld so the next scheduled
-/// run re-fetches and re-pushes the *entire* delta rather than skipping what `bad_target` already
-/// (partially) received. `vault_sync_tasks` only ever pushes in `upsert` mode (see
-/// `AGENT.MD` §3.B and `SCHEMA.MD`'s `vault_sync_tasks.mode` column) — a `full_replace` variant of
-/// this exact scenario lives in `tests/external_ingestion_tests.rs`, the pipeline that actually
-/// supports that mode.
-#[tokio::test]
-async fn mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at() {
-    let (conn, state, _master) = common::setup().await;
-
-    const TOTAL_RECORDS: u32 = 12_000;
-
+async fn mock_paged_vault_source(total_records: u32) -> MockServer {
     let source_mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/ips"))
@@ -684,7 +837,7 @@ async fn mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at()
                 .find(|(k, _)| k == "limit")
                 .and_then(|(_, v)| v.parse().ok())
                 .unwrap_or(5000);
-            let page_len = limit.min(TOTAL_RECORDS.saturating_sub(offset));
+            let page_len = limit.min(total_records.saturating_sub(offset));
             let page: Vec<serde_json::Value> = (0..page_len)
                 .map(|i| {
                     let idx = offset + i;
@@ -703,7 +856,22 @@ async fn mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at()
         })
         .mount(&source_mock)
         .await;
+    source_mock
+}
 
+/// Task 2: a failure on chunk 2 of a target's own 3-chunk push sequence — *after* chunk 1 already
+/// landed — must stop that target's sequence immediately (chunk 3 is never attempted), the overall
+/// job must report `PARTIAL` (one target, `good_target`, fully succeeds; the other,
+/// `bad_target`, partially fails), and `last_sync_at` must remain withheld so the next scheduled
+/// run re-fetches and re-pushes the *entire* delta rather than skipping what `bad_target` already
+/// (partially) received. `vault_sync_tasks` only ever pushes in `upsert` mode (see
+/// `AGENT.MD` §3.B and `SCHEMA.MD`'s `vault_sync_tasks.mode` column) — a `full_replace` variant of
+/// this exact scenario lives in `tests/external_ingestion_tests.rs`, the pipeline that actually
+/// supports that mode.
+#[tokio::test]
+async fn mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at() {
+    let (conn, state, _master) = common::setup().await;
+    let source_mock = mock_paged_vault_source(12_000).await;
     let good_target_mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/records/batch"))
@@ -740,7 +908,9 @@ async fn mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at()
     let bad_target_id = insert_vault(&conn, "bad-target", &bad_target_mock.uri()).await;
     let task_id = insert_task_multi(&conn, source_id, &[good_target_id, bad_target_id]).await;
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
 
     assert_eq!(
         summary.status, "PARTIAL",
@@ -751,16 +921,31 @@ async fn mid_run_chunk_failure_stops_further_chunks_and_withholds_last_sync_at()
         "good_target's 3 successful chunks + bad_target's 1 successful chunk (before it failed on chunk 2) = 4"
     );
 
-    let good_requests = good_target_mock.received_requests().await.expect("recording enabled");
-    assert_eq!(good_requests.len(), 3, "good_target must still receive its full 3-chunk sequence regardless of bad_target's failure");
-
-    let bad_requests = bad_target_mock.received_requests().await.expect("recording enabled");
+    let good_requests = good_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
     assert_eq!(
-        bad_requests.len(), 2,
+        good_requests.len(),
+        3,
+        "good_target must still receive its full 3-chunk sequence regardless of bad_target's failure"
+    );
+
+    let bad_requests = bad_target_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(
+        bad_requests.len(),
+        2,
         "bad_target must receive exactly chunk 1 (succeeded) + chunk 2 (failed) — chunk 3 must never be attempted once chunk 2 failed"
     );
 
-    let task = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.expect("query").expect("task exists");
+    let task = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .expect("query")
+        .expect("task exists");
     assert!(
         task.last_sync_at.is_none(),
         "last_sync_at must remain withheld after a mid-run failure, so the next scheduled run re-fetches and \
@@ -818,32 +1003,69 @@ const DELETED_LAST: u32 = 200;
 /// `since = last_sync_at`, so the untouched bulk of the dataset has to sit clearly *outside* that
 /// window for "only the changed records come back" to mean anything. Seeded at "now", every record
 /// would land on the boundary and the differential assertion would pass for the wrong reason.
-async fn build_two_vault_fixture() -> (common::MockVault, common::MockVault, chrono::DateTime<Utc>) {
+async fn build_two_vault_fixture() -> (common::MockVault, common::MockVault, chrono::DateTime<Utc>)
+{
     let vault_a = common::MockVault::start().await;
     let vault_b = common::MockVault::start().await;
     let seeded_at = Utc::now() - chrono::Duration::hours(1);
 
     // Vault A: 1,000 records in each of two groups.
-    vault_a.seed("group_alpha", block_range(ALPHA_BLOCK, A_FIRST, A_LAST), seeded_at);
-    vault_a.seed("group_beta", block_range(BETA_BLOCK, A_FIRST, A_LAST), seeded_at);
+    vault_a.seed(
+        "group_alpha",
+        block_range(ALPHA_BLOCK, A_FIRST, A_LAST),
+        seeded_at,
+    );
+    vault_a.seed(
+        "group_beta",
+        block_range(BETA_BLOCK, A_FIRST, A_LAST),
+        seeded_at,
+    );
 
     // Vault B: 1,000 records in each group — half overlapping A, half unique to B.
     for (group, block) in [("group_alpha", ALPHA_BLOCK), ("group_beta", BETA_BLOCK)] {
-        vault_b.seed(group, block_range(block, OVERLAP_FIRST, OVERLAP_LAST), seeded_at);
-        vault_b.seed(group, block_range(block, B_UNIQUE_FIRST, B_UNIQUE_LAST), seeded_at);
+        vault_b.seed(
+            group,
+            block_range(block, OVERLAP_FIRST, OVERLAP_LAST),
+            seeded_at,
+        );
+        vault_b.seed(
+            group,
+            block_range(block, B_UNIQUE_FIRST, B_UNIQUE_LAST),
+            seeded_at,
+        );
     }
 
-    assert_eq!(vault_a.record_count("group_alpha"), 1_000, "fixture: Vault A group_alpha");
-    assert_eq!(vault_a.record_count("group_beta"), 1_000, "fixture: Vault A group_beta");
-    assert_eq!(vault_b.record_count("group_alpha"), 1_000, "fixture: Vault B group_alpha");
-    assert_eq!(vault_b.record_count("group_beta"), 1_000, "fixture: Vault B group_beta");
+    assert_eq!(
+        vault_a.record_count("group_alpha"),
+        1_000,
+        "fixture: Vault A group_alpha"
+    );
+    assert_eq!(
+        vault_a.record_count("group_beta"),
+        1_000,
+        "fixture: Vault A group_beta"
+    );
+    assert_eq!(
+        vault_b.record_count("group_alpha"),
+        1_000,
+        "fixture: Vault B group_alpha"
+    );
+    assert_eq!(
+        vault_b.record_count("group_beta"),
+        1_000,
+        "fixture: Vault B group_beta"
+    );
 
     (vault_a, vault_b, seeded_at)
 }
 
 /// Wires a sync task replicating `group_alpha` from `source` to `target`, same group name on both
 /// sides.
-async fn insert_alpha_task(conn: &sea_orm::DatabaseConnection, source_vault_id: Uuid, target_vault_id: Uuid) -> Uuid {
+async fn insert_alpha_task(
+    conn: &sea_orm::DatabaseConnection,
+    source_vault_id: Uuid,
+    target_vault_id: Uuid,
+) -> Uuid {
     let id = Uuid::new_v4();
     let now = Utc::now();
     vault_sync_task::ActiveModel {
@@ -900,38 +1122,47 @@ async fn insert_alpha_task(conn: &sea_orm::DatabaseConnection, source_vault_id: 
 /// paging (15,001 records across 4 pages, including the short final page) is exercised separately
 /// by `source_vault_delta_spanning_multiple_pages_is_fetched_completely` above; asserting a page
 /// boundary here that the engine does not actually cross would be asserting a fiction.
-#[tokio::test]
-async fn test_inter_vault_sync_high_volume_partial_overlap() {
-    let (conn, state, _master) = common::setup().await;
-    let (vault_a, vault_b, seeded_at) = build_two_vault_fixture().await;
-
-    let source_id = insert_vault(&conn, "vault-a", &vault_a.uri()).await;
-    let target_id = insert_vault(&conn, "vault-b", &vault_b.uri()).await;
-    let task_id = insert_alpha_task(&conn, source_id, target_id).await;
-
-    // ── Pass 1 ────────────────────────────────────────────────────────────────────────────────
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("first pass runs");
-
-    assert_eq!(summary.status, "SUCCESS", "error: {:?}", summary.error_message);
-    assert_eq!(summary.items_processed, 1_000, "the full source group must be fetched");
-    assert_eq!(summary.chunks_sent, 1, "1,000 records at a 5,000-record chunk size is a single batch");
-
-    // The fetch side: one correctly-parameterised page (see the doc comment on why one).
+fn assert_pass_one_convergence(
+    vault_a: &common::MockVault,
+    vault_b: &common::MockVault,
+    seeded_at: chrono::DateTime<Utc>,
+) {
     let gets = vault_a.gets();
-    assert_eq!(gets.len(), 1, "1,000 records fits in one 5,000-record page, so exactly one GET is correct");
+    assert_eq!(
+        gets.len(),
+        1,
+        "1,000 records fits in one 5,000-record page, so exactly one GET is correct"
+    );
     let first_get = &gets[0];
     assert_eq!(first_get.group_name.as_deref(), Some("group_alpha"));
-    assert_eq!(first_get.include_deleted.as_deref(), Some("true"), "tombstones must be requested every run");
-    assert_eq!(first_get.limit, Some(5_000), "the client must page with an explicit limit");
+    assert_eq!(
+        first_get.include_deleted.as_deref(),
+        Some("true"),
+        "tombstones must be requested every run"
+    );
+    assert_eq!(
+        first_get.limit,
+        Some(5_000),
+        "the client must page with an explicit limit"
+    );
     assert_eq!(first_get.offset, Some(0));
-    assert_eq!(first_get.since, None, "the first run has no high-water mark yet, so it must fetch everything");
+    assert_eq!(
+        first_get.since, None,
+        "the first run has no high-water mark yet, so it must fetch everything"
+    );
     assert_eq!(first_get.returned, 1_000);
 
-    // The push side: one upsert batch carrying the whole delta, with no address sent twice.
     let batches = vault_b.batches();
-    assert_eq!(batches.len(), 1, "one fetched chunk means one batch request");
+    assert_eq!(
+        batches.len(),
+        1,
+        "one fetched chunk means one batch request"
+    );
     assert_eq!(batches[0].group_name, "group_alpha");
-    assert_eq!(batches[0].mode, "upsert", "inter-vault sync must never send full_replace — a delta is not a full set");
+    assert_eq!(
+        batches[0].mode, "upsert",
+        "inter-vault sync must never send full_replace — a delta is not a full set"
+    );
     assert_eq!(batches[0].records, 1_000);
     let mut pushed_sorted = batches[0].addresses.clone();
     pushed_sorted.sort();
@@ -943,7 +1174,6 @@ async fn test_inter_vault_sync_high_volume_partial_overlap() {
         "the engine must not send the same canonical address twice within a batch"
     );
 
-    // ── Convergence ───────────────────────────────────────────────────────────────────────────
     assert_eq!(
         vault_b.record_count("group_alpha"),
         1_500,
@@ -955,70 +1185,53 @@ async fn test_inter_vault_sync_high_volume_partial_overlap() {
         "an upsert pass must never tombstone anything"
     );
 
-    // Every address from either side is present exactly once, and nothing else is.
     let converged = vault_b.records("group_alpha");
     let mut expected: Vec<String> = block_range(ALPHA_BLOCK, A_FIRST, A_LAST);
     expected.extend(block_range(ALPHA_BLOCK, B_UNIQUE_FIRST, B_UNIQUE_LAST));
     expected.sort();
     expected.dedup();
-    assert_eq!(expected.len(), 1_500, "fixture arithmetic: the union of both datasets is 1,500 addresses");
+    assert_eq!(
+        expected.len(),
+        1_500,
+        "fixture arithmetic: the union of both datasets is 1,500 addresses"
+    );
     let mut actual: Vec<String> = converged.keys().cloned().collect();
     actual.sort();
-    assert_eq!(actual, expected, "the target must hold exactly the union of both datasets");
+    assert_eq!(
+        actual, expected,
+        "the target must hold exactly the union of both datasets"
+    );
 
-    // The 500 addresses both vaults already had must have been *updated*, not re-created: their
-    // `created_at` still carries B's original seeding stamp.
     let seeded_naive = seeded_at.naive_utc();
     for address in block_range(ALPHA_BLOCK, OVERLAP_FIRST, OVERLAP_LAST) {
-        let record = converged.get(&address).unwrap_or_else(|| panic!("{address} missing from the target"));
+        let record = converged
+            .get(&address)
+            .unwrap_or_else(|| panic!("{address} missing from the target"));
         assert_eq!(
             record.created_at, seeded_naive,
             "{address} existed on B before the sync; an upsert must update it in place, not replace the row"
         );
     }
 
-    // The group nobody asked to replicate must be byte-for-byte untouched.
-    assert_eq!(vault_b.record_count("group_beta"), 1_000, "group_beta must not gain records from an alpha-only task");
-    assert!(vault_b.deleted_addresses("group_beta").is_empty(), "group_beta must not gain tombstones either");
+    assert_eq!(
+        vault_b.record_count("group_beta"),
+        1_000,
+        "group_beta must not gain records from an alpha-only task"
+    );
     assert!(
-        vault_b.batches().iter().all(|b| b.group_name == "group_alpha"),
+        vault_b.deleted_addresses("group_beta").is_empty(),
+        "group_beta must not gain tombstones either"
+    );
+    assert!(
+        vault_b
+            .batches()
+            .iter()
+            .all(|b| b.group_name == "group_alpha"),
         "no batch may be addressed to any group other than the task's target group"
     );
+}
 
-    let after_pass_one = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    let first_high_water = after_pass_one.last_sync_at.expect("a fully successful pass must advance last_sync_at");
-
-    // ── Pass 2: mutate the source, then sync differentially ───────────────────────────────────
-    let mutated_at = Utc::now();
-    let deleted = block_range(ALPHA_BLOCK, DELETED_FIRST, DELETED_LAST);
-    vault_a.soft_delete("group_alpha", &deleted, mutated_at);
-    vault_a.seed("group_alpha", block_range(ALPHA_BLOCK, ADDED_FIRST, ADDED_LAST), mutated_at);
-
-    let summary2 = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("second pass runs");
-
-    assert_eq!(summary2.status, "SUCCESS", "error: {:?}", summary2.error_message);
-    assert_eq!(
-        summary2.items_processed, 300,
-        "the differential pass must fetch exactly the 200 tombstoned + 100 added records — not the \
-         800 that did not change, and not all 1,100"
-    );
-
-    let gets2 = vault_a.gets();
-    assert_eq!(gets2.len(), 2, "the second pass adds exactly one more paged fetch");
-    let second_get = &gets2[1];
-    assert_eq!(
-        second_get.since.as_deref(),
-        Some(first_high_water.timestamp().to_string().as_str()),
-        "the second pass must filter on the high-water mark the first pass recorded"
-    );
-    assert_eq!(
-        second_get.include_deleted.as_deref(),
-        Some("true"),
-        "without include_deleted the 200 tombstones would be invisible and the deletions would never replicate"
-    );
-    assert_eq!(second_get.returned, 300);
-
-    // Tombstone delivery: the second batch must carry all 200 deletions, flagged.
+fn assert_pass_two_convergence(vault_b: &common::MockVault, deleted: &[String]) {
     let batches2 = vault_b.batches();
     assert_eq!(batches2.len(), 2, "one delta chunk per pass");
     let delta_batch = &batches2[1];
@@ -1030,44 +1243,112 @@ async fn test_inter_vault_sync_high_volume_partial_overlap() {
         .filter(|(_, is_deleted)| **is_deleted)
         .map(|(address, _)| address)
         .collect();
-    assert_eq!(tombstoned_in_batch.len(), 200, "all 200 deletions must be pushed as tombstones, not silently dropped");
-
-    // ── Convergence, second pass ──────────────────────────────────────────────────────────────
     assert_eq!(
-        vault_b.record_count("group_alpha"),
-        1_600,
-        "1,500 after the first pass + 100 newly added on the source = 1,600 distinct records; the 200 \
-         deletions tombstone existing rows rather than removing them"
+        tombstoned_in_batch.len(),
+        200,
+        "all 200 deletions must be pushed as tombstones, not silently dropped"
     );
+    assert_eq!(vault_b.record_count("group_alpha"), 1_600);
 
     let mut b_deleted = vault_b.deleted_addresses("group_alpha");
     b_deleted.sort();
-    let mut expected_deleted = deleted.clone();
+    let mut expected_deleted = deleted.to_vec();
     expected_deleted.sort();
-    assert_eq!(b_deleted, expected_deleted, "exactly the 200 addresses deleted on the source must be tombstoned on the target");
+    assert_eq!(b_deleted, expected_deleted);
 
     for address in block_range(ALPHA_BLOCK, ADDED_FIRST, ADDED_LAST) {
         let records = vault_b.records("group_alpha");
-        let record = records.get(&address).unwrap_or_else(|| panic!("newly added {address} never reached the target"));
+        let record = records
+            .get(&address)
+            .unwrap_or_else(|| panic!("newly added {address} never reached the target"));
         assert!(!record.is_deleted, "{address} was added, not deleted");
     }
 
-    assert_eq!(
-        vault_b.live_addresses("group_alpha").len(),
-        1_400,
-        "1,600 total less the 200 tombstoned leaves 1,400 live records"
-    );
-
-    // Still untouched, two passes in.
-    assert_eq!(vault_b.record_count("group_beta"), 1_000, "group_beta must survive both passes unchanged");
+    assert_eq!(vault_b.live_addresses("group_alpha").len(), 1_400);
+    assert_eq!(vault_b.record_count("group_beta"), 1_000);
     assert!(vault_b.deleted_addresses("group_beta").is_empty());
+}
 
-    let after_pass_two = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    let second_high_water = after_pass_two.last_sync_at.expect("the second pass must also advance last_sync_at");
-    assert!(
-        second_high_water > first_high_water,
-        "last_sync_at must move forward to this execution's start ({second_high_water} vs {first_high_water})"
+#[tokio::test]
+async fn test_inter_vault_sync_high_volume_partial_overlap() {
+    let (conn, state, _master) = common::setup().await;
+    let (vault_a, vault_b, seeded_at) = build_two_vault_fixture().await;
+
+    let source_id = insert_vault(&conn, "vault-a", &vault_a.uri()).await;
+    let target_id = insert_vault(&conn, "vault-b", &vault_b.uri()).await;
+    let task_id = insert_alpha_task(&conn, source_id, target_id).await;
+
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("first pass runs");
+    assert_eq!(
+        summary.status, "SUCCESS",
+        "error: {:?}",
+        summary.error_message
     );
+    assert_eq!(
+        summary.items_processed, 1_000,
+        "the full source group must be fetched"
+    );
+    assert_eq!(
+        summary.chunks_sent, 1,
+        "1,000 records at a 5,000-record chunk size is a single batch"
+    );
+    assert_pass_one_convergence(&vault_a, &vault_b, seeded_at);
+
+    let after_pass_one = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_high_water = after_pass_one
+        .last_sync_at
+        .expect("a fully successful pass must advance last_sync_at");
+
+    let mutated_at = Utc::now();
+    let deleted = block_range(ALPHA_BLOCK, DELETED_FIRST, DELETED_LAST);
+    vault_a.soft_delete("group_alpha", &deleted, mutated_at);
+    vault_a.seed(
+        "group_alpha",
+        block_range(ALPHA_BLOCK, ADDED_FIRST, ADDED_LAST),
+        mutated_at,
+    );
+
+    let summary2 = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("second pass runs");
+    assert_eq!(
+        summary2.status, "SUCCESS",
+        "error: {:?}",
+        summary2.error_message
+    );
+    assert_eq!(summary2.items_processed, 300);
+
+    let gets2 = vault_a.gets();
+    assert_eq!(
+        gets2.len(),
+        2,
+        "the second pass adds exactly one more paged fetch"
+    );
+    let second_get = &gets2[1];
+    assert_eq!(
+        second_get.since.as_deref(),
+        Some(first_high_water.timestamp().to_string().as_str())
+    );
+    assert_eq!(second_get.include_deleted.as_deref(), Some("true"));
+    assert_eq!(second_get.returned, 300);
+
+    assert_pass_two_convergence(&vault_b, &deleted);
+
+    let after_pass_two = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let second_high_water = after_pass_two
+        .last_sync_at
+        .expect("the second pass must also advance last_sync_at");
+    assert!(second_high_water > first_high_water);
 }
 
 /// A task's very *first* sync (`last_sync_at` still `None`, so the delta fetch carries no `since`
@@ -1095,22 +1376,62 @@ async fn first_sync_fetching_zero_records_is_reported_as_partial_not_silently_su
     let target_id = insert_vault(&conn, "empty-target", &target_mock.uri()).await;
     let task_id = insert_task(&conn, source_id, target_id).await;
 
-    let before = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    assert!(before.last_sync_at.is_none(), "this must be the task's first sync");
+    let before = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        before.last_sync_at.is_none(),
+        "this must be the task's first sync"
+    );
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
-    assert_eq!(summary.status, "PARTIAL", "a first sync fetching nothing must not look identical to a routine empty delta");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
+    assert_eq!(
+        summary.status, "PARTIAL",
+        "a first sync fetching nothing must not look identical to a routine empty delta"
+    );
     assert_eq!(summary.items_processed, 0);
-    assert_eq!(summary.chunks_sent, 0, "nothing to push, so nothing is sent to the target");
-    let message = summary.error_message.expect("the anomaly must be explained, not left as a bare empty success");
-    assert!(message.contains("source-group"), "must name the group that returned nothing: {message}");
-    assert!(message.contains("empty-source"), "must name the source vault: {message}");
-    assert!(message.to_lowercase().contains("case"), "must point at the most likely cause (a case mismatch): {message}");
+    assert_eq!(
+        summary.chunks_sent, 0,
+        "nothing to push, so nothing is sent to the target"
+    );
+    let message = summary
+        .error_message
+        .expect("the anomaly must be explained, not left as a bare empty success");
+    assert!(
+        message.contains("source-group"),
+        "must name the group that returned nothing: {message}"
+    );
+    assert!(
+        message.contains("empty-source"),
+        "must name the source vault: {message}"
+    );
+    assert!(
+        message.to_lowercase().contains("case"),
+        "must point at the most likely cause (a case mismatch): {message}"
+    );
 
-    assert!(target_mock.received_requests().await.expect("recording enabled").is_empty(), "nothing should be pushed");
+    assert!(
+        target_mock
+            .received_requests()
+            .await
+            .expect("recording enabled")
+            .is_empty(),
+        "nothing should be pushed"
+    );
 
-    let after = vault_sync_task::Entity::find_by_id(task_id).one(&conn).await.unwrap().unwrap();
-    assert!(after.last_sync_at.is_some(), "the warning does not block progress -- there was nothing to retry");
+    let after = vault_sync_task::Entity::find_by_id(task_id)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        after.last_sync_at.is_some(),
+        "the warning does not block progress -- there was nothing to retry"
+    );
 }
 
 /// The companion case: once a task has already completed one successful sync (`last_sync_at` is
@@ -1143,10 +1464,18 @@ async fn later_sync_fetching_zero_new_records_stays_a_silent_success() {
         .unwrap()
         .into();
     active.last_sync_at = Set(Some(Utc::now() - chrono::Duration::hours(1)));
-    active.update(&conn).await.expect("seed a prior successful sync");
+    active
+        .update(&conn)
+        .await
+        .expect("seed a prior successful sync");
 
-    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id).await.expect("job runs");
+    let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
+        .await
+        .expect("job runs");
     assert_eq!(summary.status, "SUCCESS");
     assert_eq!(summary.items_processed, 0);
-    assert_eq!(summary.error_message, None, "a routine empty delta on a non-first sync must not be flagged");
+    assert_eq!(
+        summary.error_message, None,
+        "a routine empty delta on a non-first sync must not be flagged"
+    );
 }

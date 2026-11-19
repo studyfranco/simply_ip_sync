@@ -79,8 +79,8 @@
       </nav>
     </div>
 
-    <!-- Panel bodies are rendered by app.js; each `data-tab="X"` above pairs with `id="tab-X"`
-           here, which is the invariant `tests/source_hygiene.rs` checks. -->
+    <!-- Panel bodies are rendered by app.js; each navigation tab button pairs with its matching
+           panel below (enforced by tests/source_hygiene.rs). -->
       <main id="tab-sources" class="tab-panel active"></main>
       <main id="tab-sync-tasks" class="tab-panel"></main>
       <main id="tab-vaults" class="tab-panel"></main>
@@ -98,7 +98,7 @@
             <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
             <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key (name or prefix)...">
             <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
-            <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
+            <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (inclusive)">
             <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
             <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
           </div>
@@ -150,6 +150,50 @@
     <option value="VAULT_DELETE"></option>
   </datalist>
 
+  <!-- Destination Group Create/Edit Modal -->
+  <div id="group-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="group-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="group-modal-title">New Destination Group</h3>
+        <button type="button" id="group-modal-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <div id="group-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Feed Create/Edit Modal -->
+  <div id="feed-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="feed-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="feed-modal-title">New Feed</h3>
+        <button type="button" id="feed-modal-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <div id="feed-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Sync Task Create/Edit Modal -->
+  <div id="task-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="task-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="task-modal-title">New Sync Task</h3>
+        <button type="button" id="task-modal-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <div id="task-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Vault Endpoint Create/Edit Modal -->
+  <div id="vault-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="vault-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="vault-modal-title">New Vault Endpoint</h3>
+        <button type="button" id="vault-modal-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <div id="vault-modal-body"></div>
+    </div>
+  </div>
+
   <!-- Create API Key Modal -->
   <div id="create-key-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="create-key-modal-title">
     <div class="modal-card modal-card-form card">
@@ -181,7 +225,7 @@
         </div>
         <div class="form-actions mt-4">
           <button type="submit" class="btn btn-primary" id="kf-submit-btn">Create Key</button>
-          <button type="button" id="kf-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="button" id="kf-cancel" class="btn btn-cancel">Cancel</button>
         </div>
       </form>
     </div>

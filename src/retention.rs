@@ -20,7 +20,7 @@
 //! This module purges both, on independent configurable windows, because they serve different
 //! purposes and a deployment reasonably wants different horizons for them: `sync_logs` is
 //! operational noise an operator mostly cares about for the last few weeks, while `audit_logs` is
-//! the security trail RBAC_MODEL.md's cascade-deletion and privilege-change guarantees rely on
+//! the security trail `RBAC_MODEL.md`'s cascade-deletion and privilege-change guarantees rely on
 //! being reviewable after the fact, and typically needs a much longer horizon (or none at all).
 //!
 //! `0` disables purging for that table entirely, for an operator who would rather keep everything
@@ -61,9 +61,9 @@ const DEFAULT_SWEEP_SECONDS: u64 = 3600;
 /// A malformed value warns and falls back rather than aborting startup, matching how the rest of
 /// the codebase treats bad overrides — and the fallback is the *safe* direction: keeping data
 /// longer than intended is recoverable, deleting it early is not.
-fn retention_days_from_env(env_var: &str, default_days: i64) -> i64 {
-    match std::env::var(env_var) {
-        Ok(raw) => match raw.trim().parse::<i64>() {
+fn parse_retention_days(env_var: &str, raw: Option<&str>, default_days: i64) -> i64 {
+    match raw {
+        Some(raw) => match raw.trim().parse::<i64>() {
             Ok(days) if days >= 0 => days,
             _ => {
                 tracing::warn!(
@@ -72,8 +72,13 @@ fn retention_days_from_env(env_var: &str, default_days: i64) -> i64 {
                 default_days
             }
         },
-        Err(_) => default_days,
+        None => default_days,
     }
+}
+
+fn retention_days_from_env(env_var: &str, default_days: i64) -> i64 {
+    let raw = std::env::var(env_var).ok();
+    parse_retention_days(env_var, raw.as_deref(), default_days)
 }
 
 /// Reads the configured sweep interval, clamped to at least one second.
@@ -90,6 +95,10 @@ fn sweep_seconds_from_env() -> u64 {
 
 /// Permanently deletes `sync_logs` rows older than `retention_days`. Returns the number of rows
 /// removed. A non-positive `retention_days` disables purging and is a no-op.
+///
+/// # Errors
+///
+/// Returns `DbErr` if deleting expired rows fails.
 pub async fn purge_expired_sync_logs(
     db: &DatabaseConnection,
     retention_days: i64,
@@ -107,6 +116,10 @@ pub async fn purge_expired_sync_logs(
 
 /// Permanently deletes `audit_logs` rows older than `retention_days`. Returns the number of rows
 /// removed. A non-positive `retention_days` disables purging and is a no-op.
+///
+/// # Errors
+///
+/// Returns `DbErr` if deleting expired rows fails.
 pub async fn purge_expired_audit_logs(
     db: &DatabaseConnection,
     retention_days: i64,
@@ -284,16 +297,11 @@ mod tests {
 
     #[test]
     fn a_malformed_env_override_falls_back_to_the_default_rather_than_aborting() {
-        // SAFETY: test-only env mutation, single-threaded within this test's scope by convention
-        // used elsewhere in this codebase's env-parsing tests.
-        unsafe {
-            std::env::set_var(SYNC_LOG_RETENTION_DAYS_ENV, "not-a-number");
-        }
-        let days =
-            retention_days_from_env(SYNC_LOG_RETENTION_DAYS_ENV, DEFAULT_SYNC_LOG_RETENTION_DAYS);
-        unsafe {
-            std::env::remove_var(SYNC_LOG_RETENTION_DAYS_ENV);
-        }
+        let days = parse_retention_days(
+            SYNC_LOG_RETENTION_DAYS_ENV,
+            Some("not-a-number"),
+            DEFAULT_SYNC_LOG_RETENTION_DAYS,
+        );
         assert_eq!(days, DEFAULT_SYNC_LOG_RETENTION_DAYS);
     }
 }

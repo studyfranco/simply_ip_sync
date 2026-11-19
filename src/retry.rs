@@ -10,6 +10,7 @@ use rand::RngExt;
 /// `500` (an origin bug retrying the identical request is unlikely to fix) and `413` (handled
 /// separately by adaptive batch splitting in `client::post_batch` — retrying an oversized payload
 /// unchanged can never succeed, no matter how many times or how long the wait).
+#[must_use]
 pub fn is_transient_status(status: u16) -> bool {
     matches!(status, 429 | 502 | 503 | 504)
 }
@@ -20,13 +21,22 @@ pub fn is_transient_status(status: u16) -> bool {
 /// to 50% jitter — jitter exists so that if several jobs hit the same recovering target at once,
 /// their retries don't all land in the same instant and repeat the overload that caused the
 /// transient failure in the first place.
+#[must_use]
 pub fn backoff_with_jitter(attempt: u32) -> std::time::Duration {
-    let base = crate::config::outbound_retry_backoff();
+    backoff_with_jitter_from_base(crate::config::outbound_retry_backoff(), attempt)
+}
+
+/// Computes exponential backoff with up to 50% jitter using an explicit `base` duration.
+#[must_use]
+pub fn backoff_with_jitter_from_base(
+    base: std::time::Duration,
+    attempt: u32,
+) -> std::time::Duration {
     let shift = attempt.saturating_sub(1).min(10); // cap exponent growth well before overflow
     let multiplier = 2u32.checked_pow(shift).unwrap_or(u32::MAX);
     let exp = base.saturating_mul(multiplier);
     let capped = exp.min(std::time::Duration::from_secs(30));
-    let jitter_ceiling_ms = ((capped.as_millis() as u64) / 2).max(1);
+    let jitter_ceiling_ms = (u64::try_from(capped.as_millis()).unwrap_or(30_000) / 2).max(1);
     let jitter_ms = rand::rng().random_range(0..=jitter_ceiling_ms);
     capped + std::time::Duration::from_millis(jitter_ms)
 }
@@ -53,12 +63,10 @@ mod tests {
 
     #[test]
     fn backoff_grows_with_attempt_number_and_stays_capped() {
-        unsafe {
-            std::env::set_var("OUTBOUND_RETRY_BACKOFF_MS", "100");
-        }
-        let first = backoff_with_jitter(1);
-        let second = backoff_with_jitter(2);
-        let far_future = backoff_with_jitter(50);
+        let base = std::time::Duration::from_millis(100);
+        let first = backoff_with_jitter_from_base(base, 1);
+        let second = backoff_with_jitter_from_base(base, 2);
+        let far_future = backoff_with_jitter_from_base(base, 50);
 
         assert!(
             first >= std::time::Duration::from_millis(100),
@@ -76,8 +84,5 @@ mod tests {
             far_future <= std::time::Duration::from_secs(30) + std::time::Duration::from_secs(15),
             "backoff must stay bounded even for a very high attempt count"
         );
-        unsafe {
-            std::env::remove_var("OUTBOUND_RETRY_BACKOFF_MS");
-        }
     }
 }

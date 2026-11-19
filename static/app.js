@@ -485,6 +485,46 @@ function setupTabs() {
     document.getElementById("login-screen").classList.remove("hidden");
   });
 
+  function wireModalClose(modalId, closeXId, bodyId) {
+    const close = () => {
+      document.getElementById(modalId)?.classList.add("hidden");
+      if (bodyId) {
+        const body = document.getElementById(bodyId);
+        if (body) body.innerHTML = "";
+      }
+    };
+    document.getElementById(closeXId)?.addEventListener("click", close);
+    document.getElementById(modalId)?.addEventListener("click", (e) => {
+      if (e.target.id === modalId) close();
+    });
+  }
+
+  wireModalClose("group-modal", "group-modal-close-x", "group-modal-body");
+  wireModalClose("feed-modal", "feed-modal-close-x", "feed-modal-body");
+  wireModalClose("task-modal", "task-modal-close-x", "task-modal-body");
+  wireModalClose("vault-modal", "vault-modal-close-x", "vault-modal-body");
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    for (const [modalId, bodyId] of [
+      ["group-modal", "group-modal-body"],
+      ["feed-modal", "feed-modal-body"],
+      ["task-modal", "task-modal-body"],
+      ["vault-modal", "vault-modal-body"],
+      ["create-key-modal", null],
+      ["secret-reveal-modal", null],
+    ]) {
+      const m = document.getElementById(modalId);
+      if (m && !m.classList.contains("hidden")) {
+        m.classList.add("hidden");
+        if (bodyId) {
+          const body = document.getElementById(bodyId);
+          if (body) body.innerHTML = "";
+        }
+      }
+    }
+  });
+
   document.getElementById("kf-cancel")?.addEventListener("click", () => {
     document.getElementById("create-key-modal")?.classList.add("hidden");
   });
@@ -604,10 +644,9 @@ async function renderSources() {
       <div class="list-header"><h2>Destination Groups</h2>
         ${me.is_master || me.can_manage_sources ? '<button class="btn btn-primary" id="new-group-btn">+ New Destination Group</button>' : ""}
       </div>
-      <div id="group-form-slot"></div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Name</th><th>Target Group</th><th>Schedule</th><th>Mode</th><th>Active</th><th>Bogon Filter</th><th>Last Run</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Target Group</th><th>Schedule</th><th>Mode</th><th>Active</th><th>Bogon Filter</th><th>Last Run</th><th>Actions</th></tr></thead>
         <tbody>
           ${groups.length ? groups.map(groupRow).join("") : '<tr><td colspan="8" class="empty-state">No destination groups yet.</td></tr>'}
         </tbody>
@@ -651,7 +690,14 @@ function groupRow(g) {
 }
 
 function showGroupForm(existing, vaults) {
-  const slot = document.getElementById("group-form-slot");
+  const modal = document.getElementById("group-modal");
+  const titleEl = document.getElementById("group-modal-title");
+  const slot = document.getElementById("group-modal-body");
+  if (titleEl) titleEl.textContent = existing ? `Edit Destination Group: ${existing.name}` : "New Destination Group";
+  const closeModal = () => {
+    modal?.classList.add("hidden");
+    if (slot) slot.innerHTML = "";
+  };
   const vaultOptions = vaults.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join("");
   slot.innerHTML = `
     <form class="form-grid" id="group-form">
@@ -693,7 +739,8 @@ function showGroupForm(existing, vaults) {
     });
   }
 
-  document.getElementById("group-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
+  modal?.classList.remove("hidden");
+  document.getElementById("group-form-cancel").addEventListener("click", closeModal);
   document.getElementById("group-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -713,7 +760,7 @@ function showGroupForm(existing, vaults) {
       if (existing) await client.patch("/api/destination-groups/" + existing.id, payload);
       else await client.post("/api/destination-groups", payload);
       toast("Destination group saved", "success");
-      slot.innerHTML = "";
+      closeModal();
       await renderSources();
     } catch (err) {
       toast("Save failed: " + err.message, "error");
@@ -734,10 +781,9 @@ async function renderFeedsView(group, vaults) {
         ${me.is_master || me.can_manage_sources ? '<button class="btn btn-primary" id="new-feed-btn">+ New Feed</button>' : ""}
       </div>
       <small class="field-hint mb-4">All feeds in this group are fetched concurrently and aggregated into one deduplicated set on every run.</small>
-      <div id="feed-form-slot"></div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Name</th><th>URL</th><th>Parser</th><th>Max Age (days)</th><th>Bogon Filter</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>URL</th><th>Parser</th><th>Max Age (days)</th><th>Bogon Filter</th><th>Actions</th></tr></thead>
         <tbody>
           ${group.feeds.length ? group.feeds.map(feedRow).join("") : '<tr><td colspan="6" class="empty-state">No feeds yet — this group will fetch nothing until at least one is added.</td></tr>'}
         </tbody>
@@ -864,7 +910,14 @@ function hasLastSeenAtSelector(rawConfigText) {
 }
 
 function showFeedForm(group, existing, vaults) {
-  const slot = document.getElementById("feed-form-slot");
+  const modal = document.getElementById("feed-modal");
+  const titleEl = document.getElementById("feed-modal-title");
+  const slot = document.getElementById("feed-modal-body");
+  if (titleEl) titleEl.textContent = existing ? `Edit Feed: ${existing.name}` : `New Feed — ${group.name}`;
+  const closeModal = () => {
+    modal?.classList.add("hidden");
+    if (slot) slot.innerHTML = "";
+  };
   const { headerRows, userAgent, rest } = splitParserConfig(existing?.parser_config_json);
   const bogonOverride = existing?.skip_bogon_filtering; // undefined/null -> inherit, true/false -> override
 
@@ -1039,7 +1092,8 @@ function showFeedForm(group, existing, vaults) {
     }
   });
 
-  document.getElementById("feed-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
+  modal?.classList.remove("hidden");
+  document.getElementById("feed-form-cancel").addEventListener("click", closeModal);
   document.getElementById("feed-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1060,7 +1114,7 @@ function showFeedForm(group, existing, vaults) {
       if (existing) await client.patch(`/api/destination-groups/${group.id}/feeds/${existing.id}`, payload);
       else await client.post(`/api/destination-groups/${group.id}/feeds`, payload);
       toast("Feed saved", "success");
-      slot.innerHTML = "";
+      closeModal();
       const refreshed = await client.get(`/api/destination-groups/${group.id}`);
       await renderFeedsView(refreshed, vaults);
     } catch (err) {
@@ -1082,10 +1136,9 @@ async function renderSyncTasks() {
       <div class="list-header"><h2>Inter-Vault Sync Tasks</h2>
         ${me.is_master || me.can_manage_vaults ? '<button class="btn btn-primary" id="new-task-btn">+ New Task</button>' : ""}
       </div>
-      <div id="task-form-slot"></div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Name</th><th>Source Vault</th><th>Source Group</th><th>Target Group</th><th>Schedule</th><th>Active</th><th>Last Sync</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Source Vault</th><th>Source Group</th><th>Target Group</th><th>Schedule</th><th>Active</th><th>Last Sync</th><th>Actions</th></tr></thead>
         <tbody>
           ${tasks.length ? tasks.map((t) => taskRow(t, vaults)).join("") : '<tr><td colspan="8" class="empty-state">No sync tasks yet.</td></tr>'}
         </tbody>
@@ -1126,7 +1179,14 @@ function taskRow(t, vaults) {
 }
 
 function showTaskForm(existing, vaults) {
-  const slot = document.getElementById("task-form-slot");
+  const modal = document.getElementById("task-modal");
+  const titleEl = document.getElementById("task-modal-title");
+  const slot = document.getElementById("task-modal-body");
+  if (titleEl) titleEl.textContent = existing ? `Edit Sync Task: ${existing.name}` : "New Sync Task";
+  const closeModal = () => {
+    modal?.classList.add("hidden");
+    if (slot) slot.innerHTML = "";
+  };
   const vaultOptions = vaults.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join("");
   slot.innerHTML = `
     <form class="form-grid" id="task-form">
@@ -1160,7 +1220,8 @@ function showTaskForm(existing, vaults) {
     });
   }
 
-  document.getElementById("task-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
+  modal?.classList.remove("hidden");
+  document.getElementById("task-form-cancel").addEventListener("click", closeModal);
   document.getElementById("task-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1180,7 +1241,7 @@ function showTaskForm(existing, vaults) {
       if (existing) await client.patch("/api/sync-tasks/" + existing.id, payload);
       else await client.post("/api/sync-tasks", payload);
       toast("Sync task saved", "success");
-      slot.innerHTML = "";
+      closeModal();
       await renderSyncTasks();
     } catch (err) {
       toast("Save failed: " + err.message, "error");
@@ -1209,10 +1270,9 @@ async function renderVaults() {
       <div class="list-header"><h2>Vault Endpoints</h2>
         ${me.is_master || me.can_manage_vaults ? '<button class="btn btn-primary" id="new-vault-btn">+ New Vault</button>' : ""}
       </div>
-      <div id="vault-form-slot"></div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Name</th><th>Target URL</th><th>Description</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Target URL</th><th>Description</th><th>Actions</th></tr></thead>
         <tbody>
           ${vaults.length ? vaults.map(vaultRow).join("") : '<tr><td colspan="4" class="empty-state">No vault endpoints yet.</td></tr>'}
         </tbody>
@@ -1244,7 +1304,14 @@ function vaultRow(v) {
 }
 
 function showVaultForm(existing) {
-  const slot = document.getElementById("vault-form-slot");
+  const modal = document.getElementById("vault-modal");
+  const titleEl = document.getElementById("vault-modal-title");
+  const slot = document.getElementById("vault-modal-body");
+  if (titleEl) titleEl.textContent = existing ? `Edit Vault Endpoint: ${existing.name}` : "New Vault Endpoint";
+  const closeModal = () => {
+    modal?.classList.add("hidden");
+    if (slot) slot.innerHTML = "";
+  };
   slot.innerHTML = `
     <form class="form-grid" id="vault-form">
       <label class="form-group"><span>Name</span><input class="input-field" name="name" required value="${escapeHtml(existing?.name || "")}"></label>
@@ -1258,7 +1325,8 @@ function showVaultForm(existing) {
       </div>
     </form>`;
 
-  document.getElementById("vault-form-cancel").addEventListener("click", () => (slot.innerHTML = ""));
+  modal?.classList.remove("hidden");
+  document.getElementById("vault-form-cancel").addEventListener("click", closeModal);
   document.getElementById("vault-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1273,7 +1341,7 @@ function showVaultForm(existing) {
       if (existing) await client.patch("/api/vaults/" + existing.id, payload);
       else await client.post("/api/vaults", payload);
       toast("Vault endpoint saved", "success");
-      slot.innerHTML = "";
+      closeModal();
       invalidateVaultsCache();
       await renderVaults();
     } catch (err) {
@@ -1296,7 +1364,7 @@ async function renderKeys() {
       </div>
       <div class="table-container">
         <table class="data-table">
-        <thead><tr><th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Bound IPs</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Bound IPs</th><th>Actions</th></tr></thead>
         <tbody>
           ${keys.length ? keys.map(keyRow).join("") : '<tr><td colspan="6" class="empty-state">No keys visible.</td></tr>'}
         </tbody>

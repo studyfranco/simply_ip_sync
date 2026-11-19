@@ -163,8 +163,10 @@ pick_port() {
         echo "$4"
         return
     fi
-    local candidate
-    for candidate in $(seq "$start" "$end"); do
+    local candidate offset width=$((end - start + 1))
+    local first=$((RANDOM % width))
+    for ((offset = 0; offset < width; offset++)); do
+        candidate=$((start + (first + offset) % width))
         if ! port_in_use "$candidate"; then
             echo "$candidate"
             return
@@ -174,7 +176,10 @@ pick_port() {
     exit 1
 }
 
-SERVER_PORT="$(pick_port 3003 3103 "simply_ip_sync" "$REQUESTED_PORT")"
+SERVER_PORT="$(pick_port 20000 24999 "simply_ip_sync" "$REQUESTED_PORT")" || {
+    rm -rf "$WORK_DIR"
+    exit 1
+}
 BASE_URL="http://$BIND_HOST:$SERVER_PORT"
 log "simply_ip_sync will listen on $BASE_URL"
 
@@ -202,6 +207,7 @@ register_key_secret() {
 
 # ── Daemon lifecycle ─────────────────────────────────────────────────────────
 SERVER_PID=""
+SSRF_SERVER_PID=""
 MOCK_SOURCE_PID=""
 MOCK_TARGET1_PID=""
 MOCK_TARGET2_PID=""
@@ -209,9 +215,33 @@ FIXTURE_SERVER_PID=""
 EXTRA_MOCK_PID=""
 RESILIENCE_MOCK_PID=""
 
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3() {
+        python3 - "$@" <<'PY'
+import sqlite3, sys
+db_path = sys.argv[1]
+query = sys.argv[2] if len(sys.argv) > 2 else sys.stdin.read()
+conn = sqlite3.connect(db_path, timeout=10.0)
+try:
+    cur = conn.cursor()
+    if query.strip().lower() == ".dump":
+        for line in conn.iterdump():
+            print(line)
+    else:
+        for stmt in [s.strip() for s in query.split(";") if s.strip()]:
+            cur.execute(stmt)
+            for row in cur.fetchall():
+                print("|".join("" if v is None else str(v) for v in row))
+        conn.commit()
+finally:
+    conn.close()
+PY
+    }
+fi
+
 cleanup() {
     local pid_var pid
-    for pid_var in SERVER_PID MOCK_SOURCE_PID MOCK_TARGET1_PID MOCK_TARGET2_PID FIXTURE_SERVER_PID EXTRA_MOCK_PID RESILIENCE_MOCK_PID; do
+    for pid_var in SERVER_PID SSRF_SERVER_PID MOCK_SOURCE_PID MOCK_TARGET1_PID MOCK_TARGET2_PID FIXTURE_SERVER_PID EXTRA_MOCK_PID RESILIENCE_MOCK_PID; do
         pid="${!pid_var}"
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             log "Stopping $pid_var (pid $pid)..."
@@ -223,11 +253,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+E2E_ENCRYPTION_KEY="0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
 log_section "Boot"
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" \
     RUST_LOG=info \
     INITIAL_MASTER_KEY="$MASTER_KEY" \
     INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
+    SYNC_ENCRYPTION_KEY="$E2E_ENCRYPTION_KEY" \
+    ALLOW_PRIVATE_INGEST_URLS_FOR_TEST=true \
     BIND_HOST="$BIND_HOST" \
     PORT="$SERVER_PORT" \
     TRUSTED_PROXIES="127.0.0.1/32" \
@@ -1543,8 +1577,374 @@ fi
 api_call DELETE "/api/vaults/$SCRATCH_VAULT_ID" "$MASTER_KEY"
 check "204" "clean up the cron-validation scratch vault"
 
-# ── 11. Graceful shutdown ────────────────────────────────────────────────────
-log_section "11. Graceful shutdown"
+# ── 10b. Edge-Case / Boundary / Security E2E ─────────────────────────────────
+log_section "10b. Edge-Case / Boundary / Security E2E"
+
+# 1. Target Master forbidden on /permissions + R6 pure-reduction & revocation guard.
+api_call POST "/api/vaults" "$MASTER_KEY" \
+    '{"name":"edge-security-scratch-vault","target_url":"http://127.0.0.1:1","api_key":"edge-k","signing_secret":"edge-s"}'
+check "200" "10b: create scratch vault for permissions & R6 boundary checks"
+EDGE_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call PUT "/api/keys/$MASTER_ID/permissions" "$MASTER_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$EDGE_VAULT_ID\",\"can_sync\":true,\"can_manage\":true,\"can_view_logs\":true}"
+check "400" "10b: PUT /api/keys/{master_id}/permissions is rejected with 400 (RBAC §5)"
+check_true '.error | contains("Master key")' "10b: error explains M:N permissions cannot be configured on Master"
+
+api_call DELETE "/api/keys/$MASTER_ID/permissions/00000000-0000-0000-0000-000000000000" "$MASTER_KEY"
+check "400" "10b: DELETE /api/keys/{master_id}/permissions/{perm_id} is rejected with 400 (RBAC §5)"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"edge-unpriv-key","can_manage_keys":false}'
+check "200" "10b: create unprivileged daughter key"
+EDGE_UNPRIV_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+EDGE_UNPRIV_SECRET=$(echo "$RESP_BODY" | jq -r '.plaintext_signing_secret')
+EDGE_UNPRIV_ID=$(echo "$RESP_BODY" | jq -r '.key.id')
+register_key_secret "$EDGE_UNPRIV_KEY" "$EDGE_UNPRIV_SECRET"
+
+api_call PUT "/api/keys/$MASTER_ID/permissions" "$EDGE_UNPRIV_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$EDGE_VAULT_ID\",\"can_sync\":true}"
+check "403" "10b: unprivileged key attempting PUT /api/keys/{master_id}/permissions is rejected with 403"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"edge-r6-delegator-key","can_manage_keys":true}'
+check "200" "10b: create R6 delegator key with can_manage_keys=true"
+EDGE_DELEGATOR_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+EDGE_DELEGATOR_SECRET=$(echo "$RESP_BODY" | jq -r '.plaintext_signing_secret')
+EDGE_DELEGATOR_ID=$(echo "$RESP_BODY" | jq -r '.key.id')
+register_key_secret "$EDGE_DELEGATOR_KEY" "$EDGE_DELEGATOR_SECRET"
+
+api_call PUT "/api/keys/$MASTER_ID/permissions" "$EDGE_DELEGATOR_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$EDGE_VAULT_ID\",\"can_sync\":true}"
+check "400" "10b: can_manage_keys delegator attempting PUT /api/keys/{master_id}/permissions is rejected with 400"
+
+api_call DELETE "/api/keys/$MASTER_ID/permissions/00000000-0000-0000-0000-000000000000" "$EDGE_DELEGATOR_KEY"
+check "400" "10b: can_manage_keys delegator attempting DELETE /api/keys/{master_id}/permissions/{id} is rejected with 400"
+
+# R6 guard: delegator holds ONLY can_manage on EDGE_VAULT_ID (neither can_sync nor can_view_logs).
+api_call PUT "/api/keys/$EDGE_DELEGATOR_ID/permissions" "$MASTER_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$EDGE_VAULT_ID\",\"can_manage\":true,\"can_sync\":false,\"can_view_logs\":false}"
+check "200" "10b: Master grants delegator can_manage-only on scratch vault"
+
+api_call PUT "/api/keys/$EDGE_UNPRIV_ID/permissions" "$MASTER_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$EDGE_VAULT_ID\",\"can_sync\":true,\"can_view_logs\":true}"
+check "200" "10b: Master grants unprivileged key can_sync+can_view_logs on scratch vault"
+EDGE_UNPRIV_PERM_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# R6 pure reduction via PUT: delegator does not hold can_view_logs, yet can drop can_sync while keeping can_view_logs.
+api_call PUT "/api/keys/$EDGE_UNPRIV_ID/permissions" "$EDGE_DELEGATOR_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$EDGE_VAULT_ID\",\"can_sync\":false,\"can_view_logs\":true}"
+check "200" "10b: R6 pure reduction via PUT succeeds even when revoker does not hold surviving can_view_logs"
+check_jq ".can_sync" "false" "10b: R6 reduction dropped can_sync to false"
+check_jq ".can_view_logs" "true" "10b: R6 reduction preserved can_view_logs=true"
+
+# R1/R7 widening guard: delegator cannot re-widen can_sync back to true without holding can_sync.
+api_call PUT "/api/keys/$EDGE_UNPRIV_ID/permissions" "$EDGE_DELEGATOR_KEY" \
+    "{\"resource_type\":\"vault_endpoint\",\"resource_id\":\"$EDGE_VAULT_ID\",\"can_sync\":true,\"can_view_logs\":true}"
+check "403" "10b: R1/R7 prevents delegator from re-widening can_sync back to true"
+
+api_call DELETE "/api/keys/$EDGE_UNPRIV_ID/permissions/$EDGE_UNPRIV_PERM_ID" "$EDGE_DELEGATOR_KEY"
+check "204" "10b: R6 full revocation via DELETE succeeds with can_manage alone"
+
+api_call DELETE "/api/keys/$EDGE_DELEGATOR_ID" "$MASTER_KEY"
+check "204" "10b: clean up R6 delegator key"
+api_call DELETE "/api/keys/$EDGE_UNPRIV_ID" "$MASTER_KEY"
+check "204" "10b: clean up unprivileged daughter key"
+api_call DELETE "/api/vaults/$EDGE_VAULT_ID" "$MASTER_KEY"
+check "204" "10b: clean up scratch vault"
+
+# 2. At-rest encryption check on vault_endpoints.api_key (and signing_secret).
+AT_REST_PLAIN_API_KEY="e2e-at-rest-vault-api-key-canary-${RANDOM}-987654"
+AT_REST_PLAIN_SIGNING_SECRET="e2e-at-rest-vault-signing-secret-canary-${RANDOM}-123456"
+api_call POST "/api/vaults" "$MASTER_KEY" \
+    "{\"name\":\"at-rest-cipher-vault\",\"target_url\":\"http://127.0.0.1:1\",\"api_key\":\"$AT_REST_PLAIN_API_KEY\",\"signing_secret\":\"$AT_REST_PLAIN_SIGNING_SECRET\"}"
+check "200" "10b: create vault endpoint with distinctive api_key & signing_secret for at-rest SQLite inspection"
+AT_REST_VAULT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+STORED_VAULT_API_KEY=$(sqlite3 "$DB_PATH" "SELECT api_key FROM vault_endpoints WHERE name = 'at-rest-cipher-vault';")
+STORED_VAULT_SIGNING_SECRET=$(sqlite3 "$DB_PATH" "SELECT signing_secret FROM vault_endpoints WHERE name = 'at-rest-cipher-vault';")
+check_matches "$STORED_VAULT_API_KEY" '^v1\.xchacha20poly1305\.[0-9a-f]{48}\.[0-9a-f]+$' \
+    "10b: vault_endpoints.api_key is sealed with v1.xchacha20poly1305.<nonce>.<ciphertext> in SQLite"
+check_matches "$STORED_VAULT_SIGNING_SECRET" '^v1\.xchacha20poly1305\.[0-9a-f]{48}\.[0-9a-f]+$' \
+    "10b: vault_endpoints.signing_secret is sealed with v1.xchacha20poly1305.<nonce>.<ciphertext> in SQLite"
+
+SQLITE_DUMP_CONTENT="$(sqlite3 "$DB_PATH" ".dump")"
+if [[ "$SQLITE_DUMP_CONTENT" == *"$AT_REST_PLAIN_API_KEY"* ]] || grep -aq "$AT_REST_PLAIN_API_KEY" "$DB_PATH" "${DB_PATH}-wal" 2>/dev/null; then
+    check_local "plaintext-leaked" "sealed-only" "10b: plaintext vault_endpoints.api_key never appears in sqlite3 dump or DB files"
+else
+    check_local "sealed-only" "sealed-only" "10b: plaintext vault_endpoints.api_key never appears in sqlite3 dump or DB files"
+fi
+if [[ "$SQLITE_DUMP_CONTENT" == *"$AT_REST_PLAIN_SIGNING_SECRET"* ]] || grep -aq "$AT_REST_PLAIN_SIGNING_SECRET" "$DB_PATH" "${DB_PATH}-wal" 2>/dev/null; then
+    check_local "plaintext-leaked" "sealed-only" "10b: plaintext vault_endpoints.signing_secret never appears in sqlite3 dump or DB files"
+else
+    check_local "sealed-only" "sealed-only" "10b: plaintext vault_endpoints.signing_secret never appears in sqlite3 dump or DB files"
+fi
+
+AT_REST_ROTATED_API_KEY="e2e-at-rest-vault-api-key-rotated-${RANDOM}-654321"
+api_call PATCH "/api/vaults/$AT_REST_VAULT_ID" "$MASTER_KEY" \
+    "{\"api_key\":\"$AT_REST_ROTATED_API_KEY\"}"
+check "200" "10b: PATCH vault_endpoints.api_key"
+STORED_ROTATED_API_KEY=$(sqlite3 "$DB_PATH" "SELECT api_key FROM vault_endpoints WHERE name = 'at-rest-cipher-vault';")
+check_matches "$STORED_ROTATED_API_KEY" '^v1\.xchacha20poly1305\.[0-9a-f]{48}\.[0-9a-f]+$' \
+    "10b: updated vault_endpoints.api_key remains XChaCha20-Poly1305 sealed in SQLite"
+if sqlite3 "$DB_PATH" ".dump" | grep -Fq "$AT_REST_ROTATED_API_KEY"; then
+    check_local "plaintext-leaked" "sealed-only" "10b: updated vault_endpoints.api_key plaintext never appears in sqlite3 dump"
+else
+    check_local "sealed-only" "sealed-only" "10b: updated vault_endpoints.api_key plaintext never appears in sqlite3 dump"
+fi
+
+api_call DELETE "/api/vaults/$AT_REST_VAULT_ID" "$MASTER_KEY"
+check "204" "10b: clean up at-rest cipher check vault"
+
+# 3. External Feed SSRF rejection (loopback, cloud metadata 169.254.169.254, non-http scheme).
+api_call POST "/api/sources/test-fetch" "$MASTER_KEY" \
+    '{"source_url":"file:///etc/passwd","parser_type":"REGEX_LINE"}'
+check "200" "10b: test-fetch against file:///etc/passwd returns structured FAILED report"
+check_jq ".status" "FAILED" "10b: file:// scheme is rejected even when ALLOW_PRIVATE_INGEST_URLS_FOR_TEST=true"
+check_true '.error | contains("blocked source URL")' "10b: file:// rejection carries blocked source URL message"
+
+# Boot an isolated production-posture instance (without ALLOW_PRIVATE_INGEST_URLS_FOR_TEST) on an
+# ephemeral port and temporary SQLite DB to verify live SSRF rejection against loopback & IMDSv1/v2.
+SSRF_PORT="$(pick_port 25000 29999 "simply_ip_sync-ssrf")" || exit 1
+SSRF_BASE_URL="http://$BIND_HOST:$SSRF_PORT"
+SSRF_DB_PATH="$WORK_DIR/ssrf_e2e.db"
+SSRF_SERVER_LOG="$WORK_DIR/ssrf_server.log"
+
+DATABASE_URL="sqlite://$SSRF_DB_PATH?mode=rwc" \
+    RUST_LOG=info \
+    INITIAL_MASTER_KEY="$MASTER_KEY" \
+    INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
+    SYNC_ENCRYPTION_KEY="$E2E_ENCRYPTION_KEY" \
+    ALLOW_PRIVATE_INGEST_URLS_FOR_TEST=false \
+    BIND_HOST="$BIND_HOST" \
+    PORT="$SSRF_PORT" \
+    TRUSTED_PROXIES="127.0.0.1/32" \
+    "$BINARY" >"$SSRF_SERVER_LOG" 2>&1 &
+SSRF_SERVER_PID=$!
+
+SSRF_READY=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$SSRF_SERVER_PID" 2>/dev/null; then
+        break
+    fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "$SSRF_BASE_URL/ready" 2>/dev/null)
+    if [[ "$SC" == "200" ]]; then
+        SSRF_READY=1
+        break
+    fi
+    sleep 0.25
+done
+check_local "$SSRF_READY" "1" "10b: isolated SSRF-enforcing instance (ALLOW_PRIVATE_INGEST_URLS_FOR_TEST=false) boots cleanly"
+
+if [[ "$SSRF_READY" -eq 1 ]]; then
+    SAVED_BASE_URL="$BASE_URL"
+    BASE_URL="$SSRF_BASE_URL"
+
+    for ssrf_url in "http://127.0.0.1:$SERVER_PORT/health" "http://169.254.169.254/latest/meta-data/" "http://100.64.0.1/feed.txt" "http://[::1]/feed.txt"; do
+        api_call POST "/api/sources/test-fetch" "$MASTER_KEY" \
+            "{\"source_url\":\"$ssrf_url\",\"parser_type\":\"REGEX_LINE\"}"
+        check "200" "10b: test-fetch against SSRF target $ssrf_url completes without server crash"
+        check_jq ".status" "FAILED" "10b: test-fetch rejects SSRF target $ssrf_url with status=FAILED"
+        check_true '.error | contains("blocked source URL")' "10b: SSRF rejection for $ssrf_url reports blocked source URL"
+    done
+
+    api_call POST "/api/destination-groups" "$MASTER_KEY" \
+        '{"name":"ssrf-blocked-group","cron_schedule":"0 0 * * *","target_group_name":"ssrf-target","mode":"upsert"}'
+    check "200" "10b: create destination group on SSRF-enforcing instance"
+    SSRF_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/destination-groups/$SSRF_GROUP_ID/feeds" "$MASTER_KEY" \
+        "{\"name\":\"ssrf-loopback-feed\",\"source_url\":\"http://127.0.0.1:$SERVER_PORT/health\",\"parser_type\":\"REGEX_LINE\"}"
+    check "200" "10b: register loopback feed on SSRF-enforcing instance"
+
+    api_call POST "/api/destination-groups/$SSRF_GROUP_ID/feeds" "$MASTER_KEY" \
+        '{"name":"ssrf-imds-feed","source_url":"http://169.254.169.254/latest/meta-data/","parser_type":"REGEX_LINE"}'
+    check "200" "10b: register link-local metadata feed on SSRF-enforcing instance"
+
+    api_call POST "/api/destination-groups/$SSRF_GROUP_ID/trigger" "$MASTER_KEY"
+    check "200" "10b: trigger ingestion of SSRF feeds"
+    check_jq ".status" "FAILED" "10b: ingestion job fails closed when all feeds target blocked SSRF addresses"
+    check_jq ".items_processed" "0" "10b: zero items ingested from SSRF-blocked feeds"
+    check_true '.error_message | contains("blocked source URL")' "10b: job summary records blocked source URL reason"
+
+    BASE_URL="$SAVED_BASE_URL"
+fi
+
+if [[ -n "$SSRF_SERVER_PID" ]] && kill -0 "$SSRF_SERVER_PID" 2>/dev/null; then
+    kill -TERM "$SSRF_SERVER_PID" 2>/dev/null || true
+    wait "$SSRF_SERVER_PID" 2>/dev/null || true
+    SSRF_SERVER_PID=""
+fi
+
+# 4. /api/audit-logs inclusive `until` boundary & malformed RFC3339 rejection (400).
+api_call GET "/api/audit-logs?limit=1" "$MASTER_KEY"
+check "200" "10b: fetch latest audit log entry for boundary testing"
+AUDIT_BOUNDARY_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
+AUDIT_BOUNDARY_TS=$(echo "$RESP_BODY" | jq -r '.[0].timestamp')
+
+api_call GET "/api/audit-logs?until=$AUDIT_BOUNDARY_TS&limit=50" "$MASTER_KEY"
+check "200" "10b: GET /api/audit-logs?until=<exact-timestamp> succeeds"
+check_true "any(.[]; .id == \"$AUDIT_BOUNDARY_ID\")" \
+    "10b: /api/audit-logs 'until' boundary is inclusive (<= includes row at exact timestamp)"
+
+api_call GET "/api/audit-logs?since=$AUDIT_BOUNDARY_TS&until=$AUDIT_BOUNDARY_TS" "$MASTER_KEY"
+check "200" "10b: GET /api/audit-logs with identical since & until timestamp succeeds"
+check_true "any(.[]; .id == \"$AUDIT_BOUNDARY_ID\")" \
+    "10b: identical since and until bounds return the row at that exact instant"
+
+api_call GET "/api/audit-logs?until=not-a-valid-rfc3339-timestamp" "$MASTER_KEY"
+check "400" "10b: malformed 'until' timestamp on /api/audit-logs is rejected with 400"
+check_true '.error | contains("invalid until timestamp")' "10b: malformed until error message names field"
+
+api_call GET "/api/audit-logs?since=2026-99-99T99:99:99Z" "$MASTER_KEY"
+check "400" "10b: malformed 'since' timestamp on /api/audit-logs is rejected with 400"
+check_true '.error | contains("invalid since timestamp")' "10b: malformed since error message names field"
+
+# 5. Runtime MasterPin tamper resistance: direct SQLite promotion of a Daughter key while running.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"tamper-daughter-key","can_manage_keys":false,"can_manage_sources":false,"can_manage_vaults":false}'
+check "200" "10b: create unprivileged daughter key for runtime MasterPin tamper test"
+TAMPER_DAUGHTER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+TAMPER_DAUGHTER_SECRET=$(echo "$RESP_BODY" | jq -r '.plaintext_signing_secret')
+TAMPER_DAUGHTER_ID=$(echo "$RESP_BODY" | jq -r '.key.id')
+register_key_secret "$TAMPER_DAUGHTER_KEY" "$TAMPER_DAUGHTER_SECRET"
+
+MASTER_PREFIX="${MASTER_KEY:0:8}"
+# Directly mutate SQLite under the live process: demote real Master first (satisfying the unique
+# index over the generated master_marker column), then mark the Daughter row is_master = 1.
+sqlite3 "$DB_PATH" "UPDATE api_keys SET is_master = 0 WHERE is_master = 1; UPDATE api_keys SET is_master = 1 WHERE name = 'tamper-daughter-key';"
+TAMPER_DB_FLAG=$(sqlite3 "$DB_PATH" "SELECT is_master FROM api_keys WHERE name = 'tamper-daughter-key';")
+check_local "$TAMPER_DB_FLAG" "1" "10b: direct SQLite UPDATE set is_master=1 on tamper-daughter-key row"
+
+# Despite is_master=1 in SQLite, MasterPin (OnceLock pinned at boot) demotes the key in memory.
+api_call GET "/api/auth/me" "$TAMPER_DAUGHTER_KEY"
+check "200" "10b: tampered daughter key still authenticates (no auth oracle)"
+check_jq ".is_master" "false" "10b: MasterPin demotes runtime-promoted daughter key to is_master=false"
+
+api_call GET "/api/audit-logs" "$TAMPER_DAUGHTER_KEY"
+check "403" "10b: runtime-promoted daughter key is STILL rejected (403) on Master-only GET /api/audit-logs without restart"
+
+api_call POST "/api/keys" "$TAMPER_DAUGHTER_KEY" '{"name":"tamper-escalation-attempt","can_manage_keys":true}'
+check "403" "10b: runtime-promoted daughter key is STILL rejected (403) on Master-only scope elevation without restart"
+
+if grep -q "TAMPER: key claims is_master=true" "$SERVER_LOG" 2>/dev/null; then
+    check_local "logged" "logged" "10b: MasterPin logs a TAMPER alert when a non-pinned key claims is_master=true"
+else
+    check_local "missing" "logged" "10b: MasterPin logs a TAMPER alert when a non-pinned key claims is_master=true"
+fi
+
+# Restore the real Master row in SQLite and remove the tamper test key.
+sqlite3 "$DB_PATH" "UPDATE api_keys SET is_master = 0 WHERE name = 'tamper-daughter-key'; UPDATE api_keys SET is_master = 1 WHERE prefix = '$MASTER_PREFIX';"
+api_call GET "/api/auth/me" "$MASTER_KEY"
+check "200" "10b: restored Master key authenticates after SQLite rollback"
+check_jq ".is_master" "true" "10b: restored Master key matches pinned MasterPin identity"
+
+api_call DELETE "/api/keys/$TAMPER_DAUGHTER_ID" "$MASTER_KEY"
+check "204" "10b: clean up tamper-daughter-key"
+
+# ── 11. SQLite text boundaries, write burst, and key ownership ─────────────────
+log_section "11. SQLite text boundaries, write burst, and key ownership"
+
+printf -v LONG_TEXT '%.0sabcdefghij' {1..33}
+LONG_TARGET_URL="http://127.0.0.1:1/vault/$LONG_TEXT"
+LONG_SOURCE_URL="http://127.0.0.1:1/feed/$LONG_TEXT"
+LONG_BOUND_IPS=$(printf '192.0.2.%s/32,' {1..24})
+# Put the actual client address beyond character 300 so truncation also breaks authentication.
+LONG_BOUND_IPS+="127.0.0.1/32"
+
+api_call POST "/api/keys" "$MASTER_KEY" \
+    "{\"name\":\"sqlite-boundary-owner\",\"can_manage_sources\":true,\"can_manage_vaults\":true,\"bound_ips\":\"$LONG_BOUND_IPS\"}"
+check "200" "create the boundary key with a long CIDR list"
+BOUNDARY_KEY_ID=$(jq -r '.key.id' <<< "$RESP_BODY")
+BOUNDARY_KEY=$(jq -r '.plaintext_key' <<< "$RESP_BODY")
+register_key_secret "$BOUNDARY_KEY" "$(jq -r '.plaintext_signing_secret' <<< "$RESP_BODY")"
+
+api_call GET "/api/keys/$BOUNDARY_KEY_ID" "$MASTER_KEY"
+check "200" "read the boundary key from SQLite"
+check_jq '.bound_ips' "$LONG_BOUND_IPS" "api_keys.bound_ips round-trips the complete CIDR list"
+api_call GET "/api/auth/me" "$BOUNDARY_KEY"
+check "200" "authenticate with the CIDR at the end of the stored list"
+
+api_call POST "/api/destination-groups" "$BOUNDARY_KEY" \
+    "{\"name\":\"sqlite-boundary-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"$LONG_TEXT\",\"is_active\":false}"
+check "200" "create an owned group with a long target group name"
+BOUNDARY_GROUP_ID=$(jq -r '.id' <<< "$RESP_BODY")
+BOUNDARY_GROUP_PATH="/api/destination-groups/$BOUNDARY_GROUP_ID"
+
+api_call DELETE "/api/keys/$BOUNDARY_KEY_ID" "$MASTER_KEY"
+check "409" "a destination group alone blocks key deletion"
+check_true ".owned_resources == [{type:\"destination_group\", id:\"$BOUNDARY_GROUP_ID\", name:\"sqlite-boundary-group\", owner_key_id:\"$BOUNDARY_KEY_ID\"}]" \
+    "the ownership inventory identifies the destination group"
+
+api_call POST "$BOUNDARY_GROUP_PATH/feeds" "$MASTER_KEY" \
+    "{\"name\":\"sqlite-boundary-feed\",\"source_url\":\"$LONG_SOURCE_URL\"}"
+check "200" "create a feed with a long source URL"
+BOUNDARY_FEED_ID=$(jq -r '.id' <<< "$RESP_BODY")
+
+api_call GET "$BOUNDARY_GROUP_PATH" "$MASTER_KEY"
+check "200" "read the boundary group and feed from SQLite"
+check_jq '.target_group_name' "$LONG_TEXT" "destination_groups.target_group_name round-trips the complete name"
+check_jq ".feeds[] | select(.id == \"$BOUNDARY_FEED_ID\") | .source_url" "$LONG_SOURCE_URL" \
+    "external_sources.source_url round-trips the complete URL"
+
+api_call POST "/api/vaults" "$BOUNDARY_KEY" \
+    "{\"name\":\"sqlite-boundary-vault\",\"target_url\":\"$LONG_TARGET_URL\",\"api_key\":\"boundary-token\",\"signing_secret\":\"boundary-secret\"}"
+check "200" "create an owned vault endpoint with a long target URL"
+BOUNDARY_VAULT_ID=$(jq -r '.id' <<< "$RESP_BODY")
+api_call GET "/api/vaults/$BOUNDARY_VAULT_ID" "$MASTER_KEY"
+check "200" "read the boundary vault endpoint from SQLite"
+check_jq '.target_url' "$LONG_TARGET_URL" "vault_endpoints.target_url round-trips the complete URL"
+
+check_local "$(sqlite3 "$DB_PATH" "PRAGMA journal_mode;")" "wal" "the daemon database uses SQLite WAL"
+BURST_DIR="$WORK_DIR/sqlite-write-burst"
+mkdir -p "$BURST_DIR"
+BURST_BODY='{"is_active":false}'
+BURST_TIMESTAMPS=()
+BURST_SIGNATURES=()
+BURST_PIDS=()
+# Sign first so curl launches are not paced by openssl. Allocate timestamps in the parent shell.
+for i in {1..20}; do
+    next_timestamp
+    BURST_TIMESTAMPS[$i]="$SIGNED_TS"
+    BURST_SIGNATURES[$i]=$(hmac_sign "$MASTER_SIGNING_SECRET" PATCH "$BOUNDARY_GROUP_PATH" "$SIGNED_TS" "$BURST_BODY")
+done
+BURST_LOG_OFFSET=$(wc -c < "$SERVER_LOG")
+for i in {1..20}; do
+    curl --silent --show-error --max-time 30 --output "$BURST_DIR/body_$i" --write-out '%{http_code}' \
+        -X PATCH -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: ${BURST_TIMESTAMPS[$i]}" \
+        -H "X-Signature-256: ${BURST_SIGNATURES[$i]}" -H 'Content-Type: application/json' \
+        --data-binary "$BURST_BODY" "$BASE_URL$BOUNDARY_GROUP_PATH" > "$BURST_DIR/status_$i" &
+    BURST_PIDS[$i]=$!
+done
+BURST_OK=0
+for i in {1..20}; do
+    if wait "${BURST_PIDS[$i]}" && [[ "$(cat "$BURST_DIR/status_$i")" == "200" ]]; then
+        BURST_OK=$((BURST_OK + 1))
+    else
+        warn "SQLite write burst request $i returned HTTP $(cat "$BURST_DIR/status_$i")"
+    fi
+done
+check_local "$BURST_OK" "20" "all 20 concurrent authenticated writes return 200"
+tail -c "+$((BURST_LOG_OFFSET + 1))" "$SERVER_LOG" > "$BURST_DIR/server.log"
+BURST_LOCK_ERRORS=0
+if grep -Ei 'database.*(locked|busy)|SQLITE_(BUSY|LOCKED)' "$BURST_DIR"/body_* "$BURST_DIR/server.log"; then
+    BURST_LOCK_ERRORS=1
+fi
+check_local "$BURST_LOCK_ERRORS" "0" "the burst produces zero SQLite lock errors in responses or server logs"
+
+api_call DELETE "$BOUNDARY_GROUP_PATH/feeds/$BOUNDARY_FEED_ID" "$MASTER_KEY"
+check "204" "delete the boundary feed"
+api_call DELETE "$BOUNDARY_GROUP_PATH" "$MASTER_KEY"
+check "204" "delete the boundary destination group"
+
+api_call DELETE "/api/keys/$BOUNDARY_KEY_ID" "$MASTER_KEY"
+check "409" "a vault endpoint alone blocks key deletion after group cleanup"
+check_true ".owned_resources == [{type:\"vault_endpoint\", id:\"$BOUNDARY_VAULT_ID\", name:\"sqlite-boundary-vault\", owner_key_id:\"$BOUNDARY_KEY_ID\"}]" \
+    "the ownership inventory identifies only the remaining vault endpoint"
+api_call DELETE "/api/vaults/$BOUNDARY_VAULT_ID" "$MASTER_KEY"
+check "204" "delete the boundary vault endpoint"
+api_call DELETE "/api/keys/$BOUNDARY_KEY_ID" "$MASTER_KEY"
+check "204" "delete the boundary key after all owned resources are removed"
+
+# ── 12. Graceful shutdown ────────────────────────────────────────────────────
+log_section "12. Graceful shutdown"
 
 log "Sending SIGTERM to pid $SERVER_PID and waiting for exit..."
 kill -TERM "$SERVER_PID" 2>/dev/null || true

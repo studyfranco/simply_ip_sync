@@ -1,7 +1,7 @@
 //! Transparent ZIP decompression for fetched feed bodies, plus decompression-bomb protection for
 //! both that and the HTTP layer's own transparent `Content-Encoding` decoding.
 //!
-//! Some feeds (e.g. StopForumSpam's downloads) are distributed as a `.zip` archive containing a
+//! Some feeds (e.g. `StopForumSpam`'s downloads) are distributed as a `.zip` archive containing a
 //! single plain-text or JSON member. This is an ingestion-layer concern, not a parser concern:
 //! [`FeedParser::parse`](crate::parsers::FeedParser::parse) always receives already-decompressed
 //! bytes, so any parser type (`REGEX_LINE`, `JSON_PATH`, future formats) transparently gains ZIP
@@ -48,6 +48,7 @@ const ZIP_LOCAL_HEADER_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
 const ZIP_EMPTY_ARCHIVE_MAGIC: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
 
 /// True if `bytes` begins with a ZIP archive signature.
+#[must_use]
 pub fn is_zip(bytes: &[u8]) -> bool {
     bytes.len() >= 4
         && (bytes[..4] == ZIP_LOCAL_HEADER_MAGIC || bytes[..4] == ZIP_EMPTY_ARCHIVE_MAGIC)
@@ -64,6 +65,11 @@ pub fn is_zip(bytes: &[u8]) -> bool {
 /// limit in aggregate) — so a member whose true decompressed size vastly exceeds the archive's own
 /// compressed size (the defining shape of a ZIP bomb) is caught after reading at most
 /// `max_decompressed_bytes + 1` bytes of it, never after decompressing it in full.
+///
+/// # Errors
+///
+/// Returns [`DecompressError`] if the ZIP archive is malformed, empty, unreadable, or exceeds
+/// `max_decompressed_bytes`.
 pub fn decompress_if_zip(
     bytes: &[u8],
     max_decompressed_bytes: u64,
@@ -120,6 +126,10 @@ pub fn decompress_if_zip(
 /// time `bytes()` returns, an arbitrarily large payload would already be fully decompressed and
 /// resident in memory. `Response::chunk()` polls that same post-decompression stream one piece at
 /// a time, which is what lets this function reject the payload mid-stream instead.
+///
+/// # Errors
+///
+/// Returns [`DecompressError`] on stream read error or when `max_bytes` is exceeded.
 pub async fn read_capped_body(
     mut response: reqwest::Response,
     max_bytes: u64,

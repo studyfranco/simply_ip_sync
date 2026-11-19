@@ -3,7 +3,7 @@
 //!
 //! Must not hold freshness/skew policy — that lives in `middleware.rs`, which decides the window
 //! length and only calls [`ReplayGuard::check_and_record`] after signature verification has
-//! already succeeded (recording an unverified digest would be a pre-insertion DoS vector against
+//! already succeeded (recording an unverified digest would be a pre-insertion `DoS` vector against
 //! the legitimate client).
 
 use std::collections::HashMap;
@@ -47,11 +47,19 @@ pub struct ReplayGuard {
     capacity_backoff: Duration,
 }
 
+/// Tracking TTL covering the full signed freshness window (`max_age + skew`, i.e. `2 * ±300s`).
+/// Because `middleware.rs` accepts requests up to `+MAX_TIMESTAMP_SKEW_SECS` in the future and down
+/// to `-MAX_TIMESTAMP_SKEW_SECS` in the past, a signature minted at `+300s` remains valid for 600s
+/// of wall-clock time; keeping `TTL >= max_age + skew` ensures it cannot be replayed near the end
+/// of that window.
+pub const REPLAY_WINDOW_SECS: i64 = crate::crypto::MAX_TIMESTAMP_SKEW_SECS * 2;
+
 impl ReplayGuard {
     /// Builds a guard with the given freshness window, clamped to `[1, 3600]` seconds.
     #[must_use]
     pub fn new(window_secs: i64) -> Self {
-        let window = Duration::from_secs(window_secs.clamp(1, 3600) as u64);
+        let clamped = u64::try_from(window_secs.clamp(1, 3600)).unwrap_or(1);
+        let window = Duration::from_secs(clamped);
         let prune_interval = window / PRUNE_INTERVAL_DIVISOR;
         let capacity_backoff = window / CAPACITY_BACKOFF_DIVISOR;
         let now = Instant::now();
@@ -104,15 +112,14 @@ impl ReplayGuard {
 
     #[cfg(test)]
     fn tracked(&self) -> usize {
-        self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
+        self.seen.lock().map_or(0, |seen| seen.len())
     }
 
     fn prune_if_due(&self, now: Instant) {
         let over_capacity = self
             .seen
             .lock()
-            .map(|seen| seen.len() >= MAX_TRACKED_SIGNATURES)
-            .unwrap_or(false);
+            .is_ok_and(|seen| seen.len() >= MAX_TRACKED_SIGNATURES);
 
         {
             let Ok(mut schedule) = self.schedule.lock() else {
@@ -146,7 +153,7 @@ impl ReplayGuard {
 
 impl Default for ReplayGuard {
     fn default() -> Self {
-        Self::new(crate::crypto::MAX_TIMESTAMP_SKEW_SECS)
+        Self::new(REPLAY_WINDOW_SECS)
     }
 }
 
@@ -180,5 +187,19 @@ mod tests {
         assert_eq!(guard.tracked(), 1);
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(guard.check_and_record(key_id, &digest));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_window_covers_full_skew_and_max_age() {
+        const { assert!(REPLAY_WINDOW_SECS >= crate::crypto::MAX_TIMESTAMP_SKEW_SECS * 2) };
+        let guard = ReplayGuard::default();
+        let key_id = Uuid::new_v4();
+        let digest = vec![7, 8, 9];
+        assert!(guard.check_and_record(key_id, &digest));
+        tokio::time::advance(Duration::from_secs(350)).await;
+        assert!(
+            !guard.check_and_record(key_id, &digest),
+            "signature must remain tracked past 300s (max_age + skew)"
+        );
     }
 }

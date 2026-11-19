@@ -65,6 +65,7 @@ pub const MAX_BATCH_SIZE: usize = 5_000;
 
 /// Splits `items` into chunks of at most `max` elements. An empty input yields no chunks (not one
 /// empty chunk).
+#[must_use]
 pub fn chunk_records<T>(items: Vec<T>, max: usize) -> Vec<Vec<T>> {
     let mut iter = items.into_iter();
     let mut chunks = Vec::new();
@@ -89,6 +90,7 @@ pub fn chunk_records<T>(items: Vec<T>, max: usize) -> Vec<Vec<T>> {
 /// that rule is expressed, called identically by `external_ingestion.rs` and `vault_sync.rs`, and
 /// mirrored inside `client::post_batch` for the sub-chunks a `413` response splits a single chunk
 /// into.
+#[must_use]
 pub fn mode_for_chunk_index(
     base_mode: crate::client::BatchMode,
     chunk_index: usize,
@@ -116,6 +118,10 @@ pub struct JobSummary {
 }
 
 /// Writes one `sync_logs` row for a completed job execution.
+///
+/// # Errors
+///
+/// Returns `DbErr` if inserting the log entry fails.
 pub async fn write_sync_log<C: sea_orm::ConnectionTrait>(
     db: &C,
     job_type: &str,

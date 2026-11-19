@@ -1,284 +1,1382 @@
-//! Properties of `static/app.js` that nothing else in the build pipeline checks.
-//!
-//! `static/` is served straight off disk by `ServeDir` (`lib.rs`) and is never compiled, linted,
-//! or executed by anything else in this repository — `cargo check`, `cargo clippy`, and every
-//! HTTP-level integration test in `tests/` all exercise the API and never parse the file they're
-//! serving. A syntax error, or a `document.getElementById("typo-id")` referencing an element that
-//! doesn't exist, is invisible to all of them and only surfaces when a human opens the dashboard.
+//! Repository policy checks for the Cargo manifest, Rust sources, and dashboard.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use oxc_allocator::Allocator;
-use oxc_parser::Parser;
+use oxc_parser::{Parser, config::TokensParserConfig};
 use oxc_span::SourceType;
 use regex::Regex;
 
-/// Resolves a path relative to the crate root, independent of `cargo test`'s working directory.
+fn regex(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("valid policy regex")
+}
+
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
 fn read(relative: &str) -> String {
-    std::fs::read_to_string(repo_path(relative)).unwrap_or_else(|e| panic!("{relative} must be readable: {e}"))
+    std::fs::read_to_string(repo_path(relative))
+        .unwrap_or_else(|e| panic!("{relative} must be readable: {e}"))
 }
 
-/// Parses one file as a classic (non-module) script — `app.js` is loaded with a plain `<script>`
-/// tag, so `import`/`export` the browser would reject here must be rejected here too — and
-/// returns its syntax errors, each rendered as `path:line:col message`.
+fn files_under(directory: &str, recursive: bool) -> Vec<PathBuf> {
+    fn visit(directory: &Path, recursive: bool, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("read policy directory") {
+            let entry = entry.expect("read directory entry");
+            let kind = entry.file_type().expect("read directory entry type");
+            if kind.is_dir() && recursive {
+                visit(&entry.path(), true, files);
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+
+    let root = repo_path("");
+    let mut files = Vec::new();
+    visit(&root.join(directory), recursive, &mut files);
+    for file in &mut files {
+        *file = file
+            .strip_prefix(&root)
+            .expect("repository file")
+            .to_owned();
+    }
+    files.sort();
+    files
+}
+
+fn rust_files(directory: &str) -> impl Iterator<Item = PathBuf> {
+    files_under(directory, true)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+}
+
+// Cargo validates the document before running this test. Read the policy keys
+// from TOML tokens so comments, quoted keys, and multiline arrays are handled.
+fn manifest_tokens(source: &str) -> Vec<&str> {
+    static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+        regex(concat!(
+            r#"(?s)"""(?:\\.|.)*?""""{0,2}|'''.*?'''\x27{0,2}"#,
+            r#"|"(?:\\.|[^"\\])*"|'[^']*'|\#[^\n]*|\n|[^\s\[\]{}.,="'#]+|[\[\]{}.,=]"#
+        ))
+    });
+    TOKEN
+        .find_iter(source)
+        .map(|token| token.as_str())
+        .filter(|token| !token.starts_with('#'))
+        .collect()
+}
+
+fn toml_text(token: &str) -> String {
+    if token.starts_with('"') {
+        serde_json::from_str(token).unwrap_or_else(|_| token.to_owned())
+    } else {
+        token.trim_matches('\'').to_owned()
+    }
+}
+
+fn value_end(tokens: &[&str], separators: &[&str]) -> usize {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        if depth == 0 && separators.contains(token) {
+            return index;
+        }
+        match *token {
+            "[" | "{" | "(" => depth += 1,
+            "]" | "}" | ")" => depth -= 1,
+            token if token.starts_with('`') && token.ends_with("${") => depth += 1,
+            token if token.starts_with('}') && token.ends_with('`') => depth -= 1,
+            _ => (),
+        }
+    }
+    tokens.len()
+}
+
+fn toml_path(tokens: &[&str]) -> impl Iterator<Item = String> {
+    tokens
+        .iter()
+        .filter(|token| **token != ".")
+        .map(|token| toml_text(token))
+}
+
+fn manifest_values<'a>(tokens: &'a [&'a str]) -> BTreeMap<Vec<String>, &'a [&'a str]> {
+    fn insert_values<'a>(
+        mut tokens: &'a [&'a str],
+        prefix: &[String],
+        separators: &[&str],
+        values: &mut BTreeMap<Vec<String>, &'a [&'a str]>,
+    ) {
+        let mut prefix = prefix.to_vec();
+        while let Some((first, rest)) = tokens.split_first() {
+            if separators.contains(first) || *first == "\n" {
+                tokens = rest;
+            } else if *first == "[" {
+                let end = rest
+                    .iter()
+                    .position(|token| *token == "\n")
+                    .unwrap_or(rest.len());
+                let header = &rest[..end];
+                prefix = if header.first() == Some(&"[") {
+                    // An array of tables cannot declare a manifest policy key.
+                    vec!["[[".to_owned()]
+                } else {
+                    toml_path(&header[..header.len() - 1]).collect()
+                };
+                tokens = &rest[end..];
+            } else {
+                let equals = tokens
+                    .iter()
+                    .position(|token| *token == "=")
+                    .expect("TOML assignment");
+                let key: Vec<_> = prefix
+                    .iter()
+                    .cloned()
+                    .chain(toml_path(&tokens[..equals]))
+                    .collect();
+                let tail = &tokens[equals + 1..];
+                let end = value_end(tail, separators);
+                let value = &tail[..end];
+                values.insert(key.clone(), value);
+                if let ["{", fields @ .., "}"] = value {
+                    insert_values(fields, &key, &[","], values);
+                }
+                tokens = &tail[end..];
+            }
+        }
+    }
+
+    let mut values = BTreeMap::new();
+    insert_values(tokens, &[], &["\n"], &mut values);
+    values
+}
+
+fn manifest_policy(source: &str) -> Vec<String> {
+    let tokens = manifest_tokens(source);
+    let values = manifest_values(&tokens);
+    let get = |path: &[&str]| {
+        values
+            .get(&path.iter().map(ToString::to_string).collect::<Vec<_>>())
+            .copied()
+    };
+    let level = |value: Option<&[&str]>| match value {
+        Some([token]) => toml_text(token),
+        _ => String::new(),
+    };
+    let lint_level = |lint| {
+        level(get(&["lints", "clippy", lint, "level"]).or_else(|| get(&["lints", "clippy", lint])))
+    };
+    let mut violations = Vec::new();
+    if level(get(&["package", "edition"])) != "2024" {
+        violations.push("package.edition must be 2024".to_owned());
+    }
+    if get(&["package", "rust-version"]).is_some() {
+        violations.push("package.rust-version must be absent".to_owned());
+    }
+    if level(
+        get(&["lints", "rust", "unsafe_code", "level"])
+            .or_else(|| get(&["lints", "rust", "unsafe_code"])),
+    ) != "forbid"
+    {
+        violations.push("lints.rust.unsafe_code must be forbid".to_owned());
+    }
+    for (lint, priority) in [("all", "-2"), ("pedantic", "-1")] {
+        if lint_level(lint) != "warn" {
+            violations.push(format!("lints.clippy.{lint} must be warn"));
+        }
+        if level(get(&["lints", "clippy", lint, "priority"])) != priority {
+            violations.push(format!("lints.clippy.{lint} must have priority {priority}"));
+        }
+    }
+    for key in values.keys() {
+        if let [lints, clippy, lint] | [lints, clippy, lint, _] = key.as_slice()
+            && lints == "lints"
+            && clippy == "clippy"
+            && (key.len() == 3 || get(&["lints", "clippy", lint]).is_none())
+            && lint_level(lint) == "allow"
+        {
+            violations.push(format!("lints.clippy.{lint} must not be allow"));
+        }
+    }
+    let sqlx_features = |dependency| -> BTreeSet<_> {
+        get(&["dependencies", dependency, "features"])
+            .into_iter()
+            .flatten()
+            .map(|token| toml_text(token))
+            .filter(|feature| feature.starts_with("sqlx-"))
+            .collect()
+    };
+    let orm = sqlx_features("sea-orm");
+    let migration = sqlx_features("sea-orm-migration");
+    for feature in orm.difference(&migration) {
+        violations.push(format!("sea-orm-migration is missing {feature}"));
+    }
+    for feature in migration.difference(&orm) {
+        violations.push(format!("sea-orm is missing {feature}"));
+    }
+    violations
+}
+
+#[test]
+fn cargo_manifest_enforces_ecosystem_policy() {
+    let violations = manifest_policy(&read("Cargo.toml"));
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn manifest_policy_rejects_drift() {
+    let manifest = r#"
+        [package]
+        edition = '2024' # A comment is not a key.
+        [lints.rust]
+        unsafe_code = "forbid"
+        [lints.clippy]
+        all = { priority = -2, level = 'warn' }
+        pedantic = { level = "warn", priority = -1 }
+        [dependencies.sea-orm]
+        features = ["sqlx-sqlite", # Keep database support in sync.
+            "sqlx-postgres"]
+        [dependencies]
+        sea-orm-migration = { features = ['sqlx-postgres', 'sqlx-sqlite'] }
+    "#;
+    assert!(manifest_policy(manifest).is_empty());
+    for (before, after, diagnostic) in [
+        ("'2024'", "'2021'", "package.edition"),
+        (
+            "'2024'",
+            "'2024'\nrust-version = '1.95'",
+            "package.rust-version",
+        ),
+        ("forbid", "warn", "unsafe_code"),
+        ("level = 'warn'", "level = 'allow'", "clippy.all"),
+        ("priority = -2", "priority = 0", "clippy.all"),
+        ("priority = -1", "priority = 0", "clippy.pedantic"),
+        (
+            "level = \"warn\", priority = -1",
+            "level = \"deny\", priority = -1",
+            "clippy.pedantic",
+        ),
+        (
+            "[dependencies.sea-orm]",
+            "needless_pass_by_value.level = 'allow'\n[dependencies.sea-orm]",
+            "clippy.needless_pass_by_value",
+        ),
+        ("'sqlx-sqlite'", "'with-uuid'", "missing sqlx-sqlite"),
+    ] {
+        let violations = manifest_policy(&manifest.replace(before, after));
+        assert!(
+            violations.iter().any(|error| error.contains(diagnostic)),
+            "{violations:?}"
+        );
+    }
+}
+
+struct RustSource<'a> {
+    code: String,
+    strings: Vec<(Range<usize>, &'a str)>,
+}
+
+fn quoted_end(bytes: &[u8], quote: u8) -> usize {
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte == quote => return index + 1,
+            b'\\' => index += 2,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn block_comment_end(bytes: &[u8]) -> usize {
+    let mut depth = 1;
+    let mut index = 2;
+    while depth > 0 && index + 1 < bytes.len() {
+        match &bytes[index..index + 2] {
+            b"/*" => {
+                depth += 1;
+                index += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                index += 2;
+            }
+            _ => index += 1,
+        }
+    }
+    if depth == 0 { index } else { bytes.len() }
+}
+
+fn rust_source(source: &str) -> RustSource<'_> {
+    static RAW_OPENING: LazyLock<Regex> = LazyLock::new(|| regex(r#"^(?:br|cr|r)(#*)""#));
+    static CHARACTER: LazyLock<Regex> =
+        LazyLock::new(|| regex(r"^'(?:[^'\\\r\n]|\\(?:u\{[\da-fA-F_]+\}|x[\da-fA-F]{2}|.))'"));
+    let bytes = source.as_bytes();
+    let mut code = bytes.to_vec();
+    let mut strings = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let tail = &bytes[index..];
+        let mut content = None;
+        let length = match tail {
+            [b'/', b'/', ..] => tail
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(tail.len()),
+            [b'/', b'*', ..] => block_comment_end(tail),
+            [b'"', ..] => {
+                let end = quoted_end(tail, b'"');
+                content = Some(1..end.saturating_sub(1).max(1));
+                end
+            }
+            [b'\'', ..] => CHARACTER.find(&source[index..]).map_or(0, |m| m.end()),
+            [b'r' | b'b' | b'c', ..]
+                if index == 0
+                    || !matches!(bytes[index - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | 128..=255) =>
+            {
+                RAW_OPENING.captures(&source[index..]).map_or(0, |opening| {
+                    let start = opening.get(0).expect("raw opening").end();
+                    let delimiter = format!("\"{}", &opening[1]);
+                    let end = source[index + start..]
+                        .find(&delimiter)
+                        .map_or(tail.len(), |offset| start + offset);
+                    content = Some(start..end);
+                    (end + delimiter.len()).min(tail.len())
+                })
+            }
+            _ => 0,
+        };
+        if length == 0 {
+            index += 1;
+            continue;
+        }
+        let span = index..index + length;
+        if let Some(content) = content {
+            strings.push((
+                span.clone(),
+                &source[index + content.start..index + content.end],
+            ));
+        }
+        for byte in &mut code[span] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        if tail[0] == b'\'' {
+            // Keep a placeholder for a character token while hiding its contents.
+            code[index] = b'_';
+        }
+        index += length;
+    }
+    RustSource {
+        code: String::from_utf8(code).expect("source masking preserves UTF-8"),
+        strings,
+    }
+}
+
+fn closing_delimiter(code: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
+    let mut depth = 0;
+    for (index, byte) in code.bytes().enumerate().skip(open) {
+        if byte == opening {
+            depth += 1;
+        }
+        if byte == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn test_module_offset(rust: &RustSource<'_>) -> Result<Option<usize>, &'static str> {
+    static CFG_TEST: LazyLock<Regex> =
+        LazyLock::new(|| regex(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]"));
+    static MODULE: LazyLock<Regex> = LazyLock::new(|| regex(r"^\s*mod\s+tests\s*\{"));
+    let code = &rust.code;
+    let mut depth = 0;
+    let mut previous = 0;
+    for cfg in CFG_TEST.find_iter(code) {
+        for byte in code[previous..cfg.start()].bytes() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => (),
+            }
+        }
+        previous = cfg.end();
+        if depth != 0 {
+            continue;
+        }
+        let module = MODULE
+            .find(&code[cfg.end()..])
+            .ok_or("top-level cfg(test) must precede mod tests")?;
+        let close = closing_delimiter(code, cfg.end() + module.end() - 1, b'{', b'}')
+            .ok_or("mod tests has no closing brace")?;
+        if !code[close + 1..].trim().is_empty()
+            || rust.strings.iter().any(|(span, _)| span.start > close)
+        {
+            return Err("only comments and whitespace may follow mod tests");
+        }
+        return Ok(Some(cfg.start()));
+    }
+    Ok(None)
+}
+
+#[test]
+fn every_source_file_places_its_test_module_last() {
+    for path in rust_files("src") {
+        let source = read(path.to_str().expect("UTF-8 path"));
+        if let Err(error) = test_module_offset(&rust_source(&source)) {
+            panic!("{}: {error}", path.display());
+        }
+    }
+}
+
+#[test]
+fn test_module_check_rejects_misplaced_tests() {
+    for source in [
+        "#[cfg(test)] fn test_helper() {}",
+        "#[cfg(test)] mod tests { fn f() {} } fn production() {}",
+        "#[cfg(test)] mod tests { fn missing_closing_brace() {}",
+        "#[cfg(test)] mod tests {} \"trailing literal\"",
+        "#[cfg(test)] mod tests {} 'x'",
+    ] {
+        assert!(
+            test_module_offset(&rust_source(source)).is_err(),
+            "{source}"
+        );
+    }
+    let source = r##"fn production() {} #[cfg(test)] mod tests { const TEXT: &str = r#"}"#; /* { /* } */ { */ } // }"##;
+    assert_eq!(
+        test_module_offset(&rust_source(source)),
+        Ok(source.find("#[cfg(test)]"))
+    );
+}
+
+fn entity_model_with_bool_fields(code: &str, attributes: &str) -> bool {
+    static DERIVE: LazyLock<Regex> =
+        LazyLock::new(|| regex(r"#\s*\[\s*derive\s*\([^)]*\bDeriveEntityModel\s*[,)]"));
+    static MODEL: LazyLock<Regex> = LazyLock::new(|| regex(r"^\s*pub\s+struct\s+Model\s*\{"));
+    static BOOL_FIELD: LazyLock<Regex> = LazyLock::new(|| regex(r"\b\w+\s*:\s*bool\s*(?:,|$)"));
+    if !DERIVE.is_match(attributes) {
+        return false;
+    }
+    let Some(model) = MODEL.find(code) else {
+        return false;
+    };
+    let Some(end) = closing_delimiter(code, model.end() - 1, b'{', b'}') else {
+        return false;
+    };
+    BOOL_FIELD.find_iter(&code[model.end()..end]).count() >= 4
+}
+
+const ENTITY_EXPECT_REASON: &str =
+    "SeaORM DeriveEntityModel requires flat 1:1 fields for SQL BOOLEAN columns";
+
+fn lint_attribute_violations(path: &Path, rust: &RustSource<'_>) -> Vec<usize> {
+    static ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| regex(r"#\s*(!\s*)?\["));
+    static LINT: LazyLock<Regex> = LazyLock::new(|| {
+        regex(concat!(
+            r"\b(",
+            "allow",
+            "|",
+            "expect",
+            "|warn|deny|forbid",
+            r")\s*\(([^)]*)\)"
+        ))
+    });
+    static EXPECTED: LazyLock<Regex> = LazyLock::new(|| {
+        regex(concat!(
+            r"^\s*clippy",
+            r"\s*::\s*struct_excessive_bools\s*,\s*reason\s*(=)\s*,?\s*$"
+        ))
+    });
+    let code = &rust.code;
+    let attributes: Vec<_> = ATTRIBUTE
+        .captures_iter(code)
+        .filter_map(|capture| {
+            let header = capture.get(0)?;
+            let end = closing_delimiter(code, header.end() - 1, b'[', b']')?;
+            Some((
+                header.start()..end + 1,
+                header.end()..end,
+                capture.get(1).is_some(),
+            ))
+        })
+        .collect();
+    let mut violations = Vec::new();
+    for (index, (span, body, inner)) in attributes.iter().enumerate() {
+        let contents = &code[body.clone()];
+        let Some(lint) = LINT.captures(contents) else {
+            continue;
+        };
+        let direct = contents.trim() == &lint[0];
+        if !direct && !contents.trim_start().starts_with("cfg_attr") {
+            continue;
+        }
+        let mut start = span.start;
+        let mut end = span.end;
+        for (previous, _, _) in attributes[..index].iter().rev() {
+            if previous.end > start || !code[previous.end..start].trim().is_empty() {
+                break;
+            }
+            start = previous.start;
+        }
+        for (following, _, _) in &attributes[index + 1..] {
+            if following.start < end || !code[end..following.start].trim().is_empty() {
+                break;
+            }
+            end = following.end;
+        }
+        let arguments = lint.get(2).expect("lint arguments");
+        let valid_reason = EXPECTED
+            .captures(arguments.as_str())
+            .is_some_and(|expected| {
+                let equals = expected.get(1).expect("reason assignment").end();
+                let reason_start = body.start + arguments.start() + equals;
+                let reason_end = body.start + arguments.end();
+                let mut reasons = rust
+                    .strings
+                    .iter()
+                    .filter(|(span, _)| span.start >= reason_start && span.end <= reason_end);
+                reasons
+                    .next()
+                    .is_some_and(|(_, text)| *text == ENTITY_EXPECT_REASON)
+                    && reasons.next().is_none()
+            });
+        if path.parent() != Some(Path::new("src/entities"))
+            || *inner
+            || !direct
+            || &lint[1] != "expect"
+            || !valid_reason
+            || !entity_model_with_bool_fields(&code[end..], &code[start..end])
+        {
+            violations.push(span.start);
+        }
+    }
+    violations
+}
+
+#[test]
+fn rust_sources_only_use_the_entity_lint_expectation() {
+    for path in rust_files("src").chain(rust_files("tests")) {
+        let source = read(path.to_str().expect("UTF-8 path"));
+        let violations = lint_attribute_violations(&path, &rust_source(&source));
+        assert!(
+            violations.is_empty(),
+            "{}: forbidden lint attributes at byte offsets {violations:?}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn lint_policy_rejects_attributes_outside_the_entity_exception() {
+    let permitted = format!(
+        concat!(
+            "#[derive(Debug, DeriveEntityModel)]\n",
+            "#[",
+            "expect(clippy::",
+            "struct_excessive_bools, reason = {:?})]\n",
+            "pub struct Model {{ a: bool, b: bool, c: bool, d: bool }}",
+        ),
+        ENTITY_EXPECT_REASON
+    );
+    let entity = Path::new("src/entities/example.rs");
+    assert!(lint_attribute_violations(entity, &rust_source(&permitted)).is_empty());
+    for path in [
+        "src/api/example.rs",
+        "tests/example.rs",
+        "src/entities/nested/example.rs",
+    ] {
+        assert!(!lint_attribute_violations(Path::new(path), &rust_source(&permitted)).is_empty());
+    }
+    for source in [
+        concat!("#[", "allow(clippy::", "all)] fn f() {}").to_owned(),
+        concat!("#![", "allow(clippy::", "all)]").to_owned(),
+        concat!("#![", "allow(dead_code)]").to_owned(),
+        concat!("#![", "expect(clippy::", "all)]").to_owned(),
+        concat!("#[cfg_attr(test, ", "allow(clippy::", "all))] fn f() {}").to_owned(),
+        permitted.replace("pub struct Model", "struct Model"),
+        permitted.replace("struct Model", "struct Other"),
+        permitted.replace("DeriveEntityModel", "Clone"),
+        permitted.replace("d: bool", "d: u8"),
+        permitted.replace(ENTITY_EXPECT_REASON, "different reason"),
+    ] {
+        assert!(
+            !lint_attribute_violations(entity, &rust_source(&source)).is_empty(),
+            "{source}"
+        );
+    }
+}
+
+fn production_code_violations(code: &str) -> Vec<&str> {
+    static FORBIDDEN: LazyLock<Regex> = LazyLock::new(|| {
+        regex(concat!(
+            r"\.\s*(?:unwrap|expect)\s*\(",
+            r"|\b(?:panic|todo|unimplemented|dbg)\s*!\s*[(\[{]",
+            r"|\bunsafe",
+            r"\s*(?:\{|\b(?:fn|impl)\b)",
+        ))
+    });
+    FORBIDDEN.find_iter(code).map(|m| m.as_str()).collect()
+}
+
+#[test]
+fn rust_production_code_is_panic_free_and_safe() {
+    for path in rust_files("src") {
+        let source = read(path.to_str().expect("UTF-8 path"));
+        let rust = rust_source(&source);
+        let end = test_module_offset(&rust)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .unwrap_or(rust.code.len());
+        let violations = production_code_violations(&rust.code[..end]);
+        assert!(
+            violations.is_empty(),
+            "{}: forbidden Rust constructs {violations:?}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn production_check_rejects_panics_and_unsafe_code() {
+    for source in [
+        concat!("value.", "unwrap /* comment */ ()"),
+        concat!("value.", "expect(\"message\")"),
+        concat!("panic", "!(\"message\")"),
+        concat!("todo", "!()"),
+        concat!("unimplemented", "!()"),
+        concat!("dbg", "!(value)"),
+        concat!("unsafe", " { operation(); }"),
+        concat!("unsafe", " fn f() {}"),
+        concat!("unsafe", " impl Trait for Type {}"),
+    ] {
+        assert_eq!(
+            production_code_violations(&rust_source(source).code).len(),
+            1,
+            "{source}"
+        );
+    }
+    let ignored = concat!(
+        "// value.",
+        "unwrap()\n",
+        "/* outer /* ",
+        "panic!() */ ",
+        "todo!() */\n",
+        "let cooked = \"\\\"value.",
+        "expect()\";\n",
+        "let raw = r##\"unsafe",
+        " { } \"#\"##;\n",
+        "let character = '\"'; let label = 'x';",
+    );
+    assert!(production_code_violations(&rust_source(ignored).code).is_empty());
+}
+
+const RAW_SQL_MARKERS: &str = concat!(
+    r"\bStatement",
+    r"\s*::\s*from_\w*\b",
+    r"|\b(?:execute_raw|query_raw|query_one_raw|query_all_raw|execute_unprepared|from_raw_sql)\b",
+    r"|\bExpr",
+    r"\s*::\s*cust\w*\b",
+);
+const SQL_SHAPES: &str = concat!(
+    r"(?is)\b(?:INSERT",
+    r"(?:\s|\\[nrt])+INTO\b|DELETE",
+    r"(?:\s|\\[nrt])+FROM\b",
+    r"|UPDATE",
+    r"\b[^;]*?(?:\b|\\[nrt])SET\b|SELECT",
+    r"\b[^;]*?(?:\b|\\[nrt])FROM\b)",
+    r"|^\s*(?:SELECT\s+|PRAGMA\s+|(?:CREATE|ALTER|DROP)\s+(?:TEMP(?:ORARY)?\s+)?(?:TABLE|INDEX|VIEW|TRIGGER|SCHEMA|DATABASE)\b)",
+);
+const RAW_SQL_ALLOWED: &[&str] = &[];
+
+fn raw_sql_violations<'a>(rust: &'a RustSource<'_>, end: usize) -> Vec<&'a str> {
+    static MARKER: LazyLock<Regex> = LazyLock::new(|| regex(RAW_SQL_MARKERS));
+    static SQL: LazyLock<Regex> = LazyLock::new(|| regex(SQL_SHAPES));
+    let code_matches = MARKER.find_iter(&rust.code[..end]);
+    let string_matches = rust
+        .strings
+        .iter()
+        .take_while(|(span, _)| span.start < end)
+        .filter(|(_, text)| *text != "SELECT 1")
+        .flat_map(|(_, text)| SQL.find_iter(text));
+    code_matches
+        .chain(string_matches)
+        .map(|m| m.as_str())
+        .collect()
+}
+
+fn raw_sql_allowance(path: &str) -> Option<&'static str> {
+    RAW_SQL_ALLOWED.iter().copied().find(|entry| path == *entry)
+}
+
+fn production_raw_sql() -> impl Iterator<Item = (String, Vec<String>)> {
+    rust_files("src").map(|path| {
+        let path = path
+            .iter()
+            .map(|part| part.to_str().expect("UTF-8 path"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let source = read(&path);
+        let rust = rust_source(&source);
+        let violations = raw_sql_violations(&rust, rust.code.len())
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        (path, violations)
+    })
+}
+
+#[test]
+fn source_uses_typed_queries() {
+    for (path, violations) in production_raw_sql() {
+        assert!(
+            violations.is_empty() || raw_sql_allowance(&path).is_some(),
+            "{path}: raw SQL {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn raw_sql_check_rejects_raw_apis_and_sql_literals() {
+    for source in [
+        concat!("Statement::", "from_string(db, query)"),
+        concat!("Statement::", "from_sql_and_values(db, query, values)"),
+        concat!("db.execute_", "raw(statement)"),
+        concat!("db.query_", "raw(statement)"),
+        concat!("db.query_one_", "raw(statement)"),
+        concat!("db.query_all_", "raw(statement)"),
+        concat!("db.execute_", "unprepared(query)"),
+        concat!("Entity::from_", "raw_sql(statement)"),
+        concat!("Expr::", "cust_with_values(query, values)"),
+        concat!("\"insert", " into records values (1)\""),
+        concat!("\"UPDATE", " records\\nSET active = true\""),
+        concat!("r#\"SELECT", " *\nFROM records\"#"),
+        concat!("\"DELETE", " FROM records\""),
+        concat!("\"ALTER", " TABLE records ADD COLUMN active BOOLEAN\""),
+        concat!("\"PRAGMA", " foreign_keys\""),
+        concat!("\"SELECT", " 1 + 1\""),
+    ] {
+        let rust = rust_source(source);
+        assert_eq!(raw_sql_violations(&rust, source.len()).len(), 1, "{source}");
+    }
+    let source = r#""SELECT 1""#;
+    assert!(raw_sql_violations(&rust_source(source), source.len()).is_empty());
+    let source = concat!(
+        "// SELECT",
+        " * FROM records\n\"Statement::",
+        "from_string\""
+    );
+    assert!(raw_sql_violations(&rust_source(source), source.len()).is_empty());
+}
+
 fn syntax_errors(relative: &str, source: &str) -> Vec<String> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
     parsed
         .diagnostics
         .iter()
-        .map(|err| {
-            let offset = (err.labels.first().map_or(0, |span| span.offset()) as usize).min(source.len());
-            let line = source[..offset].matches('\n').count() + 1;
-            let column = offset - source[..offset].rfind('\n').map_or(0, |i| i + 1) + 1;
-            format!("{relative}:{line}:{column}  {}", err.message)
+        .map(|error| {
+            let offset = (error
+                .labels
+                .first()
+                .map_or(0, oxc_span::LabeledSpan::offset) as usize)
+                .min(source.len());
+            let prefix = &source.as_bytes()[..offset];
+            let line = prefix.split(|byte| *byte == b'\n').count();
+            let column = prefix
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(offset + 1, |newline| offset - newline);
+            format!("{relative}:{line}:{column} {error}")
         })
         .collect()
 }
 
-/// `static/app.js` must parse as valid ECMAScript.
 #[test]
-fn app_js_has_no_syntax_errors() {
-    let source = read("static/app.js");
-    let errors = syntax_errors("static/app.js", &source);
-    assert!(
-        errors.is_empty(),
-        "static/app.js has {} syntax error(s) and will not load in a browser:\n  {}",
-        errors.len(),
-        errors.join("\n  ")
-    );
-}
-
-/// The check is only worth having if it actually rejects broken input. A backtick inside a
-/// template literal ends the template early and leaves the rest as bare tokens — feed the parser
-/// exactly that defect and confirm it is reported, so a future refactor that neuters the real
-/// check (wrong path, swallowed diagnostics, an always-true condition) doesn't keep passing
-/// silently.
-#[test]
-fn the_syntax_check_rejects_the_defect_it_exists_to_catch() {
-    let broken = r#"
-        function render(rows) {
-            return rows.map(r => `
-                <span title="${r.address}">
-                    <!-- ` a stray backtick ends the template literal early -->
-                </span>
-            `).join('');
-        }
-    "#;
-    let errors = syntax_errors("<fixture>", broken);
-    assert!(
-        !errors.is_empty(),
-        "a backtick inside a template literal must be reported as a syntax error — if this \
-         passes, the parser is not actually checking anything"
-    );
-}
-
-/// A file that no longer exists would make `read` panic with a path-naming message rather than
-/// silently reporting success against nothing. Cheap insurance against the check being pointed at
-/// a path that no longer exists after a reorganization.
-#[test]
-fn the_checked_file_is_where_the_test_thinks_it_is() {
-    assert!(repo_path("static/app.js").is_file(), "static/app.js not found");
-    assert!(repo_path("static/index.html").is_file(), "static/index.html not found");
-}
-
-/// Every DOM element id `app.js` reaches for via a literal `document.getElementById("...")` call
-/// must actually exist somewhere it could plausibly be found at the moment it's queried — either
-/// statically in `index.html`, or dynamically because `app.js` itself injects an element carrying
-/// that id (via an `innerHTML` template) before immediately querying it in the same function. A
-/// typo'd id doesn't fail to parse, it fails silently at runtime with `null` and a `TypeError` on
-/// the next line, and nothing except opening the page in a browser would ever catch it otherwise.
-#[test]
-fn every_literal_get_element_by_id_reference_exists_somewhere_it_could_be_found() {
-    let app_js = read("static/app.js");
-    let index_html = read("static/index.html");
-
-    // The valid set is the union of ids declared in the static document and ids `app.js`
-    // dynamically injects into it — both are legitimate, and conflating them would either miss
-    // real typos (checking against nothing) or flag every dynamically-created form as broken
-    // (checking against index.html alone, which is what the first version of this test did before
-    // it caught its own overly narrow assumption against `source-form`, `vault-form`, and friends).
-    let mut valid_ids = html_element_ids(&index_html);
-    valid_ids.extend(html_element_ids(&app_js));
-
-    let literal_call = Regex::new(r#"getElementById\(\s*["']([A-Za-z0-9_-]+)["']\s*\)"#).expect("valid regex");
-    let mut missing = Vec::new();
-    let mut checked = HashSet::new();
-    for capture in literal_call.captures_iter(&app_js) {
-        let id = capture[1].to_owned();
-        if checked.insert(id.clone()) && !valid_ids.contains(&id) {
-            missing.push(id);
-        }
+fn dashboard_assets_exist() {
+    for path in ["static/app.js", "static/index.html", "static/style.css"] {
+        assert!(repo_path(path).is_file(), "missing dashboard asset {path}");
     }
-
-    assert!(
-        !checked.is_empty(),
-        "sanity check: the literal-getElementById regex matched nothing in app.js — it is no \
-         longer checking anything (has the call syntax changed?)"
-    );
-    assert!(
-        missing.is_empty(),
-        "app.js calls document.getElementById() with id(s) found neither in index.html nor \
-         dynamically injected by app.js itself: {missing:?}"
-    );
 }
-
-/// Every id `app.js` injects via an `innerHTML` template and then queries in the *same* rendering
-/// function must be spelled identically on both sides — the previous test only proves the id
-/// exists *somewhere* in the file; a copy-paste typo between a template's `id="foo-form"` and a
-/// sibling function's `getElementById("foo−form")` (or similar) would still pass it if the typo
-/// happened to collide with an unrelated real id elsewhere in the file. This test is deliberately
-/// narrower and catches same-function mismatches directly.
-#[test]
-fn dynamically_injected_form_ids_are_queried_with_the_exact_same_spelling() {
-    let app_js = read("static/app.js");
-    let html_ids = html_element_ids(&read("static/index.html"));
-    let js_defined_ids = html_element_ids(&app_js);
-
-    // Every id app.js defines itself (i.e. not already in index.html) must also be referenced by
-    // at least one getElementById call somewhere in the file — an injected element nothing ever
-    // queries again is dead markup, and one queried under a different spelling is exactly the
-    // silent-typo failure mode this whole file exists to catch.
-    let literal_call = Regex::new(r#"getElementById\(\s*["']([A-Za-z0-9_-]+)["']\s*\)"#).expect("valid regex");
-    let queried_ids: HashSet<String> = literal_call.captures_iter(&app_js).map(|c| c[1].to_owned()).collect();
-
-    let dynamically_defined_only: Vec<&String> = js_defined_ids.difference(&html_ids).collect();
-    assert!(!dynamically_defined_only.is_empty(), "sanity check: expected at least one app.js-only id");
-
-    let never_queried: Vec<&&String> =
-        dynamically_defined_only.iter().filter(|id| !queried_ids.contains(id.as_str())).collect();
-    assert!(
-        never_queried.is_empty(),
-        "app.js injects id(s) via innerHTML that no getElementById call ever references: {never_queried:?}"
-    );
-}
-
-/// The one dynamic exception: `document.getElementById("tab-" + tabName)` inside `activateTab()`
-/// builds its id at runtime from a nav button's `data-tab` attribute, so the literal-string check
-/// above cannot see it. Verify the underlying invariant directly instead: every `data-tab="X"`
-/// value present in `index.html` must have a matching `id="tab-X"` panel element, since that's
-/// exactly the pairing the runtime concatenation depends on.
-///
-/// The pinned expression was `getElementById("tab-" + btn.dataset.tab)` until the WebUI was
-/// aligned with the ecosystem's `.tab-btn`/`.tab-panel` convention, which moved the lookup out of
-/// the click handler and into a reusable `activateTab(tabName)` — the concatenation, and therefore
-/// the invariant, is the same; only the variable it reads from changed.
-#[test]
-fn dynamic_tab_panel_id_construction_matches_every_nav_button() {
-    let app_js = read("static/app.js");
-    let index_html = read("static/index.html");
-    let html_ids = html_element_ids(&index_html);
-
-    assert!(
-        app_js.contains(r#"getElementById("tab-" + tabName)"#),
-        "this test pins a specific dynamic id-construction pattern in app.js; if it no longer \
-         appears, the pattern changed and this test (and its rationale) need to be revisited \
-         rather than silently passing on nothing"
-    );
-
-    let data_tab = Regex::new(r#"data-tab="([A-Za-z0-9_-]+)""#).expect("valid regex");
-    let tab_values: HashSet<String> = data_tab.captures_iter(&index_html).map(|c| c[1].to_owned()).collect();
-    assert!(!tab_values.is_empty(), "sanity check: no data-tab attributes found in index.html");
-
-    let missing: Vec<String> =
-        tab_values.iter().filter(|v| !html_ids.contains(&format!("tab-{v}"))).cloned().collect();
-    assert!(
-        missing.is_empty(),
-        "nav buttons reference data-tab value(s) with no matching id=\"tab-<value>\" panel: {missing:?}"
-    );
-}
-
-/// Extracts every `id="..."` attribute value from a raw HTML source string.
-fn html_element_ids(html: &str) -> HashSet<String> {
-    let id_attr = Regex::new(r#"\bid="([A-Za-z0-9_-]+)""#).expect("valid regex");
-    id_attr.captures_iter(html).map(|c| c[1].to_owned()).collect()
-}
-
-// ---------------------------------------------------------------------------------------------
-// Reverse-proxy subpath support — regression coverage for a mechanism nothing else exercises.
-//
-// `app.js` runs only in a browser, and this repository has no JS test runner (`source_hygiene.rs`
-// only *parses* it — see the module doc comment). A behavioural test of `SyncClient` deriving the
-// right base path for a given `window.location.pathname` is therefore not possible here; what
-// *is* checkable without a runtime is the property a regression would actually break: that every
-// outbound request is built through `this.requestBase`/`this.signingBase` rather than a
-// reintroduced hardcoded absolute path. These tests exist to catch exactly that reintroduction —
-// e.g. a future edit that "simplifies" `request()` back to `fetch(path)` — which is precisely the
-// bug this task fixed and precisely the kind of regression a syntax check cannot see.
-// ---------------------------------------------------------------------------------------------
 
 #[test]
-fn sync_client_derives_its_request_base_from_the_page_location_rather_than_a_hardcoded_root() {
-    let app_js = read("static/app.js");
+fn app_js_parses_without_syntax_errors() {
+    let errors = syntax_errors("static/app.js", &read("static/app.js"));
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+#[test]
+fn the_syntax_check_rejects_broken_javascript() {
+    let errors = syntax_errors("fixture.js", "const ok = true;\nconst broken = ;");
     assert!(
-        app_js.contains("static deriveRequestBase()") && app_js.contains("window.location.pathname"),
-        "SyncClient must derive its request base from window.location.pathname, so a dashboard \
-         mounted under a reverse-proxy subpath (e.g. /ip_sync/) needs no build-time configuration"
+        errors
+            .iter()
+            .any(|error| error.starts_with("fixture.js:2:")),
+        "{errors:?}"
     );
 }
 
-/// The signing base must be independently overridable, because the browser cannot discover
-/// whether a reverse proxy strips the mount prefix before forwarding to this service — that is a
-/// fact about the proxy's own configuration, not about where the page happens to be served from.
-#[test]
-fn sync_client_exposes_an_independently_overridable_signing_base() {
-    let app_js = read("static/app.js");
-    assert!(
-        app_js.contains("setApiBaseOverride") && app_js.contains("simply_ip_sync_api_base"),
-        "the signing-base override must exist and persist via localStorage under a stable key, \
-         matching the ecosystem's login-api-base convention"
-    );
+fn js_tokens(source: &str) -> Vec<&str> {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs())
+        .with_config(TokensParserConfig)
+        .parse();
+    parsed
+        .tokens
+        .iter()
+        .map(|token| &source[token.start() as usize..token.end() as usize])
+        .collect()
 }
 
-/// The one and only `fetch()` call in the file must go through `requestBase`, not a bare path —
-/// this is the literal shape of the bug this task fixes: a hardcoded `fetch(\"/api/...\")` (or
-/// `fetch(path)` with no prefix at all) reaches the wrong URL the moment the dashboard is mounted
-/// under a subpath, because the browser resolves a leading-`/` path against the domain root, not
-/// against the page's own directory.
-#[test]
-fn the_one_fetch_call_site_is_prefixed_with_the_derived_request_base() {
-    let app_js = read("static/app.js");
-    let fetch_calls: Vec<&str> = Regex::new(r"fetch\([^)]*\)")
-        .expect("valid regex")
-        .find_iter(&app_js)
-        .map(|m| m.as_str())
+fn quoted_capture<'a>(captures: &regex::Captures<'a>) -> &'a str {
+    captures
+        .iter()
+        .skip(1)
+        .flatten()
+        .next()
+        .expect("quoted value")
+        .as_str()
+}
+
+fn html_ids(source: &str) -> impl Iterator<Item = &str> {
+    static ID: LazyLock<Regex> =
+        LazyLock::new(|| regex(r#"(?:^|[\s<])id\s*=\s*(?:"([^"]+)"|'([^']+)')"#));
+    ID.captures_iter(source)
+        .map(|captures| quoted_capture(&captures))
+        .filter(|id| !id.contains("${"))
+}
+
+fn missing_dom_ids<'a>(html: &'a str, js: &'a str) -> BTreeSet<&'a str> {
+    static ASSIGNED: LazyLock<Regex> =
+        LazyLock::new(|| regex(r#"\.id\s*=\s*(?:"([^"]+)"|'([^']+)'|`([^`]+)`)"#));
+    static LOOKUP: LazyLock<Regex> =
+        LazyLock::new(|| regex(r#"\b(?:el|getElementById)\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)"#));
+    let declared: BTreeSet<_> = html_ids(html)
+        .chain(html_ids(js))
+        .chain(
+            ASSIGNED
+                .captures_iter(js)
+                .map(|captures| quoted_capture(&captures)),
+        )
+        .filter(|id| !id.contains("${"))
         .collect();
-    assert_eq!(fetch_calls.len(), 1, "expected exactly one fetch() call site in app.js: {fetch_calls:?}");
-    assert!(
-        fetch_calls[0].contains("this.requestBase"),
-        "the fetch() call must be prefixed with this.requestBase: {}",
-        fetch_calls[0]
-    );
+    LOOKUP
+        .captures_iter(js)
+        .map(|captures| quoted_capture(&captures))
+        .filter(|id| !id.contains("${") && !declared.contains(id))
+        .collect()
 }
 
-/// Every request signature must cover `this.signingBase`, not a bare path — otherwise the override
-/// field this task added would exist in the DOM but have no effect on what is actually signed.
 #[test]
-fn the_signed_message_includes_the_signing_base() {
-    let app_js = read("static/app.js");
+fn every_get_element_by_id_target_is_declared_in_html_or_rendered_by_js() {
+    let html = read("static/index.html");
+    let js = read("static/app.js");
+    let missing = missing_dom_ids(&html, &js);
     assert!(
-        app_js.contains("${method}\\n${this.signingBase}${path}\\n${timestamp}"),
-        "the CANONICAL_V1 message must be built over this.signingBase, or a reverse proxy that \
-         strips the mount prefix will sign a path the server never actually receives"
+        missing.is_empty(),
+        "DOM lookups have no declared IDs: {missing:?}"
     );
 }
 
-/// `index.html`'s login form must offer the override field `app.js` reads from, and it must be a
-/// plain optional text input (not `required`) — a field an operator must fill in to log in at all
-/// would break every direct, non-proxied deployment, which is the common case this fix must not
-/// regress.
+#[test]
+fn dom_id_check_rejects_missing_single_and_double_quoted_ids() {
+    let js = r#"
+        el('single-el'); el("double-el");
+        document.getElementById('single-get'); document.getElementById("double-get");
+        panel("no"); model('no'); el('${dynamic}');
+        el('html'); el("rendered"); el('assigned');
+        node.innerHTML = `<div id='rendered'></div>`; node.id = "assigned";
+    "#;
+    assert_eq!(
+        missing_dom_ids(r#"<div id="html"></div>"#, js),
+        BTreeSet::from(["single-el", "double-el", "single-get", "double-get"])
+    );
+}
+
+#[test]
+fn rendered_form_ids_are_referenced() {
+    let html = read("static/index.html");
+    let js = read("static/app.js");
+    let static_ids: BTreeSet<_> = html_ids(&html).collect();
+    let lookup = regex(
+        r##"\b(?:getElementById\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)|querySelector\s*\(\s*(?:"#([\w-]+)|'#([\w-]+)))"##,
+    );
+    let queried: BTreeSet<_> = lookup
+        .captures_iter(&js)
+        .map(|capture| quoted_capture(&capture))
+        .collect();
+    let unqueried: BTreeSet<_> = html_ids(&js)
+        .filter(|id| !static_ids.contains(id) && !queried.contains(id))
+        .collect();
+    assert!(
+        unqueried.is_empty(),
+        "unqueried rendered IDs: {unqueried:?}"
+    );
+}
+
+fn missing_tab_panels(html: &str) -> BTreeSet<String> {
+    static TAB: LazyLock<Regex> =
+        LazyLock::new(|| regex(r#"(?:^|\s)data-tab\s*=\s*(?:"([\w-]+)"|'([\w-]+)')"#));
+    let ids: BTreeSet<_> = html_ids(html).collect();
+    TAB.captures_iter(html)
+        .map(|captures| format!("tab-{}", quoted_capture(&captures)))
+        .filter(|panel| !ids.contains(panel.as_str()))
+        .collect()
+}
+
+#[test]
+fn every_tab_button_in_index_html_has_a_matching_panel() {
+    let js = read("static/app.js");
+    let lookup = regex(r#"getElementById\(\s*["']tab-["']\s*\+\s*tabName\s*\)"#);
+    assert!(
+        lookup.is_match(&js),
+        "expected the dynamic tab panel lookup"
+    );
+    let html = read("static/index.html");
+    assert!(html.contains("data-tab="), "expected dashboard tabs");
+    let missing = missing_tab_panels(&html);
+    assert!(missing.is_empty(), "missing tab panels: {missing:?}");
+}
+
+#[test]
+fn tab_pairing_rejects_a_missing_panel() {
+    let html = r#"<button data-tab="keys"></button><button data-tab='rules'></button><div id='tab-rules'></div>"#;
+    assert_eq!(
+        missing_tab_panels(html),
+        BTreeSet::from(["tab-keys".to_owned()])
+    );
+}
+
+fn subpath_violations(js: &str) -> Vec<&'static str> {
+    let mut violations = Vec::new();
+    let fetches = regex(r"\bfetch\s*\(").find_iter(js).count();
+    let prefixed = regex(r"\bfetch\s*\(\s*`\$\{this\.requestBase\}\$\{path\}`\s*,")
+        .find_iter(js)
+        .count();
+    if fetches == 0 || fetches != prefixed {
+        violations.push("fetch URL must interpolate this.requestBase and path");
+    }
+    let expected = [
+        (
+            "this.requestBase = SyncClient.deriveRequestBase()",
+            "derive the request base",
+        ),
+        (
+            "const path = window.location.pathname",
+            "read the dashboard location",
+        ),
+        (
+            "this.signingBase = SyncClient.normalizeBasePath(override)",
+            "initialize an independent signing base",
+        ),
+        (
+            "this.signingBase = normalized",
+            "apply the signing override",
+        ),
+        (
+            r#"localStorage.getItem("simply_ip_sync_api_base")"#,
+            "read the stored override",
+        ),
+        (
+            r#"localStorage.setItem("simply_ip_sync_api_base", normalized)"#,
+            "persist the override",
+        ),
+        (
+            r"encode(`${method}\n${this.signingBase}${path}\n${timestamp}\n`)",
+            "sign the path with the signing base",
+        ),
+        (
+            "concatBytes(message, bodyBytes)",
+            "include the body in the signature",
+        ),
+        (
+            "hmacSha256Hex(this.signingSecret, full)",
+            "sign the encoded message",
+        ),
+    ];
+    violations.extend(
+        expected
+            .into_iter()
+            .filter_map(|(fragment, diagnostic)| (!js.contains(fragment)).then_some(diagnostic)),
+    );
+    violations
+}
+
+#[test]
+fn dashboard_requests_and_signatures_use_independent_bases() {
+    let violations = subpath_violations(&read("static/app.js"));
+    assert!(violations.is_empty(), "{violations:?}");
+}
+
+#[test]
+fn subpath_check_rejects_root_relative_fetches_and_shared_bases() {
+    let js = read("static/app.js");
+    for (original, broken, diagnostic) in [
+        ("`${this.requestBase}${path}`", "'/api/keys'", "fetch URL"),
+        (
+            r"encode(`${method}\n${this.signingBase}${path}",
+            r"encode(`${method}\n${this.requestBase}${path}",
+            "sign the path",
+        ),
+    ] {
+        let violations = subpath_violations(&js.replace(original, broken));
+        assert!(
+            violations.iter().any(|error| error.starts_with(diagnostic)),
+            "{violations:?}"
+        );
+    }
+}
+
+const HTML_TAG_TAIL: &str = r#"(?:[^>"']|"[^"]*"|'[^']*')*>"#;
+
+fn html_attributes(tag: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
+    static ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| {
+        regex(r#"\s+([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?"#)
+    });
+    ATTRIBUTE.captures_iter(tag).map(|attr| {
+        (
+            attr.get(1).expect("attribute name").as_str(),
+            attr.iter()
+                .skip(2)
+                .flatten()
+                .next()
+                .map(|value| value.as_str()),
+        )
+    })
+}
+
 #[test]
 fn login_form_exposes_an_optional_api_base_override_field() {
-    let index_html = read("static/index.html");
-    let input = Regex::new(r#"<input[^>]*id="login-api-base"[^>]*>"#)
-        .expect("valid regex")
-        .find(&index_html)
-        .map(|m| m.as_str().to_owned())
-        .unwrap_or_else(|| panic!("static/index.html must have an #login-api-base input"));
-    assert!(!input.contains("required"), "the API base override must be optional: {input}");
+    let html = read("static/index.html");
+    let input = regex(&format!(r"(?i)<input\b{HTML_TAG_TAIL}"));
+    let field = input
+        .find_iter(&html)
+        .find(|tag| {
+            html_attributes(tag.as_str()).any(|(name, value)| {
+                name.eq_ignore_ascii_case("id") && value == Some("login-api-base")
+            })
+        })
+        .expect("index.html must have an #login-api-base input");
+    assert!(
+        html_attributes(field.as_str()).all(|(name, _)| !name.eq_ignore_ascii_case("required")),
+        "#login-api-base must be optional"
+    );
+}
+
+fn literal_text(token: &str) -> Option<&str> {
+    let first = token.as_bytes().first()?;
+    if matches!(first, b'\'' | b'"' | b'`') {
+        Some(
+            token[1..]
+                .strip_suffix(char::from(*first))
+                .unwrap_or(&token[1..]),
+        )
+    } else {
+        None
+    }
+}
+
+fn key_route(token: &str) -> bool {
+    literal_text(token)
+        .and_then(|path| path.strip_prefix("/api/keys"))
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['/', '?']))
+}
+
+fn master_property(tokens: &[&str]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        let next = tokens.get(index + 1).copied();
+        let previous = index.checked_sub(1).and_then(|i| tokens.get(i)).copied();
+        let property = *token == "is_master" || literal_text(token) == Some("is_master");
+        property
+            && match (previous, next) {
+                (Some("{" | ","), Some(":" | "," | "}")) | (Some("."), Some("=")) => true,
+                (Some("["), Some("]")) => {
+                    tokens.get(index + 2) == Some(&"=") || tokens.get(index + 2) == Some(&":")
+                }
+                _ => false,
+            }
+    })
+}
+
+fn payload_includes_master(tokens: &[&str], payload: &[&str], call: usize) -> bool {
+    if master_property(payload)
+        || payload
+            .windows(2)
+            .any(|pair| pair[0] == "..." && payload_includes_master(tokens, &pair[1..], call))
+        || payload.windows(5).any(|pair| {
+            pair[..4] == ["JSON", ".", "stringify", "("]
+                && payload_includes_master(tokens, &pair[4..], call)
+        })
+    {
+        return true;
+    }
+    let [name] = payload else {
+        return false;
+    };
+    let Some((binding, _)) = tokens[..call]
+        .windows(3)
+        .enumerate()
+        .rev()
+        .find(|(index, window)| {
+            matches!(window[0], "const" | "let" | "var")
+                && window[1] == *name
+                && window[2] == "="
+                && value_end(&tokens[*index..call], &["}"]) == call - index
+        })
+    else {
+        return false;
+    };
+    let initializer = &tokens[binding + 3..call];
+    let end = value_end(initializer, &[";", ","]);
+    let mutations = &initializer[end..];
+    payload_includes_master(tokens, &initializer[..end], binding)
+        || mutations.iter().enumerate().any(|(index, token)| {
+            token == name
+                && match &mutations[index + 1..] {
+                    [".", "is_master", "=", ..] => true,
+                    ["[", key, "]", "=", ..] => literal_text(key) == Some("is_master"),
+                    ["=", rhs @ ..] => {
+                        let start = binding + 3 + end + index + 2;
+                        payload_includes_master(tokens, &rhs[..value_end(rhs, &[";", "}"])], start)
+                    }
+                    _ => false,
+                }
+        })
+}
+
+fn key_payload_violations(js: &str) -> Vec<&str> {
+    let tokens = js_tokens(js);
+    tokens
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, pair)| {
+            let [operation, "("] = pair else {
+                return None;
+            };
+            let args = &tokens[index + 2..];
+            let route_index = match *operation {
+                "post" | "put" | "patch" | "fetch" => 0,
+                "request"
+                    if args
+                        .first()
+                        .and_then(|method| literal_text(method))
+                        .is_some_and(|m| matches!(m, "POST" | "PUT" | "PATCH")) =>
+                {
+                    2
+                }
+                _ => return None,
+            };
+            let route = args.get(route_index)?;
+            if !key_route(route) {
+                return None;
+            }
+            // A template route can contain one or more interpolated expressions.
+            let rest = &args[route_index..];
+            let comma = value_end(rest, &[",", ")"]);
+            if rest.get(comma) != Some(&",") {
+                return None;
+            }
+            let payload = rest.get(comma + 1..)?;
+            let end = value_end(payload, &[",", ")"]);
+            payload_includes_master(&tokens, &payload[..end], index).then_some(*route)
+        })
+        .collect()
+}
+
+#[test]
+fn the_dashboard_never_sends_is_master_in_a_key_payload() {
+    let js = read("static/app.js");
+    let violations = key_payload_violations(&js);
+    assert!(
+        violations.is_empty(),
+        "is_master sent in key payloads: {violations:?}"
+    );
+}
+
+#[test]
+fn key_payload_check_rejects_writing_is_master_but_accepts_reads() {
+    let js = r"
+        client.post('/api/keys', {is_master: me.is_master});
+        const payload = { name: 'updated' };
+        payload['is_master'] = true;
+        client.put(`/api/keys/${existing.id}`, payload);
+        const body = { 'is_master': true };
+        client.patch('/api/keys/example', body);
+        client.post('/api/keys', { ...body });
+        fetch('/api/keys', { method: 'POST', body: JSON.stringify(body) });
+        let replacement = {};
+        replacement = { ['is_master']: true };
+        client.request('PUT', '/api/keys/example', replacement);
+        { const payload = { is_master: true }; client.post('/api/other', payload); }
+        client.post('/api/other', {is_master: true});
+        client.post('/api/keys', { name: existing?.is_master ? 'master' : 'regular' });
+        if (profile.is_master || me.is_master) client.get('/api/keys');
+    ";
+    assert_eq!(key_payload_violations(js).len(), 6);
+}
+
+#[test]
+fn key_payload_check_covers_the_dashboard_create_and_update_forms() {
+    let js = read("static/app.js");
+    for field in [
+        "name: document.getElementById(\"kf-name\").value.trim(),",
+        "bound_ips: document.getElementById(\"kf-bound-ips\").value.trim() }",
+    ] {
+        let broken = js.replace(field, &format!("is_master: true, {field}"));
+        assert_ne!(js, broken, "expected dashboard form field {field}");
+        assert!(!key_payload_violations(&broken).is_empty(), "{field}");
+    }
+}
+
+fn external_url(url: &str) -> bool {
+    let url = url.trim_start().to_ascii_lowercase();
+    ["https://", "http://", "//", "wss://", "ws://"]
+        .iter()
+        .any(|prefix| url.starts_with(prefix))
+}
+
+fn js_external_urls(source: &str) -> Vec<&str> {
+    let tokens = js_tokens(source);
+    tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| {
+            let url = literal_text(token)?;
+            if !external_url(url) {
+                return None;
+            }
+            let active = match &tokens[..index] {
+                [.., "fetch" | "WebSocket" | "EventSource" | "import", "("]
+                | [.., "new", "WebSocket" | "EventSource"]
+                | [.., "import" | "from"] => true,
+                [.., "[", property, "]", "="] => {
+                    matches!(literal_text(property), Some("src" | "href"))
+                }
+                [.., property, "=" | ":"] => {
+                    matches!(*property, "src" | "href")
+                        || matches!(literal_text(property), Some("src" | "href"))
+                }
+                _ => false,
+            };
+            active.then_some(url)
+        })
+        .collect()
+}
+
+fn external_asset_violations<'a>(source: &'a str, extension: &str) -> Vec<&'a str> {
+    static BANNED: LazyLock<Regex> = LazyLock::new(|| {
+        regex(
+            r"(?i)fonts\.(?:googleapis|gstatic)|cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare|data:image/svg\+xml",
+        )
+    });
+    static CSS: LazyLock<Regex> =
+        LazyLock::new(|| regex(r#"(?i)@import\b|\burl\(\s*['"]?\s*(?:https?:)?//"#));
+    static TAG: LazyLock<Regex> = LazyLock::new(|| {
+        regex(&format!(
+            r"(?i)<(?:script|link|img|iframe|source|object)\b{HTML_TAG_TAIL}"
+        ))
+    });
+    let mut violations: Vec<_> = BANNED
+        .find_iter(source)
+        .chain(CSS.find_iter(source))
+        .map(|m| m.as_str())
+        .collect();
+    if matches!(extension, "html" | "js") {
+        for tag in TAG.find_iter(source) {
+            for (name, value) in html_attributes(tag.as_str()) {
+                let name = name.to_ascii_lowercase();
+                if let Some(value) = value {
+                    match name.as_str() {
+                        "src" | "href" | "data" if external_url(value) => violations.push(value),
+                        "srcset" => {
+                            violations.extend(value.split(',').filter(|url| external_url(url)));
+                        }
+                        _ => (),
+                    }
+                }
+            }
+        }
+    }
+    if extension == "js" {
+        violations.extend(js_external_urls(source));
+    }
+    violations
+}
+
+#[test]
+fn frontend_has_no_external_assets_or_svg_data_uris() {
+    for path in files_under("static", false) {
+        if let Some(extension @ ("html" | "css" | "js")) =
+            path.extension().and_then(|ext| ext.to_str())
+        {
+            let source = read(path.to_str().expect("UTF-8 path"));
+            let violations = external_asset_violations(&source, extension);
+            assert!(
+                violations.is_empty(),
+                "{}: forbidden frontend assets {violations:?}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn offline_asset_check_rejects_external_resources_and_svg_data() {
+    for (extension, source) in [
+        (
+            "html",
+            "fonts.googleapis fonts.gstatic cdn.jsdelivr unpkg.com cdnjs.cloudflare",
+        ),
+        ("css", "background: url(data:image/svg+xml;base64,abc)"),
+        ("css", "@import 'local.css';"),
+        ("css", "background: url( 'https://example.test/bg' );"),
+        ("css", "background: url(//example.test/bg);"),
+        (
+            "html",
+            "<script src='https://example.test/app.js'></script>",
+        ),
+        (
+            "html",
+            "<link href=//example.test/style.css rel=stylesheet>",
+        ),
+        ("html", "<img src='http://example.test/img'>"),
+        ("html", "<iframe src=//example.test/frame></iframe>"),
+        (
+            "html",
+            "<source srcset='/local.png 1x, //example.test/large.png 2x'>",
+        ),
+        (
+            "html",
+            "<object data='https://example.test/plugin'></object>",
+        ),
+        ("js", "fetch (\n 'https://example.test/data');"),
+        ("js", "new WebSocket('wss://example.test/socket');"),
+        ("js", "new EventSource(`http://example.test/events`);"),
+        ("js", "import('https://example.test/module.js');"),
+        ("js", "import x from 'https://example.test/module.js';"),
+        ("js", "node.src = 'https://example.test/img';"),
+        ("js", "node.href = '//example.test/page';"),
+        (
+            "js",
+            "node.innerHTML = `<img src='http://example.test/image'>`;",
+        ),
+    ] {
+        assert!(
+            !external_asset_violations(source, extension).is_empty(),
+            "{source}"
+        );
+    }
+    let benign = r#"const help = `<input placeholder="https://..."><code>http://...:2375</code>`;
+        const example = "http://127.0.0.1:8080";
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg"></svg>`;
+        const local = `<img src="./local.png" alt="try https://example.test">`;
+        fetch(this.requestBase + path);"#;
+    assert!(external_asset_violations(benign, "js").is_empty());
 }

@@ -2608,3 +2608,22 @@ project name elsewhere on the machine.
 - Verified `scripts/test_e2e.sh` performs automated `cargo update` and `cargo audit --ignore RUSTSEC-2026-0459` with error logging prior to build and execution. Verified full test suite execution passes 100% (231/231 passed).
 - Updated `AGENT.MD` with explicit rules requiring all dependencies to be maintained at latest compatible semver versions, enforced by CI and `scripts/test_e2e.sh`.
 
+
+## 2026-11-18 — Zero-allow Clippy Pedantic and Wave 3A verification
+
+Matched the migration crate's SQLx features to SeaORM's SQLite, PostgreSQL, and MySQL features.
+Removed blanket lint attributes and retained the single schema-backed expectation on the API key
+entity. The shared integration-test harness exports its helpers across the test modules, and the
+vault sync tests use private helpers for fixture setup and convergence assertions.
+
+Adapted the sibling source-hygiene tests to this repository. Raw SQL exceptions are pinned to
+`src/db.rs` and the three migrations that currently require raw statements. Dashboard checks
+exercise the signed request and key form patterns against deliberate regressions. Updated the API
+reference for permission reductions, Master targets, and inclusive audit query bounds.
+
+
+## 2026-11-19 — Chantier 1 database migrations
+
+- SQLite session settings are applied through connection options. Startup index checks use SeaORM's schema manager, and migrations use SeaQuery builders.
+- The additive text migration widens six columns. SQLite stages the affected tables and their junctions in a transaction, drops children before parents, and restores parents before children with foreign keys enabled.
+- Source hygiene checks raw SQL APIs and literals throughout `src/`, including migrations.

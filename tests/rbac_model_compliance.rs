@@ -7,7 +7,7 @@
 //! why that distinction matters: a test that supplies the very safeguard it is meant to prove
 //! exists only ever proves the application's own habits.
 
-mod common;
+pub mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -20,13 +20,15 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn to_body(bytes: axum::body::Bytes) -> serde_json::Value {
-    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+fn to_body(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes).unwrap_or(serde_json::Value::Null)
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
-    to_body(bytes)
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    to_body(&bytes)
 }
 
 /// Inserts a `destination_groups` row (the RBAC-bearing, triggerable resource these tests exercise
@@ -34,7 +36,11 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 /// — permissions, `/trigger`, and ownership all resolve to the group, never to the feed
 /// underneath it. Named `insert_source` for continuity with every call site below; what changed is
 /// which table backs "the external-ingestion resource under test", not the tests' own intent.
-async fn insert_source(conn: &sea_orm::DatabaseConnection, source_url: &str, owner_key_id: Uuid) -> Uuid {
+async fn insert_source(
+    conn: &sea_orm::DatabaseConnection,
+    source_url: &str,
+    owner_key_id: Uuid,
+) -> Uuid {
     let group_id = Uuid::new_v4();
     let now = Utc::now();
     let group = destination_group::ActiveModel {
@@ -103,16 +109,27 @@ async fn grant_permission(
 #[tokio::test]
 async fn r1_cannot_grant_can_sync_without_holding_it_yourself() {
     let (conn, state, master) = common::setup().await;
-    let granter = common::insert_key(&conn, "Granter", false, true, false, false, Some(master.id)).await;
-    let grantee = common::insert_key(&conn, "Grantee", false, false, false, false, Some(master.id)).await;
+    let delegator = common::insert_key(&conn, "Granter", true, false, false, Some(master.id)).await;
+    let recipient =
+        common::insert_key(&conn, "Grantee", false, false, false, Some(master.id)).await;
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
-    grant_permission(&conn, granter.id, source_id, false, true, false).await;
+    grant_permission(&conn, delegator.id, source_id, false, true, false).await;
 
     let app = simply_ip_sync::create_app(state);
-    let payload = json!({ "resource_type": "destination_group", "resource_id": source_id, "can_sync": true });
-    let req = common::signed_request(&granter, "PUT", &format!("/api/keys/{}/permissions", grantee.id), Some(payload));
+    let payload =
+        json!({ "resource_type": "destination_group", "resource_id": source_id, "can_sync": true });
+    let req = common::signed_request(
+        &delegator,
+        "PUT",
+        &format!("/api/keys/{}/permissions", recipient.id),
+        Some(&payload),
+    );
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "R1: cannot grant can_sync without holding it yourself on the resource");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "R1: cannot grant can_sync without holding it yourself on the resource"
+    );
 }
 
 /// R2 (manage is a conjunction): managing a resource — here, delegating a permission on it —
@@ -124,23 +141,51 @@ async fn r1_cannot_grant_can_sync_without_holding_it_yourself() {
 async fn r2_manage_requires_both_the_global_flag_and_the_per_resource_row() {
     let (conn, state, master) = common::setup().await;
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
-    let grantee = common::insert_key(&conn, "Grantee", false, false, false, false, Some(master.id)).await;
+    let recipient =
+        common::insert_key(&conn, "Grantee", false, false, false, Some(master.id)).await;
 
     // Half A: global can_manage_keys=true, but no permission row on the resource at all.
-    let global_only = common::insert_key(&conn, "GlobalOnly", false, true, false, false, Some(master.id)).await;
+    let global_only =
+        common::insert_key(&conn, "GlobalOnly", true, false, false, Some(master.id)).await;
     let app = simply_ip_sync::create_app(state.clone());
     let payload = json!({ "resource_type": "destination_group", "resource_id": source_id, "can_view_logs": true });
-    let req = common::signed_request(&global_only, "PUT", &format!("/api/keys/{}/permissions", grantee.id), Some(payload.clone()));
+    let req = common::signed_request(
+        &global_only,
+        "PUT",
+        &format!("/api/keys/{}/permissions", recipient.id),
+        Some(&payload),
+    );
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "R2: can_manage_keys alone, with no per-resource can_manage row, must not suffice");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "R2: can_manage_keys alone, with no per-resource can_manage row, must not suffice"
+    );
 
     // Half B: a per-resource can_manage=true row, but can_manage_keys=false globally.
-    let per_resource_only = common::insert_key(&conn, "PerResourceOnly", false, false, false, false, Some(master.id)).await;
+    let per_resource_only = common::insert_key(
+        &conn,
+        "PerResourceOnly",
+        false,
+        false,
+        false,
+        Some(master.id),
+    )
+    .await;
     grant_permission(&conn, per_resource_only.id, source_id, false, true, false).await;
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&per_resource_only, "PUT", &format!("/api/keys/{}/permissions", grantee.id), Some(payload));
+    let req = common::signed_request(
+        &per_resource_only,
+        "PUT",
+        &format!("/api/keys/{}/permissions", recipient.id),
+        Some(&payload),
+    );
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "R2: a per-resource can_manage row alone, without global can_manage_keys, must not suffice");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "R2: a per-resource can_manage row alone, without global can_manage_keys, must not suffice"
+    );
 }
 
 /// R3 (parentage confers no authority): `parent_key_id` exists solely for cascade/visibility
@@ -151,21 +196,49 @@ async fn r2_manage_requires_both_the_global_flag_and_the_per_resource_row() {
 #[tokio::test]
 async fn r3_parentage_confers_no_special_authority() {
     let (conn, state, master) = common::setup().await;
-    let parent = common::insert_key(&conn, "Parent", false, true, false, false, Some(master.id)).await;
-    let daughter_of_master = common::insert_key(&conn, "DaughterOfMaster", false, false, false, false, Some(master.id)).await;
-    let daughter_of_parent = common::insert_key(&conn, "DaughterOfParent", false, false, false, false, Some(parent.id)).await;
+    let parent = common::insert_key(&conn, "Parent", true, false, false, Some(master.id)).await;
+    let daughter_of_master = common::insert_key(
+        &conn,
+        "DaughterOfMaster",
+        false,
+        false,
+        false,
+        Some(master.id),
+    )
+    .await;
+    let daughter_of_parent = common::insert_key(
+        &conn,
+        "DaughterOfParent",
+        false,
+        false,
+        false,
+        Some(parent.id),
+    )
+    .await;
 
     let app = simply_ip_sync::create_app(state);
     let payload = json!({ "name": "attempted-escalation", "can_manage_sources": true });
 
-    let req_a = common::signed_request(&daughter_of_master, "POST", "/api/keys", Some(payload.clone()));
+    let req_a = common::signed_request(&daughter_of_master, "POST", "/api/keys", Some(&payload));
     let resp_a = app.clone().oneshot(req_a).await.expect("response");
-    let req_b = common::signed_request(&daughter_of_parent, "POST", "/api/keys", Some(payload));
+    let req_b = common::signed_request(&daughter_of_parent, "POST", "/api/keys", Some(&payload));
     let resp_b = app.oneshot(req_b).await.expect("response");
 
-    assert_eq!(resp_a.status(), StatusCode::FORBIDDEN, "R3: being a direct daughter of Master confers no extra authority");
-    assert_eq!(resp_b.status(), StatusCode::FORBIDDEN, "R3: being a daughter of an ordinary Parent is refused identically");
-    assert_eq!(resp_a.status(), resp_b.status(), "R3: lineage must not change the outcome of an otherwise-identical request");
+    assert_eq!(
+        resp_a.status(),
+        StatusCode::FORBIDDEN,
+        "R3: being a direct daughter of Master confers no extra authority"
+    );
+    assert_eq!(
+        resp_b.status(),
+        StatusCode::FORBIDDEN,
+        "R3: being a daughter of an ordinary Parent is refused identically"
+    );
+    assert_eq!(
+        resp_a.status(),
+        resp_b.status(),
+        "R3: lineage must not change the outcome of an otherwise-identical request"
+    );
 }
 
 /// R4 (only Master creates parents): only the Master key may grant `can_manage_keys`,
@@ -174,32 +247,45 @@ async fn r3_parentage_confers_no_special_authority() {
 #[tokio::test]
 async fn r4_only_master_may_grant_scope_elevation() {
     let (conn, state, master) = common::setup().await;
-    let parent = common::insert_key(&conn, "Parent", false, true, false, false, Some(master.id)).await;
+    let parent = common::insert_key(&conn, "Parent", true, false, false, Some(master.id)).await;
 
     let app = simply_ip_sync::create_app(state);
     let payload = json!({ "name": "attempted-escalation", "can_manage_sources": true });
-    let req = common::signed_request(&parent, "POST", "/api/keys", Some(payload));
+    let req = common::signed_request(&parent, "POST", "/api/keys", Some(&payload));
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "R4: only Master may grant a resource-creation right");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "R4: only Master may grant a resource-creation right"
+    );
 }
 
 /// R5 (manage may propagate sideways): a Parent holding manage rights on a resource may grant
 /// manage rights on that same resource to *another existing Parent key* — this is not the
-/// Parent's own tier expanding (parent_b already holds `can_manage_keys` from its own creation,
+/// Parent's own tier expanding (`parent_b` already holds `can_manage_keys` from its own creation,
 /// independent of this grant), only the resource-level permission propagating between two peers.
 #[tokio::test]
 async fn r5_manage_may_propagate_sideways_between_parents() {
     let (conn, state, master) = common::setup().await;
-    let parent_a = common::insert_key(&conn, "ParentA", false, true, false, false, Some(master.id)).await;
-    let parent_b = common::insert_key(&conn, "ParentB", false, true, false, false, Some(master.id)).await;
+    let parent_a = common::insert_key(&conn, "ParentA", true, false, false, Some(master.id)).await;
+    let parent_b = common::insert_key(&conn, "ParentB", true, false, false, Some(master.id)).await;
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
     grant_permission(&conn, parent_a.id, source_id, false, true, false).await;
 
     let app = simply_ip_sync::create_app(state);
     let payload = json!({ "resource_type": "destination_group", "resource_id": source_id, "can_manage": true });
-    let req = common::signed_request(&parent_a, "PUT", &format!("/api/keys/{}/permissions", parent_b.id), Some(payload));
+    let req = common::signed_request(
+        &parent_a,
+        "PUT",
+        &format!("/api/keys/{}/permissions", parent_b.id),
+        Some(&payload),
+    );
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::OK, "R5: manage rights may propagate sideways between two Parent-tier keys");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "R5: manage rights may propagate sideways between two Parent-tier keys"
+    );
 }
 
 /// R6 (revocation is never escalation): revoking a permission requires only R2 (manage rights on
@@ -208,15 +294,16 @@ async fn r5_manage_may_propagate_sideways_between_parents() {
 #[tokio::test]
 async fn r6_revocation_requires_only_manage_not_the_verb_itself() {
     let (conn, state, master) = common::setup().await;
-    let revoker = common::insert_key(&conn, "Revoker", false, true, false, false, Some(master.id)).await;
-    let grantee = common::insert_key(&conn, "Grantee", false, false, false, false, Some(master.id)).await;
+    let revoker = common::insert_key(&conn, "Revoker", true, false, false, Some(master.id)).await;
+    let recipient =
+        common::insert_key(&conn, "Grantee", false, false, false, Some(master.id)).await;
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
     grant_permission(&conn, revoker.id, source_id, false, true, false).await;
 
     let grantee_permission_id = Uuid::new_v4();
     api_key_sync_permission::ActiveModel {
         id: Set(grantee_permission_id),
-        api_key_id: Set(grantee.id),
+        api_key_id: Set(recipient.id),
         resource_type: Set("destination_group".to_owned()),
         resource_id: Set(source_id),
         can_sync: Set(true),
@@ -232,11 +319,18 @@ async fn r6_revocation_requires_only_manage_not_the_verb_itself() {
     let req = common::signed_request(
         &revoker,
         "DELETE",
-        &format!("/api/keys/{}/permissions/{}", grantee.id, grantee_permission_id),
+        &format!(
+            "/api/keys/{}/permissions/{}",
+            recipient.id, grantee_permission_id
+        ),
         None,
     );
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "R6: revocation needs only manage rights, not the verb being removed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "R6: revocation needs only manage rights, not the verb being removed"
+    );
 }
 
 /// R7 (granting is bounded by R1 and R2 together): the positive complement to `r1_`'s negative
@@ -246,17 +340,28 @@ async fn r6_revocation_requires_only_manage_not_the_verb_itself() {
 #[tokio::test]
 async fn r7_granting_succeeds_only_when_r1_and_r2_both_hold() {
     let (conn, state, master) = common::setup().await;
-    let granter = common::insert_key(&conn, "Granter", false, true, false, false, Some(master.id)).await;
-    let grantee = common::insert_key(&conn, "Grantee", false, false, false, false, Some(master.id)).await;
+    let delegator = common::insert_key(&conn, "Granter", true, false, false, Some(master.id)).await;
+    let recipient =
+        common::insert_key(&conn, "Grantee", false, false, false, Some(master.id)).await;
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
     // R2: can_manage_keys (via insert_key above) + a can_manage=true row. R1: also holds can_sync.
-    grant_permission(&conn, granter.id, source_id, true, true, false).await;
+    grant_permission(&conn, delegator.id, source_id, true, true, false).await;
 
     let app = simply_ip_sync::create_app(state);
-    let payload = json!({ "resource_type": "destination_group", "resource_id": source_id, "can_sync": true });
-    let req = common::signed_request(&granter, "PUT", &format!("/api/keys/{}/permissions", grantee.id), Some(payload));
+    let payload =
+        json!({ "resource_type": "destination_group", "resource_id": source_id, "can_sync": true });
+    let req = common::signed_request(
+        &delegator,
+        "PUT",
+        &format!("/api/keys/{}/permissions", recipient.id),
+        Some(&payload),
+    );
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::OK, "R7: granting succeeds once both R1 and R2 hold simultaneously");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "R7: granting succeeds once both R1 and R2 hold simultaneously"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -269,8 +374,9 @@ async fn r7_granting_succeeds_only_when_r1_and_r2_both_hold() {
 #[tokio::test]
 async fn s3_resource_lifecycle_delete_requires_owner_or_master() {
     let (conn, state, master) = common::setup().await;
-    let owner = common::insert_key(&conn, "Owner", false, true, true, true, Some(master.id)).await;
-    let other_parent = common::insert_key(&conn, "OtherParent", false, true, true, true, Some(master.id)).await;
+    let owner = common::insert_key(&conn, "Owner", true, true, true, Some(master.id)).await;
+    let other_parent =
+        common::insert_key(&conn, "OtherParent", true, true, true, Some(master.id)).await;
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", owner.id).await;
 
     // Grant `other_parent` full manage rights (R2 conjunct) on the resource, but they are not the
@@ -278,13 +384,31 @@ async fn s3_resource_lifecycle_delete_requires_owner_or_master() {
     grant_permission(&conn, other_parent.id, source_id, true, true, true).await;
 
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&other_parent, "DELETE", &format!("/api/destination-groups/{source_id}"), None);
+    let req = common::signed_request(
+        &other_parent,
+        "DELETE",
+        &format!("/api/destination-groups/{source_id}"),
+        None,
+    );
     let resp = app.clone().oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "§3: manage rights alone do not confer lifecycle authority");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "§3: manage rights alone do not confer lifecycle authority"
+    );
 
-    let req_owner = common::signed_request(&owner, "DELETE", &format!("/api/destination-groups/{source_id}"), None);
+    let req_owner = common::signed_request(
+        &owner,
+        "DELETE",
+        &format!("/api/destination-groups/{source_id}"),
+        None,
+    );
     let resp_owner = app.oneshot(req_owner).await.expect("response");
-    assert_eq!(resp_owner.status(), StatusCode::NO_CONTENT, "the owner may always delete their own resource");
+    assert_eq!(
+        resp_owner.status(),
+        StatusCode::NO_CONTENT,
+        "the owner may always delete their own resource"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -299,11 +423,14 @@ async fn s3_resource_lifecycle_delete_requires_owner_or_master() {
 #[tokio::test]
 async fn s4_out_of_scope_and_nonexistent_vaults_are_indistinguishable() {
     let (conn, state, master) = common::setup().await;
-    let stranger = common::insert_key(&conn, "Stranger", false, false, false, false, Some(master.id)).await;
+    let stranger =
+        common::insert_key(&conn, "Stranger", false, false, false, Some(master.id)).await;
     let out_of_scope_id = {
         let id = Uuid::new_v4();
         let now = Utc::now();
-        let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext.seal("secret").unwrap();
+        let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext
+            .seal("secret")
+            .unwrap();
         let model = simply_ip_sync::entities::vault_endpoint::ActiveModel {
             id: Set(id),
             name: Set("owned-by-master".to_owned()),
@@ -315,25 +442,48 @@ async fn s4_out_of_scope_and_nonexistent_vaults_are_indistinguishable() {
             created_at: Set(now),
             updated_at: Set(now),
         };
-        model.insert(&conn).await.expect("insert vault owned by someone else");
+        model
+            .insert(&conn)
+            .await
+            .expect("insert vault owned by someone else");
         id
     };
     let nonexistent_id = Uuid::new_v4();
 
     let app = simply_ip_sync::create_app(state);
-    let req_out_of_scope = common::signed_request(&stranger, "GET", &format!("/api/vaults/{out_of_scope_id}"), None);
-    let resp_out_of_scope = app.clone().oneshot(req_out_of_scope).await.expect("response");
+    let req_out_of_scope = common::signed_request(
+        &stranger,
+        "GET",
+        &format!("/api/vaults/{out_of_scope_id}"),
+        None,
+    );
+    let resp_out_of_scope = app
+        .clone()
+        .oneshot(req_out_of_scope)
+        .await
+        .expect("response");
     let status_out_of_scope = resp_out_of_scope.status();
     let body_out_of_scope = body_json(resp_out_of_scope).await;
 
-    let req_nonexistent = common::signed_request(&stranger, "GET", &format!("/api/vaults/{nonexistent_id}"), None);
+    let req_nonexistent = common::signed_request(
+        &stranger,
+        "GET",
+        &format!("/api/vaults/{nonexistent_id}"),
+        None,
+    );
     let resp_nonexistent = app.oneshot(req_nonexistent).await.expect("response");
     let status_nonexistent = resp_nonexistent.status();
     let body_nonexistent = body_json(resp_nonexistent).await;
 
     assert_eq!(status_out_of_scope, StatusCode::NOT_FOUND);
-    assert_eq!(status_out_of_scope, status_nonexistent, "an out-of-scope resource must return the same status as one that doesn't exist");
-    assert_eq!(body_out_of_scope, body_nonexistent, "an out-of-scope resource must return the same body as one that doesn't exist");
+    assert_eq!(
+        status_out_of_scope, status_nonexistent,
+        "an out-of-scope resource must return the same status as one that doesn't exist"
+    );
+    assert_eq!(
+        body_out_of_scope, body_nonexistent,
+        "an out-of-scope resource must return the same body as one that doesn't exist"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -346,18 +496,36 @@ async fn s5_master_key_rejects_edits_beyond_bound_ips() {
     let _ = &conn;
     let app = simply_ip_sync::create_app(state);
     let payload = json!({ "name": "Renamed Master" });
-    let req = common::signed_request(&master, "PATCH", &format!("/api/keys/{}", master.id), Some(payload));
+    let req = common::signed_request(
+        &master,
+        "PATCH",
+        &format!("/api/keys/{}", master.id),
+        Some(&payload),
+    );
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "§5: the Master key is immutable except its own bound_ips");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "§5: the Master key is immutable except its own bound_ips"
+    );
 }
 
 #[tokio::test]
 async fn s5_master_key_rotation_is_always_refused() {
     let (_conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&master, "POST", &format!("/api/keys/{}/rotate", master.id), None);
+    let req = common::signed_request(
+        &master,
+        "POST",
+        &format!("/api/keys/{}/rotate", master.id),
+        None,
+    );
     let resp = app.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "§5: rotation is refused for the Master key");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "§5: rotation is refused for the Master key"
+    );
 }
 
 /// ADVERSARIAL(§5): a direct raw-SQL insert setting `is_master=1` with the generated
@@ -376,8 +544,13 @@ async fn s5_adversarial_second_master_rejected_by_generated_column() {
         )
     };
     // `common::setup()` already bootstrapped one Master; this is the second.
-    let second: Result<_, DbErr> = conn.execute_unprepared(&insert_master("22222222-2222-2222-2222-222222222222")).await;
-    assert!(second.is_err(), "§5 ADVERSARIAL: a second is_master=true row must be rejected by the DB itself, not merely refused by application logic");
+    let second: Result<_, DbErr> = conn
+        .execute_unprepared(&insert_master("22222222-2222-2222-2222-222222222222"))
+        .await;
+    assert!(
+        second.is_err(),
+        "§5 ADVERSARIAL: a second is_master=true row must be rejected by the DB itself, not merely refused by application logic"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -392,7 +565,7 @@ async fn s5_adversarial_second_master_rejected_by_generated_column() {
 #[tokio::test]
 async fn s6_deleting_a_key_that_still_owns_resources_is_blocked_with_inventory() {
     let (conn, state, master) = common::setup().await;
-    let owner = common::insert_key(&conn, "Owner", false, false, true, false, Some(master.id)).await;
+    let owner = common::insert_key(&conn, "Owner", false, true, false, Some(master.id)).await;
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", owner.id).await;
 
     let app = simply_ip_sync::create_app(state);
@@ -400,19 +573,27 @@ async fn s6_deleting_a_key_that_still_owns_resources_is_blocked_with_inventory()
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let body = body_json(resp).await;
-    let owned = body["owned_resources"].as_array().expect("owned_resources array");
-    assert_eq!(owned.len(), 1);
-    assert_eq!(owned[0]["id"], json!(source_id));
+    let resources = body["owned_resources"]
+        .as_array()
+        .expect("owned_resources array");
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0]["id"], json!(source_id));
 }
 
 /// The mirror case: a key that owns nothing deletes cleanly.
 #[tokio::test]
 async fn s6_deleting_a_key_with_no_owned_resources_succeeds() {
     let (conn, state, master) = common::setup().await;
-    let empty_handed = common::insert_key(&conn, "EmptyHanded", false, false, false, false, Some(master.id)).await;
+    let empty_handed =
+        common::insert_key(&conn, "EmptyHanded", false, false, false, Some(master.id)).await;
 
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&master, "DELETE", &format!("/api/keys/{}", empty_handed.id), None);
+    let req = common::signed_request(
+        &master,
+        "DELETE",
+        &format!("/api/keys/{}", empty_handed.id),
+        None,
+    );
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
@@ -434,17 +615,22 @@ async fn s7_mandatory_indexes_exist() {
         ("vault_endpoints", "idx-vault_endpoints-owner_key_id"),
         ("destination_groups", "idx-destination_groups-owner_key_id"),
         ("vault_sync_tasks", "idx-vault_sync_tasks-owner_key_id"),
-        ("api_key_sync_permissions", "idx-api_key_sync_permissions-unique"),
+        (
+            "api_key_sync_permissions",
+            "idx-api_key_sync_permissions-unique",
+        ),
         ("sync_logs", "idx-sync_logs-job_type_job_id"),
         ("sync_logs", "idx-sync_logs-timestamp"),
         ("audit_logs", "idx-audit_logs-action_timestamp"),
     ] {
-        let present = simply_ip_sync::db::has_index(&conn, table, index).await.expect("has_index query");
+        let present = simply_ip_sync::db::has_index(&conn, table, index)
+            .await
+            .expect("has_index query");
         assert!(present, "§7: {table}.{index} must exist after migration");
     }
 }
 
-/// ADVERSARIAL(§7): `api_keys.key_hash` carries a `UNIQUE` constraint (RBAC_MODEL.md §7's
+/// ADVERSARIAL(§7): `api_keys.key_hash` carries a `UNIQUE` constraint (`RBAC_MODEL.md` §7's
 /// "fast key lookup" index doubles as the collision guard — two keys must never hash-collide
 /// to the same lookup value). Proven with a direct raw-SQL insert bypassing the application's own
 /// (nonexistent, here) duplicate-check logic, so the guarantee is shown to hold at the engine
@@ -458,14 +644,23 @@ async fn s7_adversarial_duplicate_key_hash_rejected_by_unique_constraint() {
              VALUES ('{id}', 'dup-test', '{hash}', '{id}pfx', 0, 0, 0, 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
         )
     };
-    conn.execute_unprepared(&insert_daughter("33333333-3333-3333-3333-333333333333", "collide-me"))
-        .await
-        .expect("first insert with this hash succeeds");
+    conn.execute_unprepared(&insert_daughter(
+        "33333333-3333-3333-3333-333333333333",
+        "collide-me",
+    ))
+    .await
+    .expect("first insert with this hash succeeds");
 
     let second: Result<_, DbErr> = conn
-        .execute_unprepared(&insert_daughter("44444444-4444-4444-4444-444444444444", "collide-me"))
+        .execute_unprepared(&insert_daughter(
+            "44444444-4444-4444-4444-444444444444",
+            "collide-me",
+        ))
         .await;
-    assert!(second.is_err(), "§7 ADVERSARIAL: a duplicate key_hash must be rejected by the DB's own UNIQUE constraint");
+    assert!(
+        second.is_err(),
+        "§7 ADVERSARIAL: a duplicate key_hash must be rejected by the DB's own UNIQUE constraint"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -477,11 +672,17 @@ async fn s7_adversarial_duplicate_key_hash_rejected_by_unique_constraint() {
 #[tokio::test]
 async fn trigger_without_can_sync_is_forbidden() {
     let (conn, state, master) = common::setup().await;
-    let daughter = common::insert_key(&conn, "Daughter", false, false, false, false, Some(master.id)).await;
+    let daughter =
+        common::insert_key(&conn, "Daughter", false, false, false, Some(master.id)).await;
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
 
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&daughter, "POST", &format!("/api/destination-groups/{source_id}/trigger"), None);
+    let req = common::signed_request(
+        &daughter,
+        "POST",
+        &format!("/api/destination-groups/{source_id}/trigger"),
+        None,
+    );
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
@@ -489,7 +690,8 @@ async fn trigger_without_can_sync_is_forbidden() {
 #[tokio::test]
 async fn trigger_with_granted_can_sync_succeeds() {
     let (conn, state, master) = common::setup().await;
-    let daughter = common::insert_key(&conn, "Daughter", false, false, false, false, Some(master.id)).await;
+    let daughter =
+        common::insert_key(&conn, "Daughter", false, false, false, Some(master.id)).await;
 
     let feed_mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -507,7 +709,12 @@ async fn trigger_with_granted_can_sync_succeeds() {
     grant_permission(&conn, daughter.id, source_id, true, false, true).await;
 
     let app = simply_ip_sync::create_app(state);
-    let req = common::signed_request(&daughter, "POST", &format!("/api/destination-groups/{source_id}/trigger"), None);
+    let req = common::signed_request(
+        &daughter,
+        "POST",
+        &format!("/api/destination-groups/{source_id}/trigger"),
+        None,
+    );
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
@@ -519,9 +726,16 @@ async fn trigger_with_granted_can_sync_succeeds() {
 /// don't collide into byte-identical `CANONICAL_V1` signatures, which the anti-replay guard would
 /// then (correctly) reject the second of as a replay, an artifact that has nothing to do with
 /// whatever property the test actually wants to exercise concurrently.
-fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestamp: i64) -> Request<Body> {
+fn signed_request_at(
+    key: &common::TestKey,
+    method: &str,
+    target: &str,
+    timestamp: i64,
+) -> Request<Body> {
     let ts = timestamp.to_string();
-    let signature = simply_ip_sync::crypto::compute_signature(&key.signing_secret, method, target, &ts, b"").expect("sign");
+    let signature =
+        simply_ip_sync::crypto::compute_signature(&key.signing_secret, method, target, &ts, b"")
+            .expect("sign");
     let mut req = Request::builder()
         .method(method)
         .uri(target)
@@ -531,7 +745,10 @@ fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestam
         .body(Body::empty())
         .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
     req
 }
 
@@ -563,7 +780,7 @@ async fn concurrent_deletes_of_the_same_resource_do_not_both_succeed() {
 
     let statuses = {
         let mut s = vec![status_a, status_b];
-        s.sort_by_key(|s| s.as_u16());
+        s.sort_by_key(axum::http::StatusCode::as_u16);
         s
     };
     assert_eq!(
@@ -577,9 +794,115 @@ async fn concurrent_deletes_of_the_same_resource_do_not_both_succeed() {
 async fn unauthenticated_request_never_reaches_a_handler() {
     let (_conn, state, _master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
-    let mut req = Request::builder().method("GET").uri("/api/keys").body(Body::empty()).expect("build");
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/api/keys")
+        .body(Body::empty())
+        .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
     let resp = app.oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn master_key_permissions_cannot_be_modified_or_revoked() {
+    let (conn, state, master) = common::setup().await;
+    let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
+    let app = simply_ip_sync::create_app(state);
+
+    let put_req = common::signed_request(
+        &master,
+        "PUT",
+        &format!("/api/keys/{}/permissions", master.id),
+        Some(&json!({
+            "resource_type": "destination_group",
+            "resource_id": source_id,
+            "can_sync": true
+        })),
+    );
+    let put_resp = app.clone().oneshot(put_req).await.expect("response");
+    assert_eq!(put_resp.status(), StatusCode::BAD_REQUEST);
+
+    let del_req = common::signed_request(
+        &master,
+        "DELETE",
+        &format!("/api/keys/{}/permissions/{}", master.id, Uuid::new_v4()),
+        None,
+    );
+    let del_resp = app.oneshot(del_req).await.expect("response");
+    assert_eq!(del_resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn r6_can_manage_without_can_sync_permits_reduction_and_blocks_widening() {
+    let (conn, state, master) = common::setup().await;
+    let manager = common::insert_key(&conn, "Manager", true, false, false, Some(master.id)).await;
+    let target = common::insert_key(&conn, "Target", false, false, false, Some(master.id)).await;
+    let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
+
+    // Manager has can_manage only (not can_sync) — R2 holds, R1 does not hold for can_sync.
+    grant_permission(&conn, manager.id, source_id, false, true, false).await;
+    // Target starts with can_sync=true, can_manage=true.
+    grant_permission(&conn, target.id, source_id, true, true, false).await;
+
+    let app = simply_ip_sync::create_app(state);
+
+    // Reduction: removing can_sync without widening requires R2 only (R6).
+    let reduce_req = common::signed_request(
+        &manager,
+        "PUT",
+        &format!("/api/keys/{}/permissions", target.id),
+        Some(&json!({
+            "resource_type": "destination_group",
+            "resource_id": source_id,
+            "can_sync": false,
+            "can_manage": true,
+            "can_view_logs": false
+        })),
+    );
+    let reduce_resp = app.clone().oneshot(reduce_req).await.expect("response");
+    assert_eq!(
+        reduce_resp.status(),
+        StatusCode::OK,
+        "R6 allows permission reduction with can_manage only"
+    );
+
+    // Widening: adding can_view_logs requires holding can_view_logs (R1) -> 403.
+    let widen_req = common::signed_request(
+        &manager,
+        "PUT",
+        &format!("/api/keys/{}/permissions", target.id),
+        Some(&json!({
+            "resource_type": "destination_group",
+            "resource_id": source_id,
+            "can_sync": false,
+            "can_manage": true,
+            "can_view_logs": true
+        })),
+    );
+    let widen_resp = app.clone().oneshot(widen_req).await.expect("response");
+    assert_eq!(
+        widen_resp.status(),
+        StatusCode::FORBIDDEN,
+        "R1 blocks granting unheld verb"
+    );
+
+    // Non-master self-reduction is allowed, whereas non-master cannot grant self new row.
+    let other_source_id = insert_source(&conn, "http://127.0.0.1:1/other", master.id).await;
+    let self_grant_req = common::signed_request(
+        &manager,
+        "PUT",
+        &format!("/api/keys/{}/permissions", manager.id),
+        Some(&json!({
+            "resource_type": "destination_group",
+            "resource_id": other_source_id,
+            "can_manage": true
+        })),
+    );
+    let self_grant_resp = app.oneshot(self_grant_req).await.expect("response");
+    assert_eq!(self_grant_resp.status(), StatusCode::FORBIDDEN);
 }

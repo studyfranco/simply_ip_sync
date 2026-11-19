@@ -104,7 +104,10 @@ enum ExternalSourcesRebuild {
 /// the exact pre-refactor shape it replaces. One function for both directions for the same reason
 /// `audit_attribution_not_null` gives: a hand-maintained pair drifts, and `down` silently
 /// resurrecting the wrong shape is the failure mode that matters least visibly.
-fn external_sources_definition(table: TableRef, post_refactor: bool) -> TableCreateStatement {
+pub(super) fn external_sources_definition(
+    table: TableRef,
+    post_refactor: bool,
+) -> TableCreateStatement {
     let mut stmt = Table::create();
     stmt.table(table)
         .col(
@@ -188,69 +191,71 @@ fn external_sources_definition(table: TableRef, post_refactor: bool) -> TableCre
         );
     }
 
-    stmt.to_owned()
+    stmt.take()
+}
+
+pub(super) fn destination_groups_definition() -> TableCreateStatement {
+    Table::create()
+        .table(DestinationGroups::Table)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(DestinationGroups::Id)
+                .uuid()
+                .not_null()
+                .primary_key(),
+        )
+        .col(
+            ColumnDef::new(DestinationGroups::Name)
+                .string()
+                .not_null()
+                .unique_key(),
+        )
+        .col(
+            ColumnDef::new(DestinationGroups::TargetGroupName)
+                .string()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(DestinationGroups::CronSchedule)
+                .string()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(DestinationGroups::Mode)
+                .string()
+                .not_null()
+                .default("upsert"),
+        )
+        .col(
+            ColumnDef::new(DestinationGroups::IsActive)
+                .boolean()
+                .not_null()
+                .default(true),
+        )
+        .col(
+            ColumnDef::new(DestinationGroups::SkipBogonFiltering)
+                .boolean()
+                .not_null()
+                .default(false),
+        )
+        .col(ColumnDef::new(DestinationGroups::LastRunAt).timestamp_with_time_zone())
+        .col(ColumnDef::new(DestinationGroups::OwnerKeyId).uuid())
+        .col(
+            ColumnDef::new(DestinationGroups::CreatedAt)
+                .timestamp_with_time_zone()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(DestinationGroups::UpdatedAt)
+                .timestamp_with_time_zone()
+                .not_null(),
+        )
+        .take()
 }
 
 async fn create_destination_groups(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
-        .create_table(
-            Table::create()
-                .table(DestinationGroups::Table)
-                .if_not_exists()
-                .col(
-                    ColumnDef::new(DestinationGroups::Id)
-                        .uuid()
-                        .not_null()
-                        .primary_key(),
-                )
-                .col(
-                    ColumnDef::new(DestinationGroups::Name)
-                        .string()
-                        .not_null()
-                        .unique_key(),
-                )
-                .col(
-                    ColumnDef::new(DestinationGroups::TargetGroupName)
-                        .string()
-                        .not_null(),
-                )
-                .col(
-                    ColumnDef::new(DestinationGroups::CronSchedule)
-                        .string()
-                        .not_null(),
-                )
-                .col(
-                    ColumnDef::new(DestinationGroups::Mode)
-                        .string()
-                        .not_null()
-                        .default("upsert"),
-                )
-                .col(
-                    ColumnDef::new(DestinationGroups::IsActive)
-                        .boolean()
-                        .not_null()
-                        .default(true),
-                )
-                .col(
-                    ColumnDef::new(DestinationGroups::SkipBogonFiltering)
-                        .boolean()
-                        .not_null()
-                        .default(false),
-                )
-                .col(ColumnDef::new(DestinationGroups::LastRunAt).timestamp_with_time_zone())
-                .col(ColumnDef::new(DestinationGroups::OwnerKeyId).uuid())
-                .col(
-                    ColumnDef::new(DestinationGroups::CreatedAt)
-                        .timestamp_with_time_zone()
-                        .not_null(),
-                )
-                .col(
-                    ColumnDef::new(DestinationGroups::UpdatedAt)
-                        .timestamp_with_time_zone()
-                        .not_null(),
-                )
-                .to_owned(),
-        )
+        .create_table(destination_groups_definition())
         .await?;
     manager
         .create_index(
@@ -263,50 +268,52 @@ async fn create_destination_groups(manager: &SchemaManager<'_>) -> Result<(), Db
         .await
 }
 
+pub(super) fn destination_group_vault_targets_definition() -> TableCreateStatement {
+    Table::create()
+        .table(DestinationGroupVaultTargets::Table)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(DestinationGroupVaultTargets::DestinationGroupId)
+                .uuid()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(DestinationGroupVaultTargets::VaultEndpointId)
+                .uuid()
+                .not_null(),
+        )
+        .col(ColumnDef::new(DestinationGroupVaultTargets::TargetGroupName).text())
+        .primary_key(
+            Index::create()
+                .col(DestinationGroupVaultTargets::DestinationGroupId)
+                .col(DestinationGroupVaultTargets::VaultEndpointId),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .name("fk-dgvt-destination_group")
+                .from(
+                    DestinationGroupVaultTargets::Table,
+                    DestinationGroupVaultTargets::DestinationGroupId,
+                )
+                .to(DestinationGroups::Table, DestinationGroups::Id)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .name("fk-dgvt-vault_endpoint")
+                .from(
+                    DestinationGroupVaultTargets::Table,
+                    DestinationGroupVaultTargets::VaultEndpointId,
+                )
+                .to(VaultEndpoints::Table, VaultEndpoints::Id)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .take()
+}
+
 async fn create_destination_group_vault_targets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
-        .create_table(
-            Table::create()
-                .table(DestinationGroupVaultTargets::Table)
-                .if_not_exists()
-                .col(
-                    ColumnDef::new(DestinationGroupVaultTargets::DestinationGroupId)
-                        .uuid()
-                        .not_null(),
-                )
-                .col(
-                    ColumnDef::new(DestinationGroupVaultTargets::VaultEndpointId)
-                        .uuid()
-                        .not_null(),
-                )
-                .col(ColumnDef::new(DestinationGroupVaultTargets::TargetGroupName).text())
-                .primary_key(
-                    Index::create()
-                        .col(DestinationGroupVaultTargets::DestinationGroupId)
-                        .col(DestinationGroupVaultTargets::VaultEndpointId),
-                )
-                .foreign_key(
-                    ForeignKey::create()
-                        .name("fk-dgvt-destination_group")
-                        .from(
-                            DestinationGroupVaultTargets::Table,
-                            DestinationGroupVaultTargets::DestinationGroupId,
-                        )
-                        .to(DestinationGroups::Table, DestinationGroups::Id)
-                        .on_delete(ForeignKeyAction::Cascade),
-                )
-                .foreign_key(
-                    ForeignKey::create()
-                        .name("fk-dgvt-vault_endpoint")
-                        .from(
-                            DestinationGroupVaultTargets::Table,
-                            DestinationGroupVaultTargets::VaultEndpointId,
-                        )
-                        .to(VaultEndpoints::Table, VaultEndpoints::Id)
-                        .on_delete(ForeignKeyAction::Cascade),
-                )
-                .to_owned(),
-        )
+        .create_table(destination_group_vault_targets_definition())
         .await
 }
 
@@ -316,19 +323,65 @@ async fn create_destination_group_vault_targets(manager: &SchemaManager<'_>) -> 
 /// `SELECT *` — see `audit_attribution_not_null`'s own rationale for why a positional copy is
 /// exactly the kind of bug that stays invisible until a later column reorder.
 async fn migrate_existing_rows_into_groups(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    db.execute_unprepared(
-        "INSERT INTO destination_groups \
-         (id, name, target_group_name, cron_schedule, mode, is_active, skip_bogon_filtering, last_run_at, owner_key_id, created_at, updated_at) \
-         SELECT id, name, target_group_name, cron_schedule, mode, is_active, false, last_run_at, owner_key_id, created_at, updated_at \
-         FROM external_sources",
-    )
-    .await?;
-    db.execute_unprepared(
-        "INSERT INTO destination_group_vault_targets (destination_group_id, vault_endpoint_id, target_group_name) \
-         SELECT external_source_id, vault_endpoint_id, target_group_name FROM external_source_vault_targets",
-    )
-    .await?;
+    manager
+        .exec_stmt(
+            Query::insert()
+                .into_table(DestinationGroups::Table)
+                .columns([
+                    "id",
+                    "name",
+                    "target_group_name",
+                    "cron_schedule",
+                    "mode",
+                    "is_active",
+                    "skip_bogon_filtering",
+                    "last_run_at",
+                    "owner_key_id",
+                    "created_at",
+                    "updated_at",
+                ])
+                .select_from(
+                    Query::select()
+                        .columns([
+                            "id",
+                            "name",
+                            "target_group_name",
+                            "cron_schedule",
+                            "mode",
+                            "is_active",
+                        ])
+                        .expr(Expr::val(false))
+                        .columns(["last_run_at", "owner_key_id", "created_at", "updated_at"])
+                        .from(ExternalSources::Table)
+                        .take(),
+                )
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+                .take(),
+        )
+        .await?;
+    manager
+        .exec_stmt(
+            Query::insert()
+                .into_table(DestinationGroupVaultTargets::Table)
+                .columns([
+                    "destination_group_id",
+                    "vault_endpoint_id",
+                    "target_group_name",
+                ])
+                .select_from(
+                    Query::select()
+                        .columns([
+                            "external_source_id",
+                            "vault_endpoint_id",
+                            "target_group_name",
+                        ])
+                        .from(ExternalSourceVaultTargets::Table)
+                        .take(),
+                )
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+                .take(),
+        )
+        .await?;
     Ok(())
 }
 
@@ -339,7 +392,6 @@ async fn rebuild_external_sources_sqlite(
     manager: &SchemaManager<'_>,
     post_refactor: bool,
 ) -> Result<(), DbErr> {
-    let db = manager.get_connection();
     manager
         .create_table(external_sources_definition(
             ExternalSourcesRebuild::Table.into_table_ref(),
@@ -347,28 +399,61 @@ async fn rebuild_external_sources_sqlite(
         ))
         .await?;
 
+    let mut select = Query::select();
+    select.from(ExternalSources::Table);
+    let mut columns = vec![
+        "id",
+        "name",
+        "source_url",
+        "parser_type",
+        "parser_config_json",
+    ];
+    select.columns(
+        columns
+            .iter()
+            .map(|&column| (ExternalSources::Table, column)),
+    );
     if post_refactor {
-        db.execute_unprepared(
-            "INSERT INTO external_sources_rebuild \
-             (id, destination_group_id, name, source_url, parser_type, parser_config_json, max_age_days, skip_bogon_filtering, created_at, updated_at) \
-             SELECT id, id, name, source_url, parser_type, parser_config_json, NULL, NULL, created_at, updated_at \
-             FROM external_sources",
-        )
-        .await?;
+        columns.extend([
+            "destination_group_id",
+            "max_age_days",
+            "skip_bogon_filtering",
+        ]);
+        select
+            .column(ExternalSources::Id)
+            .expr(Expr::val(Option::<i32>::None))
+            .expr(Expr::val(Option::<bool>::None));
     } else {
-        // `down`: `destination_group_id` no longer exists as a column to read from; every row it
-        // maps to is (by construction, per the up migration) its own group, so re-fetch the
-        // pre-refactor columns from that same-id group row via a join.
-        db.execute_unprepared(
-            "INSERT INTO external_sources_rebuild \
-             (id, name, source_url, parser_type, parser_config_json, cron_schedule, target_group_name, mode, is_active, last_run_at, owner_key_id, created_at, updated_at) \
-             SELECT es.id, es.name, es.source_url, es.parser_type, es.parser_config_json, \
-                    dg.cron_schedule, dg.target_group_name, dg.mode, dg.is_active, dg.last_run_at, dg.owner_key_id, \
-                    es.created_at, es.updated_at \
-             FROM external_sources es JOIN destination_groups dg ON dg.id = es.destination_group_id",
+        let group_columns = [
+            "cron_schedule",
+            "target_group_name",
+            "mode",
+            "is_active",
+            "last_run_at",
+            "owner_key_id",
+        ];
+        columns.extend(group_columns);
+        select
+            .inner_join(
+                DestinationGroups::Table,
+                Expr::col((DestinationGroups::Table, DestinationGroups::Id))
+                    .equals((ExternalSources::Table, ExternalSources::DestinationGroupId)),
+            )
+            .columns(group_columns.map(|column| (DestinationGroups::Table, column)));
+    }
+    let timestamps = ["created_at", "updated_at"];
+    columns.extend(timestamps);
+    select.columns(timestamps.map(|column| (ExternalSources::Table, column)));
+    manager
+        .exec_stmt(
+            Query::insert()
+                .into_table(ExternalSourcesRebuild::Table)
+                .columns(columns)
+                .select_from(select.take())
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+                .take(),
         )
         .await?;
-    }
 
     manager
         .drop_table(Table::drop().table(ExternalSources::Table).to_owned())
@@ -386,8 +471,6 @@ async fn rebuild_external_sources_sqlite(
 /// so no rebuild is needed — add the new columns nullable, backfill, tighten `destination_group_id`
 /// to `NOT NULL` and attach its foreign key, then drop the columns that moved up to the group.
 async fn alter_external_sources_directly(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-
     manager
         .alter_table(
             Table::alter()
@@ -399,7 +482,16 @@ async fn alter_external_sources_directly(manager: &SchemaManager<'_>) -> Result<
         )
         .await?;
 
-    db.execute_unprepared("UPDATE external_sources SET destination_group_id = id")
+    manager
+        .exec_stmt(
+            Query::update()
+                .table(ExternalSources::Table)
+                .value(
+                    ExternalSources::DestinationGroupId,
+                    Expr::col(ExternalSources::Id),
+                )
+                .take(),
+        )
         .await?;
 
     manager
@@ -453,113 +545,26 @@ impl MigrationTrait for Migration {
         create_destination_group_vault_targets(manager).await?;
         migrate_existing_rows_into_groups(manager).await?;
 
-        if manager.get_database_backend() == DatabaseBackend::Sqlite {
-            rebuild_external_sources_sqlite(manager, true).await?;
-        } else {
-            alter_external_sources_directly(manager).await?;
-        }
-
         manager
             .drop_table(
                 Table::drop()
                     .table(ExternalSourceVaultTargets::Table)
-                    .to_owned(),
+                    .take(),
             )
-            .await
+            .await?;
+        if manager.get_database_backend() == DatabaseBackend::Sqlite {
+            rebuild_external_sources_sqlite(manager, true).await
+        } else {
+            alter_external_sources_directly(manager).await
+        }
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .create_table(
-                Table::create()
-                    .table(ExternalSourceVaultTargets::Table)
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(ExternalSourceVaultTargets::ExternalSourceId)
-                            .uuid()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(ExternalSourceVaultTargets::VaultEndpointId)
-                            .uuid()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(ExternalSourceVaultTargets::TargetGroupName).text())
-                    .primary_key(
-                        Index::create()
-                            .col(ExternalSourceVaultTargets::ExternalSourceId)
-                            .col(ExternalSourceVaultTargets::VaultEndpointId),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        let db = manager.get_connection();
-        db.execute_unprepared(
-            "INSERT INTO external_source_vault_targets (external_source_id, vault_endpoint_id, target_group_name) \
-             SELECT destination_group_id, vault_endpoint_id, target_group_name FROM destination_group_vault_targets",
-        )
-        .await?;
-
+        restore_external_source_vault_targets(manager).await?;
         if manager.get_database_backend() == DatabaseBackend::Sqlite {
             rebuild_external_sources_sqlite(manager, false).await?;
         } else {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ExternalSources::Table)
-                        .add_column(ColumnDef::new(ExternalSources::CronSchedule).string())
-                        .add_column(ColumnDef::new(ExternalSources::TargetGroupName).string())
-                        .add_column(
-                            ColumnDef::new(ExternalSources::Mode)
-                                .string()
-                                .default("upsert"),
-                        )
-                        .add_column(
-                            ColumnDef::new(ExternalSources::IsActive)
-                                .boolean()
-                                .default(true),
-                        )
-                        .add_column(
-                            ColumnDef::new(ExternalSources::LastRunAt).timestamp_with_time_zone(),
-                        )
-                        .add_column(ColumnDef::new(ExternalSources::OwnerKeyId).uuid())
-                        .to_owned(),
-                )
-                .await?;
-            db.execute_unprepared(
-                "UPDATE external_sources es SET \
-                 cron_schedule = dg.cron_schedule, target_group_name = dg.target_group_name, \
-                 mode = dg.mode, is_active = dg.is_active, last_run_at = dg.last_run_at, owner_key_id = dg.owner_key_id \
-                 FROM destination_groups dg WHERE dg.id = es.destination_group_id",
-            )
-            .await?;
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ExternalSources::Table)
-                        .modify_column(
-                            ColumnDef::new(ExternalSources::CronSchedule)
-                                .string()
-                                .not_null(),
-                        )
-                        .modify_column(
-                            ColumnDef::new(ExternalSources::TargetGroupName)
-                                .string()
-                                .not_null(),
-                        )
-                        .to_owned(),
-                )
-                .await?;
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ExternalSources::Table)
-                        .drop_column(ExternalSources::DestinationGroupId)
-                        .drop_column(ExternalSources::MaxAgeDays)
-                        .drop_column(ExternalSources::SkipBogonFiltering)
-                        .to_owned(),
-                )
-                .await?;
+            restore_external_sources_columns_directly(manager).await?;
         }
 
         manager
@@ -573,6 +578,168 @@ impl MigrationTrait for Migration {
             .drop_table(Table::drop().table(DestinationGroups::Table).to_owned())
             .await
     }
+}
+
+async fn restore_external_source_vault_targets(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(ExternalSourceVaultTargets::Table)
+                .if_not_exists()
+                .col(
+                    ColumnDef::new(ExternalSourceVaultTargets::ExternalSourceId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(ExternalSourceVaultTargets::VaultEndpointId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(ExternalSourceVaultTargets::TargetGroupName).text())
+                .primary_key(
+                    Index::create()
+                        .col(ExternalSourceVaultTargets::ExternalSourceId)
+                        .col(ExternalSourceVaultTargets::VaultEndpointId),
+                )
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .exec_stmt(
+            Query::insert()
+                .into_table(ExternalSourceVaultTargets::Table)
+                .columns([
+                    "external_source_id",
+                    "vault_endpoint_id",
+                    "target_group_name",
+                ])
+                .select_from(
+                    Query::select()
+                        .columns([
+                            "destination_group_id",
+                            "vault_endpoint_id",
+                            "target_group_name",
+                        ])
+                        .from(DestinationGroupVaultTargets::Table)
+                        .take(),
+                )
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+                .take(),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn restore_external_sources_columns_directly(
+    manager: &SchemaManager<'_>,
+) -> Result<(), DbErr> {
+    manager
+        .alter_table(
+            Table::alter()
+                .table(ExternalSources::Table)
+                .add_column(ColumnDef::new(ExternalSources::CronSchedule).string())
+                .add_column(ColumnDef::new(ExternalSources::TargetGroupName).string())
+                .add_column(
+                    ColumnDef::new(ExternalSources::Mode)
+                        .string()
+                        .default("upsert"),
+                )
+                .add_column(
+                    ColumnDef::new(ExternalSources::IsActive)
+                        .boolean()
+                        .default(true),
+                )
+                .add_column(ColumnDef::new(ExternalSources::LastRunAt).timestamp_with_time_zone())
+                .add_column(ColumnDef::new(ExternalSources::OwnerKeyId).uuid())
+                .to_owned(),
+        )
+        .await?;
+    backfill_external_sources_from_groups(manager).await?;
+    manager
+        .alter_table(
+            Table::alter()
+                .table(ExternalSources::Table)
+                .modify_column(
+                    ColumnDef::new(ExternalSources::CronSchedule)
+                        .string()
+                        .not_null(),
+                )
+                .modify_column(
+                    ColumnDef::new(ExternalSources::TargetGroupName)
+                        .string()
+                        .not_null(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_foreign_key(
+            ForeignKey::drop()
+                .table(ExternalSources::Table)
+                .name("fk-external_sources-destination_group")
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .alter_table(
+            Table::alter()
+                .table(ExternalSources::Table)
+                .drop_column(ExternalSources::DestinationGroupId)
+                .drop_column(ExternalSources::MaxAgeDays)
+                .drop_column(ExternalSources::SkipBogonFiltering)
+                .to_owned(),
+        )
+        .await
+}
+
+async fn backfill_external_sources_from_groups(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let select = Query::select()
+        .columns([
+            "id",
+            "cron_schedule",
+            "target_group_name",
+            "mode",
+            "is_active",
+            "last_run_at",
+            "owner_key_id",
+        ])
+        .from(DestinationGroups::Table)
+        .take();
+    for group in manager.get_connection().query_all(&select).await? {
+        let id: uuid::Uuid = group.try_get("", "id")?;
+        manager
+            .exec_stmt(
+                Query::update()
+                    .table(ExternalSources::Table)
+                    .value(
+                        ExternalSources::CronSchedule,
+                        group.try_get::<String>("", "cron_schedule")?,
+                    )
+                    .value(
+                        ExternalSources::TargetGroupName,
+                        group.try_get::<String>("", "target_group_name")?,
+                    )
+                    .value(ExternalSources::Mode, group.try_get::<String>("", "mode")?)
+                    .value(
+                        ExternalSources::IsActive,
+                        group.try_get::<bool>("", "is_active")?,
+                    )
+                    .value(
+                        ExternalSources::LastRunAt,
+                        group
+                            .try_get::<Option<chrono::DateTime<chrono::Utc>>>("", "last_run_at")?,
+                    )
+                    .value(
+                        ExternalSources::OwnerKeyId,
+                        group.try_get::<Option<uuid::Uuid>>("", "owner_key_id")?,
+                    )
+                    .and_where(Expr::col(ExternalSources::DestinationGroupId).eq(id))
+                    .take(),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

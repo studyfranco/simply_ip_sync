@@ -1,7 +1,4 @@
-//! Schema migrations. Ordered below; each file is one applied migration and is immutable history
-//! — only documentation may be corrected in place. This is the one directory (besides `db.rs`'s
-//! `PRAGMA` setup) where raw SQL is permitted, because DDL for generated columns and per-engine
-//! storage classes cannot be expressed portably through SeaQuery.
+//! Schema migrations in application order. `SeaQuery` builds the schema and data statements.
 
 pub use sea_orm_migration::prelude::*;
 
@@ -12,6 +9,7 @@ mod m20260928_033617_destination_groups;
 mod m20260928_034145_vault_sync_task_bogon_filtering;
 mod m20261109_000001_add_performance_indexes;
 mod m20261110_000001_add_scheduling_and_lookup_indexes;
+mod m20261119_112000_unify_text_columns;
 
 /// The ordered set of migrations applied at startup.
 pub struct Migrator;
@@ -27,6 +25,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260928_034145_vault_sync_task_bogon_filtering::Migration),
             Box::new(m20261109_000001_add_performance_indexes::Migration),
             Box::new(m20261110_000001_add_scheduling_and_lookup_indexes::Migration),
+            Box::new(m20261119_112000_unify_text_columns::Migration),
         ]
     }
 }

@@ -26,6 +26,17 @@ use crate::extract::StrictJson;
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
+/// Non-master capability flags on an [`ApiKeyResponse`], flattened to preserve top-level JSON fields.
+#[derive(Debug, Serialize)]
+pub struct ApiKeyScopeFlags {
+    /// Global privilege to manage other API keys.
+    pub can_manage_keys: bool,
+    /// Global privilege to create external sources.
+    pub can_manage_sources: bool,
+    /// Global privilege to register vault endpoints and inter-vault sync tasks.
+    pub can_manage_vaults: bool,
+}
+
 /// An `api_keys` row as returned by the API. Never includes `key_hash` or `signing_secret`.
 #[derive(Debug, Serialize)]
 pub struct ApiKeyResponse {
@@ -37,12 +48,9 @@ pub struct ApiKeyResponse {
     pub prefix: String,
     /// Whether this is the (unique) Master key.
     pub is_master: bool,
-    /// Global privilege to manage other API keys.
-    pub can_manage_keys: bool,
-    /// Global privilege to create external sources.
-    pub can_manage_sources: bool,
-    /// Global privilege to register vault endpoints and inter-vault sync tasks.
-    pub can_manage_vaults: bool,
+    /// Delegated global permission flags.
+    #[serde(flatten)]
+    pub scopes: ApiKeyScopeFlags,
     /// Parent key creator id. Lineage only.
     pub parent_key_id: Option<Uuid>,
     /// Comma-separated CIDR ranges permitted to use this key.
@@ -60,9 +68,11 @@ impl From<api_key::Model> for ApiKeyResponse {
             name: m.name,
             prefix: m.prefix,
             is_master: m.is_master,
-            can_manage_keys: m.can_manage_keys,
-            can_manage_sources: m.can_manage_sources,
-            can_manage_vaults: m.can_manage_vaults,
+            scopes: ApiKeyScopeFlags {
+                can_manage_keys: m.can_manage_keys,
+                can_manage_sources: m.can_manage_sources,
+                can_manage_vaults: m.can_manage_vaults,
+            },
             parent_key_id: m.parent_key_id,
             bound_ips: m.bound_ips,
             created_at: m.created_at,
@@ -507,8 +517,23 @@ pub async fn list_key_permissions(
     Ok(Json(rows))
 }
 
+fn widens_permissions(
+    existing: Option<&api_key_sync_permission::Model>,
+    can_sync: bool,
+    can_manage: bool,
+    can_view_logs: bool,
+) -> bool {
+    let Some(held) = existing else {
+        return true;
+    };
+    (can_sync && !held.can_sync)
+        || (can_manage && !held.can_manage)
+        || (can_view_logs && !held.can_view_logs)
+}
+
 /// `PUT /api/keys/{id}/permissions`. Requires `can_manage_keys`, RBAC R2 (manage rights on the
-/// target resource), and R1/R7 (the caller may only grant verbs it holds itself).
+/// target resource), and R1/R7 when widening or creating a row (R6: pure reductions require R2
+/// only, and self-reduction is permitted). Master keys cannot hold M:N permission rows (RBAC §5).
 pub async fn grant_key_permission(
     State(state): State<AppState>,
     axum::Extension(caller): axum::Extension<api_key::Model>,
@@ -521,6 +546,11 @@ pub async fn grant_key_permission(
         .one(&state.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    if target.is_master {
+        return Err(AppError::InvalidInput(
+            "cannot configure M:N permissions on the Master key (RBAC §5)".to_owned(),
+        ));
+    }
     if payload.resource_type != "destination_group"
         && payload.resource_type != "sync_task"
         && payload.resource_type != "vault_endpoint"
@@ -537,14 +567,6 @@ pub async fn grant_key_permission(
         payload.resource_id,
     )
     .await?;
-    guard_delegated_grant(
-        &caller,
-        caller_permission.as_ref(),
-        payload.can_sync,
-        payload.can_manage,
-        payload.can_view_logs,
-    )?;
-
     let existing = super::support::find_permission(
         &state.db,
         target.id,
@@ -552,27 +574,49 @@ pub async fn grant_key_permission(
         payload.resource_id,
     )
     .await?;
-    let row = match existing {
-        Some(existing) => {
-            let mut active: api_key_sync_permission::ActiveModel = existing.into();
-            active.can_sync = Set(payload.can_sync);
-            active.can_manage = Set(payload.can_manage);
-            active.can_view_logs = Set(payload.can_view_logs);
-            active.update(&state.db).await?
+    let widens = widens_permissions(
+        existing.as_ref(),
+        payload.can_sync,
+        payload.can_manage,
+        payload.can_view_logs,
+    );
+    if !caller.is_master {
+        if widens {
+            if target.id == caller.id {
+                return Err(AppError::Forbidden(
+                    "only the Master key may grant itself resource permissions".to_owned(),
+                ));
+            }
+            guard_delegated_grant(
+                &caller,
+                caller_permission.as_ref(),
+                payload.can_sync,
+                payload.can_manage,
+                payload.can_view_logs,
+            )?;
+        } else {
+            guard_revocation(&caller, caller_permission.as_ref())?;
         }
-        None => {
-            let active = api_key_sync_permission::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                api_key_id: Set(target.id),
-                resource_type: Set(payload.resource_type.clone()),
-                resource_id: Set(payload.resource_id),
-                can_sync: Set(payload.can_sync),
-                can_manage: Set(payload.can_manage),
-                can_view_logs: Set(payload.can_view_logs),
-                created_at: Set(Utc::now()),
-            };
-            active.insert(&state.db).await?
-        }
+    }
+
+    let row = if let Some(existing) = existing {
+        let mut active: api_key_sync_permission::ActiveModel = existing.into();
+        active.can_sync = Set(payload.can_sync);
+        active.can_manage = Set(payload.can_manage);
+        active.can_view_logs = Set(payload.can_view_logs);
+        active.update(&state.db).await?
+    } else {
+        let active = api_key_sync_permission::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            api_key_id: Set(target.id),
+            resource_type: Set(payload.resource_type.clone()),
+            resource_id: Set(payload.resource_id),
+            can_sync: Set(payload.can_sync),
+            can_manage: Set(payload.can_manage),
+            can_view_logs: Set(payload.can_view_logs),
+            created_at: Set(Utc::now()),
+        };
+        active.insert(&state.db).await?
     };
 
     create_audit_log(
@@ -599,6 +643,15 @@ pub async fn revoke_key_permission(
     StrictPath((id, permission_id)): StrictPath<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
     guard_manage_keys(&caller)?;
+    let target = api_key::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if target.is_master {
+        return Err(AppError::InvalidInput(
+            "cannot configure M:N permissions on the Master key (RBAC §5)".to_owned(),
+        ));
+    }
     let permission = api_key_sync_permission::Entity::find_by_id(permission_id)
         .one(&state.db)
         .await?

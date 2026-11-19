@@ -33,6 +33,10 @@ fn normalize_cron(expr: &str) -> String {
 /// expression never reaches persistence — a source or task that can never be scheduled is not a
 /// source or task, it is silent data corruption waiting to be noticed at the next cron tick that
 /// never comes.
+///
+/// # Errors
+///
+/// Returns an explanatory error string if `expr` is empty or cannot be parsed by `croner`.
 pub fn validate_cron_expression(expr: &str) -> Result<(), String> {
     if expr.trim().is_empty() {
         return Err("cron_schedule must not be empty".to_owned());
@@ -57,6 +61,10 @@ pub struct SchedulerHandle {
 
 impl SchedulerHandle {
     /// Builds and starts a new scheduler with no jobs registered yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobSchedulerError`] if creating or starting the scheduler fails.
     pub async fn new() -> Result<Self, JobSchedulerError> {
         let scheduler = JobScheduler::new().await?;
         scheduler.start().await?;
@@ -69,6 +77,10 @@ impl SchedulerHandle {
 
     /// Loads every `is_active = true` destination group and sync task from the database and
     /// registers a cron job for each. Called once at startup, after `AppState` is fully built.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbErr` if loading active groups or sync tasks fails.
     pub async fn boot(&self, state: &AppState) -> Result<(), sea_orm::DbErr> {
         let groups = destination_group::Entity::find()
             .filter(destination_group::Column::IsActive.eq(true))

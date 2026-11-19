@@ -8,11 +8,11 @@
 //! suite starts.
 //!
 //! `master_marker` must never appear on the `api_key` entity `Model` (see `entities/api_key.rs`):
-//! SeaORM builds explicit column lists from the entity, so a declared field would enter every
+//! `SeaORM` builds explicit column lists from the entity, so a declared field would enter every
 //! `INSERT`, and every engine rejects a write to a generated column.
 
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -26,12 +26,12 @@ impl MigrationTrait for Migration {
         // Pre-flight: abort before any DDL if the database already holds two or more masters
         // (never triggers on a fresh install, but keeps the migration correct if ever replayed
         // against a database seeded by something other than this service's own bootstrap path).
-        let existing_masters = db
-            .query_all_raw(Statement::from_string(
-                backend,
-                "SELECT id FROM api_keys WHERE is_master = true".to_owned(),
-            ))
-            .await?;
+        let select = Query::select()
+            .column(ApiKeys::Id)
+            .from(ApiKeys::Table)
+            .and_where(Expr::col(ApiKeys::IsMaster).eq(true))
+            .take();
+        let existing_masters = db.query_all(&select).await?;
         if existing_masters.len() > 1 {
             return Err(DbErr::Custom(format!(
                 "refusing to add master_marker: {} rows already have is_master=true, expected at most 1",
@@ -44,10 +44,18 @@ impl MigrationTrait for Migration {
             _ => "VIRTUAL",
         };
         let expression = "CASE WHEN is_master THEN 1 ELSE NULL END";
-        db.execute_unprepared(&format!(
-            "ALTER TABLE api_keys ADD COLUMN master_marker INTEGER GENERATED ALWAYS AS ({expression}) {storage}"
-        ))
-        .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKeys::Table)
+                    .add_column(
+                        ColumnDef::new(MasterMarker::MasterMarker)
+                            .integer()
+                            .extra(format!("GENERATED ALWAYS AS ({expression}) {storage}")),
+                    )
+                    .take(),
+            )
+            .await?;
 
         manager
             .create_index(
@@ -65,10 +73,20 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_index(Index::drop().name("idx-api_keys-master_marker").to_owned())
+            .drop_index(
+                Index::drop()
+                    .table(ApiKeys::Table)
+                    .name("idx-api_keys-master_marker")
+                    .to_owned(),
+            )
             .await?;
-        let db = manager.get_connection();
-        db.execute_unprepared("ALTER TABLE api_keys DROP COLUMN master_marker")
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKeys::Table)
+                    .drop_column(MasterMarker::MasterMarker)
+                    .take(),
+            )
             .await?;
         Ok(())
     }
@@ -77,6 +95,8 @@ impl MigrationTrait for Migration {
 #[derive(DeriveIden)]
 enum ApiKeys {
     Table,
+    Id,
+    IsMaster,
 }
 
 #[derive(DeriveIden)]

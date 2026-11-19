@@ -80,7 +80,7 @@ Stores configuration and authentication credentials for target/source `simply_ip
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique identifier for the vault endpoint |
 | `name` | `String` | Not Null, Unique, Indexed | Human-readable endpoint name (e.g., `Vault-Paris-DMZ`) |
-| `target_url` | `String` | Not Null | Base HTTP/HTTPS URL of the distant vault (e.g., `https://vault-paris.internal:3000`) |
+| `target_url` | `Text` | Not Null | Base HTTP/HTTPS URL of the distant vault (e.g., `https://vault-paris.internal:3000`) |
 | `api_key` | `Text` | Not Null | Plaintext `X-API-Key` sent to the remote Vault |
 | `signing_secret` | `Text` | Not Null | HMAC signing secret used to compute `X-Signature-256` for remote Vault calls. Encrypted at rest via XChaCha20-Poly1305 (`v1.xchacha20poly1305...`) |
 | `description` | `Text` | Nullable | Optional description |
@@ -100,7 +100,7 @@ policy; 1-to-N child feeds (`external_sources`) supply the actual URLs/parsers a
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique identifier for the destination group |
 | `name` | `String` | Not Null, Unique, Indexed | Human-readable name (e.g., `Public_Blocklists`) |
-| `target_group_name` | `String` | Not Null | Default group name in target `ip_vault`s where the aggregated content lands |
+| `target_group_name` | `Text` | Not Null | Default group name in target `ip_vault`s where the aggregated content lands |
 | `cron_schedule` | `String` | Not Null | Cron expression for periodic execution of every child feed, concurrently, as one run |
 | `mode` | `String` | Not Null, Default: `'upsert'` | Ingestion mode: `'upsert'` (never implicitly deletes) or `'full_replace'` (this run's aggregated content becomes the target group's full authoritative set). Applies to chunk 0 of each target's chunk sequence only — every later chunk of the same run downgrades to `'upsert'` automatically (see `AGENT.MD` §3.A) |
 | `is_active` | `Boolean` | Default: `true` | Enable/disable automatic scheduling |
@@ -122,7 +122,7 @@ default group-wide bogon-filtering policy all live on the owning `destination_gr
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique identifier for the feed |
 | `destination_group_id` | `UUID` | Not Null, FK -> `destination_groups.id` (CASCADE) | Owning destination group |
 | `name` | `String` | Not Null, Unique, Indexed | Human-readable name (e.g., `Spamhaus_DROP`), unique across all feeds regardless of group |
-| `source_url` | `String` | Not Null | HTTP/HTTPS URL of the raw feed |
+| `source_url` | `Text` | Not Null | HTTP/HTTPS URL of the raw feed |
 | `parser_type` | `String` | Not Null, Default: `'REGEX_LINE'` | Parser algorithm: `'REGEX_LINE'` or `'JSON_PATH'` |
 | `parser_config_json`| `Text` | Nullable | JSON configuration for parser — field mapping (`JSON_PATH`'s `$.`-prefixed `target_address`/`last_seen_at` selectors, see `AGENT.MD` §2), custom headers, user agent |
 | `max_age_days` | `Integer` | Nullable | Discards a record whose `last_seen_at` (per the `JSON_PATH` config's optional selector) is older than this many days. Ignored when no `last_seen_at` selector is configured |
@@ -156,8 +156,8 @@ Defines inter-vault delta replication tasks from a source Vault group to target 
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique sync task ID |
 | `name` | `String` | Not Null, Unique, Indexed | Human-readable task name (e.g., `Sync_Paris_To_Lyon`) |
 | `source_vault_id` | `UUID` | FK -> `vault_endpoints.id` (CASCADE) | Source Vault Endpoint ID |
-| `source_group_name` | `String` | Not Null | Group name to query on source Vault |
-| `target_group_name` | `String` | Not Null | Default target group name on receiving Vaults |
+| `source_group_name` | `Text` | Not Null | Group name to query on source Vault |
+| `target_group_name` | `Text` | Not Null | Default target group name on receiving Vaults |
 | `cron_schedule` | `String` | Not Null | Cron expression for periodic delta polling |
 | `last_sync_at` | `DateTimeUtc` | Nullable | High-water mark timestamp used for `since=` delta queries |
 | `mode` | `String` | Not Null, Default: `'upsert'` | Sync mode: strictly `'upsert'`. Deliberately **not** extended to `'full_replace'` the way `destination_groups.mode` was — a delta batch (`since=`-filtered) is an incremental slice of a group, not its full content, so `full_replace` here would read as "delete everything the current delta batch didn't happen to touch" on every run (see `AGENT.MD` §3.B) |
@@ -231,7 +231,7 @@ Security audit trail tracking mutating operations across `simply_ip_sync`.
 | `api_key_prefix` | `String` | **Not Null** (since `m20260818_010217`) | Denormalized actor key prefix |
 | `client_ip` | `String` | **Not Null** (since `m20260818_010217`) | Resolved client IP |
 | `action` | `String` | Not Null, Indexed | Action name (e.g. `GROUP_CREATE`, `GROUP_TRIGGER`, `FEED_CREATE`, `TASK_UPDATE`, `KEY_ROTATE`) |
-| `target_resource`| `String` | Nullable | Human-readable target name |
+| `target_resource`| `Text` | Nullable | Human-readable target name |
 | `details` | `Text` | Nullable | Additional payload context |
 | `timestamp` | `DateTimeUtc` | Not Null, Indexed | Event timestamp |
 

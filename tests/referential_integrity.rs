@@ -29,7 +29,7 @@ async fn file_backed_db() -> DatabaseConnection {
 /// `AGENT_NOTES.MD`'s corresponding session entry); a bare feed (`external_sources` row) carries
 /// neither anymore.
 fn insert_group_sql(id: &str, owner_key_id: Option<&str>) -> String {
-    let owner = owner_key_id.map(|o| format!("'{o}'")).unwrap_or_else(|| "NULL".to_owned());
+    let owner = owner_key_id.map_or_else(|| "NULL".to_owned(), |o| format!("'{o}'"));
     format!(
         "INSERT INTO destination_groups (id, name, target_group_name, cron_schedule, mode, is_active, skip_bogon_filtering, owner_key_id, created_at, updated_at) \
          VALUES ('{id}', 'g-{id}', 'g', '0 0 * * *', 'upsert', 1, 0, {owner}, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
@@ -45,7 +45,10 @@ fn insert_vault_sql(id: &str) -> String {
 
 async fn row_count(db: &DatabaseConnection, table: &str) -> i64 {
     let row = db
-        .query_one_raw(Statement::from_string(db.get_database_backend(), format!("SELECT COUNT(*) AS c FROM {table}")))
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            format!("SELECT COUNT(*) AS c FROM {table}"),
+        ))
         .await
         .expect("count query")
         .expect("count row");
@@ -61,9 +64,21 @@ async fn row_count(db: &DatabaseConnection, table: &str) -> i64 {
 #[tokio::test]
 async fn cascade_delete_does_not_reach_into_an_unrelated_parents_row() {
     let db = file_backed_db().await;
-    db.execute_unprepared(&insert_group_sql("d0000000-0000-0000-0000-000000000001", None)).await.expect("doomed group");
-    db.execute_unprepared(&insert_group_sql("50000000-0000-0000-0000-000000000002", None)).await.expect("survivor group");
-    db.execute_unprepared(&insert_vault_sql("70000000-0000-0000-0000-000000000003")).await.expect("shared target vault");
+    db.execute_unprepared(&insert_group_sql(
+        "d0000000-0000-0000-0000-000000000001",
+        None,
+    ))
+    .await
+    .expect("doomed group");
+    db.execute_unprepared(&insert_group_sql(
+        "50000000-0000-0000-0000-000000000002",
+        None,
+    ))
+    .await
+    .expect("survivor group");
+    db.execute_unprepared(&insert_vault_sql("70000000-0000-0000-0000-000000000003"))
+        .await
+        .expect("shared target vault");
     db.execute_unprepared(
         "INSERT INTO destination_group_vault_targets (destination_group_id, vault_endpoint_id, target_group_name) \
          VALUES ('d0000000-0000-0000-0000-000000000001', '70000000-0000-0000-0000-000000000003', NULL)",
@@ -77,12 +92,17 @@ async fn cascade_delete_does_not_reach_into_an_unrelated_parents_row() {
     .await
     .expect("survivor junction row");
 
-    db.execute_unprepared("DELETE FROM destination_groups WHERE id = 'd0000000-0000-0000-0000-000000000001'")
-        .await
-        .expect("delete doomed group");
+    db.execute_unprepared(
+        "DELETE FROM destination_groups WHERE id = 'd0000000-0000-0000-0000-000000000001'",
+    )
+    .await
+    .expect("delete doomed group");
 
     let remaining = row_count(&db, "destination_group_vault_targets").await;
-    assert_eq!(remaining, 1, "exactly the survivor's junction row must remain — the cascade must not have swept up an unrelated parent's row");
+    assert_eq!(
+        remaining, 1,
+        "exactly the survivor's junction row must remain — the cascade must not have swept up an unrelated parent's row"
+    );
     let survivor_still_present = db
         .query_all_raw(Statement::from_string(
             db.get_database_backend(),
@@ -90,7 +110,11 @@ async fn cascade_delete_does_not_reach_into_an_unrelated_parents_row() {
         ))
         .await
         .expect("query");
-    assert_eq!(survivor_still_present.len(), 1, "the survivor's own row must be exactly the one that remains");
+    assert_eq!(
+        survivor_still_present.len(),
+        1,
+        "the survivor's own row must be exactly the one that remains"
+    );
 }
 
 /// Write-time enforcement, not just delete-time: a junction row naming a `destination_group_id`
@@ -99,7 +123,9 @@ async fn cascade_delete_does_not_reach_into_an_unrelated_parents_row() {
 #[tokio::test]
 async fn junction_row_with_a_dangling_foreign_key_is_rejected_at_insert_time() {
     let db = file_backed_db().await;
-    db.execute_unprepared(&insert_vault_sql("70000000-0000-0000-0000-000000000004")).await.expect("target vault");
+    db.execute_unprepared(&insert_vault_sql("70000000-0000-0000-0000-000000000004"))
+        .await
+        .expect("target vault");
 
     let result = db
         .execute_unprepared(
@@ -107,7 +133,10 @@ async fn junction_row_with_a_dangling_foreign_key_is_rejected_at_insert_time() {
              VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', '70000000-0000-0000-0000-000000000004', NULL)",
         )
         .await;
-    assert!(result.is_err(), "a junction row naming a non-existent destination_group_id must be refused at write time, not silently accepted");
+    assert!(
+        result.is_err(),
+        "a junction row naming a non-existent destination_group_id must be refused at write time, not silently accepted"
+    );
 }
 
 /// `owner_key_id` on `destination_groups`/`vault_endpoints`/`vault_sync_tasks` carries no FK
@@ -128,10 +157,14 @@ async fn owner_key_id_is_deliberately_unconstrained_by_design() {
     let db = file_backed_db().await;
     // No api_keys row with this id exists anywhere — if owner_key_id carried a real FK, this
     // insert would be rejected exactly like the dangling-destination_group_id case above.
-    let result = db.execute_unprepared(&insert_group_sql(
-        "90000000-0000-0000-0000-000000000005",
-        Some("ffffffff-ffff-ffff-ffff-ffffffffffff"),
-    ))
-    .await;
-    assert!(result.is_ok(), "owner_key_id must not be FK-constrained — the application layer, not the database, governs ownership cleanup");
+    let result = db
+        .execute_unprepared(&insert_group_sql(
+            "90000000-0000-0000-0000-000000000005",
+            Some("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        ))
+        .await;
+    assert!(
+        result.is_ok(),
+        "owner_key_id must not be FK-constrained — the application layer, not the database, governs ownership cleanup"
+    );
 }

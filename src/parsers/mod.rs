@@ -34,12 +34,17 @@ pub struct ParsedRecord {
 pub trait FeedParser {
     /// Parses `raw`, using `config` (the source's `parser_config_json`, if any) to steer
     /// extraction. Duplicates are not required to be removed by the parser (callers deduplicate).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `config` is invalid or `raw` cannot be parsed.
     fn parse(&self, raw: &[u8], config: Option<&str>) -> Result<Vec<ParsedRecord>, ParseError>;
 }
 
 /// Normalizes a bare IP address or CIDR subnet to a canonical string form (`/32`/`/128` singles
 /// stored without a prefix, everything else keeps its prefix length). Returns `None` if `input`
 /// is not a valid IP address or CIDR subnet.
+#[must_use]
 pub fn normalize_ip_or_cidr(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if let Ok(net) = trimmed.parse::<ipnet::IpNet>() {
@@ -60,6 +65,10 @@ pub fn normalize_ip_or_cidr(input: &str) -> Option<String> {
 }
 
 /// Selects the parser implementation for `parser_type` (`"REGEX_LINE"` or `"JSON_PATH"`).
+///
+/// # Errors
+///
+/// Returns [`ParseError::InvalidConfig`] if `parser_type` is not recognized.
 pub fn for_type(parser_type: &str) -> Result<Box<dyn FeedParser + Send + Sync>, ParseError> {
     match parser_type {
         "REGEX_LINE" => Ok(Box::new(regex_line::RegexLineParser)),
@@ -77,17 +86,38 @@ mod tests {
     #[test]
     fn normalize_ip_or_cidr_strips_host_prefix_and_keeps_subnets() {
         // IPv4
-        assert_eq!(normalize_ip_or_cidr("192.168.1.1/32"), Some("192.168.1.1".to_owned()));
-        assert_eq!(normalize_ip_or_cidr("192.168.1.1"), Some("192.168.1.1".to_owned()));
-        assert_eq!(normalize_ip_or_cidr("10.0.0.0/24"), Some("10.0.0.0/24".to_owned()));
+        assert_eq!(
+            normalize_ip_or_cidr("192.168.1.1/32"),
+            Some("192.168.1.1".to_owned())
+        );
+        assert_eq!(
+            normalize_ip_or_cidr("192.168.1.1"),
+            Some("192.168.1.1".to_owned())
+        );
+        assert_eq!(
+            normalize_ip_or_cidr("10.0.0.0/24"),
+            Some("10.0.0.0/24".to_owned())
+        );
 
         // IPv6
-        assert_eq!(normalize_ip_or_cidr("2001:db8::1/128"), Some("2001:db8::1".to_owned()));
-        assert_eq!(normalize_ip_or_cidr("2001:db8::1"), Some("2001:db8::1".to_owned()));
-        assert_eq!(normalize_ip_or_cidr("2001:db8::/64"), Some("2001:db8::/64".to_owned()));
+        assert_eq!(
+            normalize_ip_or_cidr("2001:db8::1/128"),
+            Some("2001:db8::1".to_owned())
+        );
+        assert_eq!(
+            normalize_ip_or_cidr("2001:db8::1"),
+            Some("2001:db8::1".to_owned())
+        );
+        assert_eq!(
+            normalize_ip_or_cidr("2001:db8::/64"),
+            Some("2001:db8::/64".to_owned())
+        );
 
         // Whitespace handling & invalid
-        assert_eq!(normalize_ip_or_cidr("  8.8.8.8  "), Some("8.8.8.8".to_owned()));
+        assert_eq!(
+            normalize_ip_or_cidr("  8.8.8.8  "),
+            Some("8.8.8.8".to_owned())
+        );
         assert_eq!(normalize_ip_or_cidr("not-an-ip"), None);
         assert_eq!(normalize_ip_or_cidr(""), None);
     }

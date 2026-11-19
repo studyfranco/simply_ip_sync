@@ -1,4 +1,4 @@
-//! SeaORM entity models. One file per table, plus [`prelude`] for the flat `Entity` re-export
+//! `SeaORM` entity models. One file per table, plus [`prelude`] for the flat `Entity` re-export
 //! set. Every file is generated-shaped (`Model`, `ActiveModel`, `Column`, `Relation`,
 //! `ActiveModelBehavior`) and must not hold business logic, defaults that encode policy, or
 //! authorization helpers.

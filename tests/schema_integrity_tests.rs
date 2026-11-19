@@ -35,7 +35,10 @@ async fn master_marker_index_exists_after_migration() {
     let present = db::has_index(&db, "api_keys", "idx-api_keys-master_marker")
         .await
         .expect("has_index query");
-    assert!(present, "master_marker unique index must exist after migration");
+    assert!(
+        present,
+        "master_marker unique index must exist after migration"
+    );
 }
 
 #[tokio::test]
@@ -50,7 +53,10 @@ async fn performance_and_lookup_indexes_exist_after_migration() {
         ("vault_sync_tasks", "idx_vault_sync_tasks_created_at"),
         ("sync_logs", "idx_sync_logs_status_timestamp"),
         ("sync_logs", "idx_sync_logs_job_type_timestamp"),
-        ("api_key_sync_permissions", "idx_api_key_sync_permissions_resource"),
+        (
+            "api_key_sync_permissions",
+            "idx_api_key_sync_permissions_resource",
+        ),
         ("api_keys", "idx_api_keys_is_master"),
         ("api_keys", "idx_api_keys_created_at"),
         ("vault_endpoints", "idx_vault_endpoints_created_at"),
@@ -61,7 +67,10 @@ async fn performance_and_lookup_indexes_exist_after_migration() {
         let present = db::has_index(&db, table, index)
             .await
             .unwrap_or_else(|e| panic!("failed checking index {index} on {table}: {e}"));
-        assert!(present, "index {index} on table {table} must exist after migrations");
+        assert!(
+            present,
+            "index {index} on table {table} must exist after migrations"
+        );
     }
 }
 
@@ -111,9 +120,11 @@ async fn junction_table_rows_cascade_on_parent_delete() {
     .await
     .expect("insert junction row");
 
-    db.execute_unprepared("DELETE FROM destination_groups WHERE id = '00000000-0000-0000-0000-000000000003'")
-        .await
-        .expect("delete destination group");
+    db.execute_unprepared(
+        "DELETE FROM destination_groups WHERE id = '00000000-0000-0000-0000-000000000003'",
+    )
+    .await
+    .expect("delete destination group");
 
     let remaining = db
         .query_all_raw(Statement::from_string(
@@ -122,5 +133,165 @@ async fn junction_table_rows_cascade_on_parent_delete() {
         ))
         .await
         .expect("query junction table");
-    assert!(remaining.is_empty(), "junction row must cascade-delete with its parent destination group");
+    assert!(
+        remaining.is_empty(),
+        "junction row must cascade-delete with its parent destination group"
+    );
+}
+
+const WIDENED_COLUMNS: [(&str, &str, &str); 6] = [
+    ("vault_endpoints", "target_url", "https://vault.example"),
+    ("external_sources", "source_url", "https://feed.example"),
+    ("destination_groups", "target_group_name", "group-target"),
+    ("vault_sync_tasks", "source_group_name", "task-source"),
+    ("vault_sync_tasks", "target_group_name", "task-target"),
+    ("audit_logs", "target_resource", "audit-target"),
+];
+
+async fn assert_column_types(db: &DatabaseConnection, expected: &str) {
+    for (table, column, _) in WIDENED_COLUMNS {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT type FROM pragma_table_info(?) WHERE name = ?",
+                [table.into(), column.into()],
+            ))
+            .await
+            .expect("inspect column")
+            .expect("column exists");
+        assert_eq!(
+            row.try_get::<String>("", "type").expect("declared type"),
+            expected,
+            "{table}.{column}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn fresh_database_declares_all_six_text_columns() {
+    let db = in_memory_db().await;
+    assert_column_types(&db, "TEXT").await;
+}
+
+#[tokio::test]
+async fn text_column_upgrade_preserves_rows_indexes_and_foreign_keys() {
+    use simply_ip_sync::migration::{Migrator, MigratorTrait};
+
+    let db = db::connect("sqlite::memory:").await.expect("connect");
+    let preceding = u32::try_from(Migrator::migrations().len() - 1).expect("migration count");
+    Migrator::up(&db, Some(preceding))
+        .await
+        .expect("old schema");
+    assert_column_types(&db, "varchar").await;
+
+    db.execute_unprepared(
+        "INSERT INTO api_keys (id, name, key_hash, prefix, created_at, updated_at)
+            VALUES ('key', 'key', 'hash', 'prefix', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+         INSERT INTO vault_endpoints (id, name, target_url, api_key, signing_secret, created_at, updated_at)
+            VALUES ('vault', 'vault', 'https://vault.example', 'key', 'secret', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+         INSERT INTO destination_groups (id, name, target_group_name, cron_schedule, created_at, updated_at)
+            VALUES ('group', 'group', 'group-target', '0 0 * * *', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+         INSERT INTO external_sources (id, destination_group_id, name, source_url, created_at, updated_at)
+            VALUES ('feed', 'group', 'feed', 'https://feed.example', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+         INSERT INTO vault_sync_tasks (id, name, source_vault_id, source_group_name, target_group_name, cron_schedule, created_at, updated_at)
+            VALUES ('task', 'task', 'vault', 'task-source', 'task-target', '0 0 * * *', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+         INSERT INTO destination_group_vault_targets VALUES ('group', 'vault', 'group-override');
+         INSERT INTO vault_sync_task_targets VALUES ('task', 'vault', 'task-override');
+         INSERT INTO audit_logs (id, api_key_id, api_key_name, api_key_prefix, client_ip, action, target_resource, timestamp)
+            VALUES ('log', 'key', 'key', 'prefix', '192.0.2.1', 'create', 'audit-target', CURRENT_TIMESTAMP);",
+    )
+    .await
+    .expect("seed pre-upgrade database");
+
+    let before = text_migration_indexes(&db).await;
+    Migrator::up(&db, None).await.expect("upgrade schema");
+    assert_column_types(&db, "TEXT").await;
+    assert_eq!(text_migration_indexes(&db).await, before);
+
+    for (table, column, expected) in WIDENED_COLUMNS.into_iter().chain([
+        (
+            "destination_group_vault_targets",
+            "target_group_name",
+            "group-override",
+        ),
+        (
+            "vault_sync_task_targets",
+            "target_group_name",
+            "task-override",
+        ),
+    ]) {
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                db.get_database_backend(),
+                format!("SELECT {column} FROM {table}"),
+            ))
+            .await
+            .expect("read migrated values");
+        assert_eq!(rows.len(), 1, "{table}");
+        assert_eq!(
+            rows[0].try_get::<String>("", column).expect("value"),
+            expected
+        );
+    }
+
+    Migrator::down(&db, Some(1))
+        .await
+        .expect("roll back text migration");
+    assert_column_types(&db, "varchar").await;
+    Migrator::up(&db, None)
+        .await
+        .expect("reapply text migration");
+
+    db.execute_unprepared("DELETE FROM api_keys WHERE id = 'key'")
+        .await
+        .expect("delete key");
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT COUNT(*) AS n FROM audit_logs WHERE api_key_id IS NULL AND api_key_name = 'key'"
+        )
+        .await,
+        1,
+    );
+    db.execute_unprepared("DELETE FROM vault_endpoints WHERE id = 'vault'")
+        .await
+        .expect("delete vault");
+    for table in [
+        "vault_sync_tasks",
+        "vault_sync_task_targets",
+        "destination_group_vault_targets",
+    ] {
+        assert_eq!(
+            scalar_count(&db, &format!("SELECT COUNT(*) AS n FROM {table}")).await,
+            0
+        );
+    }
+    db.execute_unprepared("DELETE FROM destination_groups WHERE id = 'group'")
+        .await
+        .expect("delete group");
+    assert_eq!(
+        scalar_count(&db, "SELECT COUNT(*) AS n FROM external_sources").await,
+        0
+    );
+}
+
+async fn text_migration_indexes(db: &DatabaseConnection) -> Vec<String> {
+    db.query_all_raw(Statement::from_string(
+        db.get_database_backend(),
+        "SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name",
+    ))
+    .await
+    .expect("read index names")
+    .iter()
+    .map(|row| row.try_get("", "name").expect("index name"))
+    .collect()
+}
+
+async fn scalar_count(db: &DatabaseConnection, query: &str) -> i64 {
+    db.query_one_raw(Statement::from_string(db.get_database_backend(), query))
+        .await
+        .expect("read count")
+        .expect("count row")
+        .try_get("", "n")
+        .expect("count")
 }

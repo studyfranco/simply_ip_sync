@@ -16,7 +16,7 @@ use std::sync::{Arc, Barrier};
 use simply_ip_sync::replay::ReplayGuard;
 use uuid::Uuid;
 
-mod common;
+pub mod common;
 
 /// 16 threads released simultaneously against one `(key_id, digest)`; exactly one must be admitted.
 ///
@@ -48,7 +48,10 @@ fn the_replay_ledger_admits_exactly_one_winner_under_real_thread_contention() {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("worker thread")).sum()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker thread"))
+                .sum()
         });
 
         assert_eq!(
@@ -81,10 +84,16 @@ fn distinct_signatures_are_all_admitted_under_the_same_contention() {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("worker thread")).sum()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("worker thread"))
+            .sum()
     });
 
-    assert_eq!(accepted, THREADS, "distinct signatures must not exclude one another");
+    assert_eq!(
+        accepted, THREADS,
+        "distinct signatures must not exclude one another"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -98,9 +107,15 @@ use tower::ServiceExt;
 use common::signed_request;
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("read body");
-    serde_json::from_slice(&bytes)
-        .unwrap_or_else(|e| panic!("response body was not JSON ({e}): {}", String::from_utf8_lossy(&bytes)))
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "response body was not JSON ({e}): {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
 }
 
 /// Axum's built-in `Path`/`Query` rejections render as **plain text**. Every other refusal this
@@ -119,7 +134,10 @@ async fn a_malformed_path_segment_is_refused_inside_the_json_envelope() {
     // well-formed id that does not exist, or the error shape becomes an id-format oracle.
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    assert!(body.get("error").is_some(), "expected an `error` field, got: {body}");
+    assert!(
+        body.get("error").is_some(),
+        "expected an `error` field, got: {body}"
+    );
 }
 
 #[tokio::test]
@@ -133,7 +151,10 @@ async fn a_malformed_query_string_is_refused_inside_the_json_envelope() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
-    assert!(body.get("error").is_some(), "expected an `error` field, got: {body}");
+    assert!(
+        body.get("error").is_some(),
+        "expected an `error` field, got: {body}"
+    );
 }
 
 /// A well-formed id for a resource that does not exist must be byte-identical to the malformed-id
@@ -163,14 +184,18 @@ async fn a_malformed_id_and_a_nonexistent_id_are_indistinguishable() {
 /// Inserts a `destination_groups` row — the resource `DELETE /api/destination-groups/{id}` now
 /// operates on (`delete_destination_group`, the same `rows_affected`-checking TOCTOU guard this
 /// test's own doc comment below describes, formerly on `delete_external_source`).
-async fn insert_source_for_deletion(conn: &sea_orm::DatabaseConnection, owner_key_id: Uuid) -> Uuid {
+async fn insert_source_for_deletion(
+    conn: &sea_orm::DatabaseConnection,
+    owner_key_id: Uuid,
+) -> Uuid {
+    use sea_orm::ActiveModelTrait as _;
     let id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let model = simply_ip_sync::entities::destination_group::ActiveModel {
         id: sea_orm::Set(id),
-        name: sea_orm::Set(format!("contention-group-{id}")),
-        target_group_name: sea_orm::Set("group".to_owned()),
-        cron_schedule: sea_orm::Set("0 0 * * *".to_owned()),
+        name: sea_orm::Set(format!("concurrent-del-{id}")),
+        target_group_name: sea_orm::Set("g".to_owned()),
+        cron_schedule: sea_orm::Set("0 * * * *".to_owned()),
         mode: sea_orm::Set("upsert".to_owned()),
         is_active: sea_orm::Set(true),
         skip_bogon_filtering: sea_orm::Set(false),
@@ -179,7 +204,6 @@ async fn insert_source_for_deletion(conn: &sea_orm::DatabaseConnection, owner_ke
         created_at: sea_orm::Set(now),
         updated_at: sea_orm::Set(now),
     };
-    use sea_orm::ActiveModelTrait as _;
     model.insert(conn).await.expect("insert destination group");
     id
 }
@@ -188,9 +212,16 @@ async fn insert_source_for_deletion(conn: &sea_orm::DatabaseConnection, owner_ke
 /// tight loop need 16 distinct, individually-valid signatures, or the anti-replay guard would
 /// (correctly) reject all but the first as replays of an identical signature, which would make
 /// this test measure replay rejection instead of deletion atomicity.
-fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestamp: i64) -> Request<Body> {
+fn signed_request_at(
+    key: &common::TestKey,
+    method: &str,
+    target: &str,
+    timestamp: i64,
+) -> Request<Body> {
     let ts = timestamp.to_string();
-    let signature = simply_ip_sync::crypto::compute_signature(&key.signing_secret, method, target, &ts, b"").expect("sign");
+    let signature =
+        simply_ip_sync::crypto::compute_signature(&key.signing_secret, method, target, &ts, b"")
+            .expect("sign");
     let mut req = Request::builder()
         .method(method)
         .uri(target)
@@ -200,7 +231,10 @@ fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestam
         .body(Body::empty())
         .expect("build");
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            55555,
+        ))));
     req
 }
 
@@ -217,7 +251,7 @@ fn signed_request_at(key: &common::TestKey, method: &str, target: &str, timestam
 /// done so far more reliably.
 #[tokio::test]
 async fn sixteen_concurrent_deletes_of_the_same_resource_admit_exactly_one_success() {
-    const CONCURRENCY: i64 = 16;
+    const CONCURRENCY: usize = 16;
 
     let (conn, state, master) = common::setup().await;
     let source_id = insert_source_for_deletion(&conn, master.id).await;
@@ -226,11 +260,18 @@ async fn sixteen_concurrent_deletes_of_the_same_resource_admit_exactly_one_succe
     let base_ts = chrono::Utc::now().timestamp();
     let target = format!("/api/destination-groups/{source_id}");
 
-    let mut handles = Vec::with_capacity(CONCURRENCY as usize);
+    let mut handles = Vec::with_capacity(CONCURRENCY);
     for i in 0..CONCURRENCY {
-        let req = signed_request_at(&master, "DELETE", &target, base_ts + i);
+        let req = signed_request_at(
+            &master,
+            "DELETE",
+            &target,
+            base_ts + i64::try_from(i).unwrap_or(0),
+        );
         let app = app.clone();
-        handles.push(tokio::spawn(async move { app.oneshot(req).await.expect("response").status() }));
+        handles.push(tokio::spawn(async move {
+            app.oneshot(req).await.expect("response").status()
+        }));
     }
 
     let mut succeeded = 0usize;
@@ -239,11 +280,20 @@ async fn sixteen_concurrent_deletes_of_the_same_resource_admit_exactly_one_succe
         match handle.await.expect("worker task") {
             StatusCode::NO_CONTENT => succeeded += 1,
             StatusCode::NOT_FOUND => not_found += 1,
-            other => panic!("unexpected status {other} — every concurrent delete must resolve to either 204 or 404"),
+            other => panic!(
+                "unexpected status {other} — every concurrent delete must resolve to either 204 or 404"
+            ),
         }
     }
-    assert_eq!(succeeded, 1, "exactly one of {CONCURRENCY} concurrent deletes of the same resource may succeed, got {succeeded}");
-    assert_eq!(not_found, CONCURRENCY as usize - 1, "every other concurrent delete must find nothing left to delete");
+    assert_eq!(
+        succeeded, 1,
+        "exactly one of {CONCURRENCY} concurrent deletes of the same resource may succeed, got {succeeded}"
+    );
+    assert_eq!(
+        not_found,
+        CONCURRENCY - 1,
+        "every other concurrent delete must find nothing left to delete"
+    );
 }
 
 /// The unauthenticated probes answer JSON too — including the 503 path.
@@ -252,7 +302,12 @@ async fn the_unauthenticated_probes_answer_inside_the_envelope() {
     let (_conn, state, _master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
     let resp = app
-        .oneshot(Request::builder().uri("/ready").body(Body::empty()).expect("request"))
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .expect("request"),
+        )
         .await
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
