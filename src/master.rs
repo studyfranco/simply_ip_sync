@@ -156,8 +156,8 @@ impl Default for MasterPin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration::MigratorTrait;
     use sea_orm::{ActiveValue::Set, Database};
-    use sea_orm_migration::MigratorTrait;
 
     #[tokio::test]
     async fn resolve_ignores_runtime_is_master_promotion() {
@@ -166,7 +166,7 @@ mod tests {
 
         let original_id = Uuid::new_v4();
         let promoted_id = Uuid::new_v4();
-        let now = chrono::Utc::now();
+        let now = time::OffsetDateTime::now_utc();
 
         let original = api_key::ActiveModel {
             id: Set(original_id),

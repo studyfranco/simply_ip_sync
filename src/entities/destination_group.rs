@@ -33,14 +33,14 @@ pub struct Model {
     /// may override this per-feed (`external_sources.skip_bogon_filtering`, `None` = inherit this).
     pub skip_bogon_filtering: bool,
     /// Timestamp of the last execution (across every child feed).
-    pub last_run_at: Option<DateTimeUtc>,
+    pub last_run_at: Option<time::OffsetDateTime>,
     /// Key holding lifecycle authority over this group (RBAC §3). Also governs every child feed —
     /// feeds carry no independent RBAC of their own.
     pub owner_key_id: Option<Uuid>,
     /// Creation timestamp.
-    pub created_at: DateTimeUtc,
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: DateTimeUtc,
+    pub updated_at: time::OffsetDateTime,
 }
 
 /// Relations from `destination_groups`.

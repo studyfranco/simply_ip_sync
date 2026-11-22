@@ -2,15 +2,14 @@
 //! since the task's high-water mark, chunk, and push to every configured target vault, in
 //! `upsert` mode.
 
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use uuid::Uuid;
 
+use super::JobContext;
 use super::{JobSummary, MAX_BATCH_SIZE, chunk_records};
 use crate::client::{self, BatchMode, BatchRecordInput};
 use crate::entities::{vault_endpoint, vault_sync_task, vault_sync_task_target};
 use crate::error::AppError;
-use crate::state::AppState;
 
 /// Runs one execution of inter-vault sync task `task_id`: fetches the source vault's delta since
 /// `last_sync_at` (including soft-deleted tombstones), chunks it, and pushes to every configured
@@ -21,8 +20,8 @@ use crate::state::AppState;
 ///
 /// Returns [`AppError::NotFound`] if the task no longer exists or [`AppError::DbError`] on
 /// database failures.
-pub async fn run(state: &AppState, task_id: Uuid) -> Result<JobSummary, AppError> {
-    let started_at = Utc::now();
+pub async fn run(state: &JobContext, task_id: Uuid) -> Result<JobSummary, AppError> {
+    let started_at = time::OffsetDateTime::now_utc();
 
     let task = vault_sync_task::Entity::find_by_id(task_id)
         .one(&state.db)
@@ -99,7 +98,7 @@ fn sanitize_sync_delta(
 }
 
 async fn push_sync_chunks(
-    state: &AppState,
+    state: &JobContext,
     task: &vault_sync_task::Model,
     targets: &[(vault_sync_task_target::Model, Option<vault_endpoint::Model>)],
     chunks: &[Vec<BatchRecordInput>],
@@ -159,7 +158,7 @@ async fn push_sync_chunks(
 }
 
 async fn execute(
-    state: &AppState,
+    state: &JobContext,
     task: &vault_sync_task::Model,
     source_vault: Option<&vault_endpoint::Model>,
     targets: &[(vault_sync_task_target::Model, Option<vault_endpoint::Model>)],

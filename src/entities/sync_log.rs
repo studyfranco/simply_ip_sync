@@ -27,7 +27,8 @@ pub struct Model {
     /// Error details on failure.
     pub error_message: Option<String>,
     /// Start timestamp of execution.
-    pub timestamp: DateTimeUtc,
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: time::OffsetDateTime,
 }
 
 /// Relations from `sync_logs`.

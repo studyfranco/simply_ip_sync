@@ -11,7 +11,6 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, OriginalUri, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use chrono::Utc;
 use ipnet::IpNet;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
@@ -48,7 +47,7 @@ fn validate_timestamp(headers: &axum::http::HeaderMap) -> Result<String, AppErro
     let supplied: i64 = raw
         .parse()
         .map_err(|_| AppError::Unauthorized("Malformed X-Timestamp header".to_owned()))?;
-    let skew = (Utc::now().timestamp() - supplied).abs();
+    let skew = (time::OffsetDateTime::now_utc().unix_timestamp() - supplied).abs();
     if skew > MAX_TIMESTAMP_SKEW_SECS {
         return Err(AppError::Unauthorized(format!(
             "Request timestamp outside the permitted {MAX_TIMESTAMP_SKEW_SECS}s window"

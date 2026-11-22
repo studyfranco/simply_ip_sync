@@ -6,10 +6,12 @@ use axum::extract::State;
 use crate::extract::StrictQuery;
 use axum::Json;
 use axum::response::IntoResponse;
-use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 use serde::Deserialize;
 
+use crate::db::{timestamp_bound, timestamp_order};
 use crate::entities::{api_key, audit_log};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -34,9 +36,9 @@ pub struct AuditLogQuery {
     pub offset: Option<u64>,
 }
 
-fn parse_rfc3339(field: &str, raw: &str) -> Result<DateTime<Utc>, AppError> {
-    DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
+fn parse_rfc3339(field: &str, raw: &str) -> Result<time::OffsetDateTime, AppError> {
+    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .map(|dt| dt.to_offset(time::UtcOffset::UTC))
         .map_err(|_| {
             AppError::InvalidInput(format!("invalid {field} timestamp (expected RFC 3339)"))
         })
@@ -54,6 +56,7 @@ pub async fn list_audit_logs(
         ));
     }
     let mut find = audit_log::Entity::find();
+    let timestamp = timestamp_order(&state.db, audit_log::Column::Timestamp);
     if let Some(action) = query
         .action
         .as_deref()
@@ -90,7 +93,11 @@ pub async fn list_audit_logs(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        find = find.filter(audit_log::Column::Timestamp.gte(parse_rfc3339("since", since)?));
+        find = find.filter(
+            timestamp
+                .clone()
+                .gte(timestamp_bound(&state.db, parse_rfc3339("since", since)?)),
+        );
     }
     if let Some(until) = query
         .until
@@ -98,11 +105,15 @@ pub async fn list_audit_logs(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        find = find.filter(audit_log::Column::Timestamp.lte(parse_rfc3339("until", until)?));
+        find = find.filter(
+            timestamp
+                .clone()
+                .lte(timestamp_bound(&state.db, parse_rfc3339("until", until)?)),
+        );
     }
     let rows = find
-        .order_by_desc(audit_log::Column::Timestamp)
-        .limit(query.limit.unwrap_or(100).min(1000))
+        .order_by_desc(timestamp)
+        .limit(std::cmp::min(query.limit.unwrap_or(100), 1000))
         .offset(query.offset.unwrap_or(0))
         .all(&state.db)
         .await?;

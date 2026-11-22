@@ -8,7 +8,6 @@ pub mod common;
 use std::io::Write;
 use std::time::Duration;
 
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use simply_ip_sync::entities::{
     destination_group, destination_group_vault_target, external_source, vault_endpoint,
@@ -19,7 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn insert_vault(conn: &sea_orm::DatabaseConnection, name: &str, target_url: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext
         .seal("shared-secret")
         .unwrap();
@@ -55,7 +54,7 @@ async fn insert_source_with_mode(
     mode: &str,
 ) -> Uuid {
     let group_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let group = destination_group::ActiveModel {
         id: Set(group_id),
         name: Set(format!("group-{group_id}")),
@@ -548,7 +547,7 @@ async fn html_response_via_json_path_parser_is_a_hard_parse_failure() {
         .mount(&feed_mock)
         .await;
 
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let group_id = Uuid::new_v4();
     let group = destination_group::ActiveModel {
         id: Set(group_id),
@@ -908,7 +907,7 @@ async fn seed_abuseipdb_group_and_feed(
     vault_uri: &str,
 ) -> Uuid {
     let group_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let group = destination_group::ActiveModel {
         id: Set(group_id),
         name: Set("AbuseIPDB Feed Group".to_owned()),

@@ -1,6 +1,8 @@
 //! Schema migrations in application order. `SeaQuery` builds the schema and data statements.
 
-pub use sea_orm_migration::prelude::*;
+mod runner;
+
+pub use runner::{Migration, MigrationStatus, MigrationTrait, MigratorTrait, SchemaManager};
 
 mod m20260101_013240_initial_schema;
 mod m20260101_013241_derive_master_marker;
@@ -14,7 +16,6 @@ mod m20261119_112000_unify_text_columns;
 /// The ordered set of migrations applied at startup.
 pub struct Migrator;
 
-#[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
         vec![

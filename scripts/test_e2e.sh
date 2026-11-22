@@ -98,7 +98,8 @@ fi
 log "All required tools present."
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/simply_ip_sync_e2e.XXXXXX")"
+mkdir -p "$PROJECT_ROOT/target"
+WORK_DIR="$(mktemp -d "${TMPDIR:-$PROJECT_ROOT/target}/simply_ip_sync_e2e.XXXXXX")"
 DB_PATH="$WORK_DIR/e2e.db"
 SERVER_LOG="$WORK_DIR/server.log"
 RESP_BODY_FILE="$WORK_DIR/resp_body"
@@ -106,20 +107,8 @@ RESP_BODY_FILE="$WORK_DIR/resp_body"
 # ── Dependencies & Security Audit ─────────────────────────────────────────────
 log_section "Dependencies & Security Audit"
 
-log "Running cargo update in $PROJECT_ROOT ..."
-if ! (cd "$PROJECT_ROOT" && cargo update >"$WORK_DIR/cargo_update.log" 2>&1); then
-    err "cargo update failed:"
-    cat "$WORK_DIR/cargo_update.log" >&2
-    rm -rf "$WORK_DIR"
-    exit 1
-fi
-log "cargo update succeeded."
-
-log "Running cargo audit in $PROJECT_ROOT ..."
-# RUSTSEC-2026-0459: upstream unpatched SQLite CVE in libsqlite3-sys 0.37.0 transitively pinned by
-# sqlx-sqlite 0.9.0 (which restricts libsqlite3-sys <0.38.0). Ignored until sqlx publishes a patch release.
-AUDIT_ARGS=(${CARGO_AUDIT_ARGS:---ignore RUSTSEC-2026-0459})
-if ! (cd "$PROJECT_ROOT" && cargo audit "${AUDIT_ARGS[@]}" >"$WORK_DIR/cargo_audit.log" 2>&1); then
+log "Running cargo audit --deny warnings in $PROJECT_ROOT ..."
+if ! (cd "$PROJECT_ROOT" && cargo audit --deny warnings >"$WORK_DIR/cargo_audit.log" 2>&1); then
     err "cargo audit detected vulnerabilities or failed:"
     cat "$WORK_DIR/cargo_audit.log" >&2
     rm -rf "$WORK_DIR"
@@ -129,7 +118,7 @@ log "cargo audit passed cleanly."
 
 log_section "Build"
 log "Running cargo build in $PROJECT_ROOT ..."
-if ! (cd "$PROJECT_ROOT" && cargo build --quiet 2>"$WORK_DIR/build.log"); then
+if ! (cd "$PROJECT_ROOT" && cargo build --locked --quiet 2>"$WORK_DIR/build.log"); then
     err "Build failed:"
     cat "$WORK_DIR/build.log" >&2
     rm -rf "$WORK_DIR"
@@ -1265,59 +1254,8 @@ else
     skip "sections 6-7k (multi-vault sync, target overrides, credential rotation, concurrency, pagination, retry, 413 split, full_replace, zip bomb, mid-run failure, non-utf8 feed): mock vaults unavailable"
 fi
 
-# ── 8. External feed ingestion — live feeds ─────────────────────────────────
-log_section "8. External feed ingestion — live feeds"
-
-NETWORK_REACHABLE=0
-if curl -s -o /dev/null -m 5 --head "https://raw.githubusercontent.com" 2>/dev/null; then
-    NETWORK_REACHABLE=1
-else
-    warn "raw.githubusercontent.com is not reachable from this environment; skipping live feed checks."
-fi
-
-if [[ "$NETWORK_REACHABLE" -eq 1 ]]; then
-    declare -A LIVE_FEEDS=(
-        # Moved upstream 2026-08: maltrail relocated this list from `trails/static/` to `data/`,
-        # and the old path now 404s. Kept as a live fetch rather than pinned to a local fixture on
-        # purpose — the whole point of this feed is to catch the real format drifting away from
-        # what REGEX_LINE expects, which a frozen copy can never do.
-        ["live-mass-scanner"]="https://raw.githubusercontent.com/stamparm/maltrail/refs/heads/master/data/mass_scanner.txt"
-        ["live-doh-ipv4"]="https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv4.txt"
-        ["live-vpn-ipv4"]="https://raw.githubusercontent.com/NazgulCoder/IPLists/refs/heads/main/output/vpn-ipv4.txt"
-        ["live-doh-ipv6"]="https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-ipv6.txt"
-    )
-    for name in "${!LIVE_FEEDS[@]}"; do
-        url="${LIVE_FEEDS[$name]}"
-        api_call POST "/api/destination-groups" "$MASTER_KEY" \
-            "{\"name\":\"$name-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"live\",\"is_active\":false}"
-        check "200" "register destination group for live source '$name'"
-        GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
-
-        api_call POST "/api/destination-groups/$GROUP_ID/feeds" "$MASTER_KEY" \
-            "{\"name\":\"$name\",\"source_url\":\"$url\",\"parser_type\":\"REGEX_LINE\"}"
-        check "200" "register live feed '$name'"
-
-        api_call POST "/api/destination-groups/$GROUP_ID/trigger" "$MASTER_KEY"
-        check "200" "trigger ingestion of live feed '$name'"
-        check_jq ".status" "SUCCESS" "'$name' ingestion reports SUCCESS"
-        ITEMS=$(echo "$RESP_BODY" | jq -r '.items_processed')
-        if [[ "${ITEMS:-0}" -gt 0 ]] 2>/dev/null; then
-            PASS_COUNT=$((PASS_COUNT + 1))
-            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} '$name' yielded $ITEMS parsed entries (> 0)" >&2
-        else
-            FAIL_COUNT=$((FAIL_COUNT + 1))
-            echo -e "$(ts)   ${RED}✗ FAIL${RESET} '$name' yielded '$ITEMS' entries, expected > 0" >&2
-        fi
-
-        api_call DELETE "/api/destination-groups/$GROUP_ID" "$MASTER_KEY"
-        check "204" "clean up live destination group '$name'"
-    done
-else
-    skip "live feed ingestion checks (network unreachable)"
-fi
-
-# ── 9. External feed ingestion — local fixtures for rate-limited feeds ──────
-log_section "9. External feed ingestion — local fixtures (StopForumSpam ZIP, Spamhaus JSONL)"
+# ── 8–9. External feed ingestion ────────────────────────────────────────────
+log_section "8–9. External feed ingestion through local HTTP fixtures"
 
 if [[ "$PYTHON3_AVAILABLE" -eq 1 ]] && command -v zip >/dev/null 2>&1; then
     FIXTURE_DIR="$WORK_DIR/fixtures"
@@ -1341,6 +1279,11 @@ if [[ "$PYTHON3_AVAILABLE" -eq 1 ]] && command -v zip >/dev/null 2>&1; then
         printf '{"type":"metadata","timestamp":1786614242,"size":123,"records":%d,"copyright":"(c) 2026 The Spamhaus Project SLU"}\n' "${#SPAMHAUS_CIDRS[@]}"
     } > "$FIXTURE_DIR/drop_v6.json"
 
+    printf '# scanner hosts\n192.0.2.10\n198.51.100.11 # tagged\n' > "$FIXTURE_DIR/scanners.txt"
+    printf '198.51.100.20\n203.0.113.21\n' > "$FIXTURE_DIR/doh-ipv4.txt"
+    printf '203.0.113.0/28\n198.51.100.32/28\n' > "$FIXTURE_DIR/vpn-ipv4.txt"
+    printf '2001:db8::10\n2001:db8::20\n' > "$FIXTURE_DIR/doh-ipv6.txt"
+
     FIXTURE_PORT="$(pick_port 18800 18820 "local fixture file server")"
     # `--directory` (not `(cd "$FIXTURE_DIR" && ...) &`) deliberately: wrapping in a `( ... ) &`
     # subshell means `$!` captures the *subshell's* pid, and bash is not guaranteed to exec()
@@ -1355,6 +1298,22 @@ if [[ "$PYTHON3_AVAILABLE" -eq 1 ]] && command -v zip >/dev/null 2>&1; then
     if kill -0 "$FIXTURE_SERVER_PID" 2>/dev/null; then
         FIXTURE_BASE="http://127.0.0.1:$FIXTURE_PORT"
         log "Local fixture server up on $FIXTURE_BASE, serving $FIXTURE_DIR"
+
+        for fixture in scanners doh-ipv4 vpn-ipv4 doh-ipv6; do
+            api_call POST "/api/destination-groups" "$MASTER_KEY" \
+                "{\"name\":\"fixture-$fixture-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false,\"skip_bogon_filtering\":true}"
+            check "200" "create destination group for $fixture"
+            GROUP_ID=$(jq -r '.id' <<< "$RESP_BODY")
+            api_call POST "/api/destination-groups/$GROUP_ID/feeds" "$MASTER_KEY" \
+                "{\"name\":\"fixture-$fixture\",\"source_url\":\"$FIXTURE_BASE/$fixture.txt\",\"parser_type\":\"REGEX_LINE\"}"
+            check "200" "register the $fixture feed"
+            api_call POST "/api/destination-groups/$GROUP_ID/trigger" "$MASTER_KEY"
+            check "200" "trigger ingestion of $fixture"
+            check_jq ".status" "SUCCESS" "$fixture ingestion reports SUCCESS"
+            check_jq ".items_processed" "2" "$fixture yields the two expected addresses"
+            api_call DELETE "/api/destination-groups/$GROUP_ID" "$MASTER_KEY"
+            check "204" "clean up the $fixture destination group"
+        done
 
         api_call POST "/api/destination-groups" "$MASTER_KEY" \
             "{\"name\":\"fixture-sfs-ipv6-zip-group\",\"cron_schedule\":\"0 0 * * *\",\"target_group_name\":\"fixtures\",\"is_active\":false}"
@@ -1420,7 +1379,7 @@ HTMLEOF
         api_call DELETE "/api/destination-groups/$HTML_GROUP_ID" "$MASTER_KEY"
         check "204" "clean up the HTML masquerade fixture group (cascades to its feed)"
     else
-        warn "Local fixture file server failed to start; skipping fixture ingestion checks."
+        check_local "stopped" "running" "local fixture file server starts"
     fi
     # Fixture files themselves live under $WORK_DIR and are removed by the exit trap; no separate
     # cleanup step is needed even if a check above fails partway through.

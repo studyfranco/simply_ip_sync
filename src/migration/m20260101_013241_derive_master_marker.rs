@@ -11,15 +11,20 @@
 //! `SeaORM` builds explicit column lists from the entity, so a declared field would enter every
 //! `INSERT`, and every engine rejects a write to a generated column.
 
-use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend};
+use super::runner::{MigrationTrait, SchemaManager};
+use sea_orm::sea_query::{ColumnDef, Expr, ExprTrait, Index, Query, Table};
+use sea_orm::{ConnectionTrait, DatabaseBackend};
+use sea_orm::{DbErr, DeriveIden};
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    fn name(&self) -> &'static str {
+        stringify!(m20260101_013241_derive_master_marker)
+    }
+
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         let db = manager.get_connection();
         let backend = manager.get_database_backend();
 
@@ -71,7 +76,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

@@ -17,5 +17,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run tests
-        run: cargo test --workspace --verbose
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Runs cargo fmt --all -- --check, cargo clippy --all-targets -- -D warnings,
+      # cargo test --workspace --verbose, and cargo audit --deny warnings.
+      - name: Run pre-push checks and workspace tests
+        run: ./scripts/pre_push.sh --workspace --verbose

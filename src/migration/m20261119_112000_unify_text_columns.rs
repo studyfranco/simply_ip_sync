@@ -3,9 +3,13 @@
 //! SQLite rebuilds the affected foreign-key graph in one transaction. Staging tables hold the
 //! rows while originals are dropped in child-first order, so foreign-key enforcement stays on.
 
+use super::runner::{MigrationTrait, SchemaManager};
 use IndexOrder::{Asc, Desc};
+use sea_orm::DbErr;
+use sea_orm::sea_query::{
+    ColumnDef, Index, IndexOrder, IntoTableRef, Query, Table, TableCreateStatement,
+};
 use sea_orm::{DatabaseBackend, TransactionTrait};
-use sea_orm_migration::prelude::*;
 
 use super::m20260101_013240_initial_schema::{
     vault_endpoints_definition, vault_sync_task_targets_definition, vault_sync_tasks_definition,
@@ -16,7 +20,6 @@ use super::m20260928_033617_destination_groups::{
     external_sources_definition,
 };
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 const TEXT_COLUMNS: [(&str, &str, bool); 6] = [
@@ -30,11 +33,15 @@ const TEXT_COLUMNS: [(&str, &str, bool); 6] = [
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    fn name(&self) -> &'static str {
+        stringify!(m20261119_112000_unify_text_columns)
+    }
+
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         change_types(manager, true).await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         change_types(manager, false).await
     }
 }

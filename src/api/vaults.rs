@@ -5,7 +5,6 @@ use axum::extract::State;
 use crate::extract::StrictPath;
 use axum::Json;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -35,9 +34,11 @@ pub struct VaultEndpointResponse {
     /// Key holding lifecycle authority over this endpoint.
     pub owner_key_id: Option<Uuid>,
     /// Creation timestamp.
-    pub created_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
 }
 
 impl From<vault_endpoint::Model> for VaultEndpointResponse {
@@ -159,7 +160,7 @@ pub async fn create_vault_endpoint(
 
     let sealed_api_key = state.cipher.seal(&payload.api_key)?;
     let sealed_secret = state.cipher.seal(&payload.signing_secret)?;
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let id = Uuid::new_v4();
     let model = vault_endpoint::ActiveModel {
         id: Set(id),
@@ -235,7 +236,7 @@ pub async fn update_vault_endpoint(
     if let Some(description) = payload.description {
         active.description = Set(Some(description));
     }
-    active.updated_at = Set(Utc::now());
+    active.updated_at = Set(time::OffsetDateTime::now_utc());
 
     let updated = active.update(&state.db).await?;
     create_audit_log(

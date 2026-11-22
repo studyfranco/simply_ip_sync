@@ -23,7 +23,8 @@ pub struct Model {
     /// Permission to view this resource's execution logs.
     pub can_view_logs: bool,
     /// Assignment timestamp.
-    pub created_at: DateTimeUtc,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
 }
 
 /// Relations from `api_key_sync_permissions`.

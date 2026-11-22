@@ -35,9 +35,9 @@ pub struct Model {
     /// group's aggregated set.
     pub skip_bogon_filtering: Option<bool>,
     /// Creation timestamp.
-    pub created_at: DateTimeUtc,
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: DateTimeUtc,
+    pub updated_at: time::OffsetDateTime,
 }
 
 /// Relations from `external_sources`.

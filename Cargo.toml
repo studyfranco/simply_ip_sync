@@ -13,17 +13,16 @@ pedantic = { level = "warn", priority = -1 }
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
-sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-postgres", "sqlx-mysql", "sqlx-sqlite"] }
+sea-orm = { version = "2", default-features = false, features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-time", "schema-sync"] }
+sea-schema = { version = "0.18", default-features = false, features = ["discovery", "probe", "runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
 ipnet = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip", "deflate", "brotli", "zstd"] }
-tokio-cron-scheduler = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "serde-human-readable", "formatting", "parsing", "macros"] }
 sha2 = "0.11"
 hmac = "0.13"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
@@ -35,7 +34,8 @@ log = "0.4"
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"] }
 regex = "1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-croner = "3"
+croner = { version = "5", default-features = false, features = ["std"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -46,3 +46,9 @@ oxc_allocator = "0.158"
 oxc_parser = "0.158"
 oxc_span = "0.158"
 flate2 = "1"
+
+[patch.crates-io]
+# The upstream weak Arrow feature creates a lockfile edge to Chrono even without Arrow enabled.
+sea-orm = { path = "vendor/sea-orm" }
+# Croner 5.0 likewise retains its optional Chrono backend through the std feature.
+croner = { path = "vendor/croner" }

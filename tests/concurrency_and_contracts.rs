@@ -190,7 +190,7 @@ async fn insert_source_for_deletion(
 ) -> Uuid {
     use sea_orm::ActiveModelTrait as _;
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let model = simply_ip_sync::entities::destination_group::ActiveModel {
         id: sea_orm::Set(id),
         name: sea_orm::Set(format!("concurrent-del-{id}")),
@@ -257,7 +257,7 @@ async fn sixteen_concurrent_deletes_of_the_same_resource_admit_exactly_one_succe
     let source_id = insert_source_for_deletion(&conn, master.id).await;
 
     let app = simply_ip_sync::create_app(state);
-    let base_ts = chrono::Utc::now().timestamp();
+    let base_ts = time::OffsetDateTime::now_utc().unix_timestamp();
     let target = format!("/api/destination-groups/{source_id}");
 
     let mut handles = Vec::with_capacity(CONCURRENCY);

@@ -27,10 +27,14 @@
 //! create-copy-drop-rename rebuild `m20260818_010217_audit_attribution_not_null` established is
 //! reused here, via `SchemaManager::get_database_backend() == DatabaseBackend::Sqlite` branching.
 
+use super::runner::{MigrationTrait, SchemaManager};
+use sea_orm::sea_query::{
+    ColumnDef, Expr, ExprTrait, ForeignKey, ForeignKeyAction, Index, IntoTableRef, Query, Table,
+    TableCreateStatement, TableForeignKey, TableRef,
+};
 use sea_orm::{ConnectionTrait, DatabaseBackend};
-use sea_orm_migration::prelude::*;
+use sea_orm::{DbErr, DeriveIden};
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[derive(DeriveIden)]
@@ -540,7 +544,11 @@ async fn alter_external_sources_directly(manager: &SchemaManager<'_>) -> Result<
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    fn name(&self) -> &'static str {
+        stringify!(m20260928_033617_destination_groups)
+    }
+
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         create_destination_groups(manager).await?;
         create_destination_group_vault_targets(manager).await?;
         migrate_existing_rows_into_groups(manager).await?;
@@ -559,7 +567,7 @@ impl MigrationTrait for Migration {
         }
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         restore_external_source_vault_targets(manager).await?;
         if manager.get_database_backend() == DatabaseBackend::Sqlite {
             rebuild_external_sources_sqlite(manager, false).await?;
@@ -727,8 +735,7 @@ async fn backfill_external_sources_from_groups(manager: &SchemaManager<'_>) -> R
                     )
                     .value(
                         ExternalSources::LastRunAt,
-                        group
-                            .try_get::<Option<chrono::DateTime<chrono::Utc>>>("", "last_run_at")?,
+                        group.try_get::<Option<time::OffsetDateTime>>("", "last_run_at")?,
                     )
                     .value(
                         ExternalSources::OwnerKeyId,

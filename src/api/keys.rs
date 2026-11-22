@@ -7,7 +7,6 @@ use axum::extract::State;
 use crate::extract::StrictPath;
 use axum::Json;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -56,9 +55,11 @@ pub struct ApiKeyResponse {
     /// Comma-separated CIDR ranges permitted to use this key.
     pub bound_ips: Option<String>,
     /// Creation timestamp.
-    pub created_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
 }
 
 impl From<api_key::Model> for ApiKeyResponse {
@@ -170,7 +171,7 @@ pub async fn create_api_key(
 
     let plaintext_key = generate_random_key();
     let plaintext_secret = crate::crypto::generate_signing_secret();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let id = Uuid::new_v4();
 
     let model = api_key::ActiveModel {
@@ -277,7 +278,7 @@ pub async fn update_api_key(
     if let Some(bound_ips) = payload.bound_ips {
         active.bound_ips = Set(Some(bound_ips));
     }
-    active.updated_at = Set(Utc::now());
+    active.updated_at = Set(time::OffsetDateTime::now_utc());
     let updated = active.update(&state.db).await?;
 
     create_audit_log(
@@ -422,7 +423,7 @@ pub async fn rotate_api_key(
     let mut active: api_key::ActiveModel = target.into();
     active.key_hash = Set(hash_key(&plaintext_key));
     active.prefix = Set(key_prefix(&plaintext_key));
-    active.updated_at = Set(Utc::now());
+    active.updated_at = Set(time::OffsetDateTime::now_utc());
     let updated = active.update(&state.db).await?;
 
     create_audit_log(
@@ -460,7 +461,7 @@ pub async fn rotate_signing_secret(
     let plaintext_secret = crate::crypto::generate_signing_secret();
     let mut active: api_key::ActiveModel = target.into();
     active.signing_secret = Set(Some(state.cipher.seal(&plaintext_secret)?));
-    active.updated_at = Set(Utc::now());
+    active.updated_at = Set(time::OffsetDateTime::now_utc());
     let updated = active.update(&state.db).await?;
 
     create_audit_log(
@@ -614,7 +615,7 @@ pub async fn grant_key_permission(
             can_sync: Set(payload.can_sync),
             can_manage: Set(payload.can_manage),
             can_view_logs: Set(payload.can_view_logs),
-            created_at: Set(Utc::now()),
+            created_at: Set(time::OffsetDateTime::now_utc()),
         };
         active.insert(&state.db).await?
     };

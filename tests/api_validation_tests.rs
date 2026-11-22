@@ -17,12 +17,11 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 async fn insert_vault_for_task(conn: &sea_orm::DatabaseConnection) -> Uuid {
-    use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
     use simply_ip_sync::entities::vault_endpoint;
 
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext
         .seal("shared-secret")
         .unwrap();
@@ -334,7 +333,10 @@ async fn oversized_inbound_body_is_rejected_cleanly_before_signature_verificatio
         .method("POST")
         .uri("/api/destination-groups")
         .header("X-API-Key", master.plaintext_key.clone())
-        .header("X-Timestamp", chrono::Utc::now().timestamp().to_string())
+        .header(
+            "X-Timestamp",
+            time::OffsetDateTime::now_utc().unix_timestamp().to_string(),
+        )
         .header(
             "X-Signature-256",
             "sha256=0000000000000000000000000000000000000000000000000000000000000000",
@@ -385,7 +387,10 @@ async fn a_declared_content_length_over_the_limit_is_rejected_without_reading_th
         .method("POST")
         .uri("/api/destination-groups")
         .header("X-API-Key", master.plaintext_key.clone())
-        .header("X-Timestamp", chrono::Utc::now().timestamp().to_string())
+        .header(
+            "X-Timestamp",
+            time::OffsetDateTime::now_utc().unix_timestamp().to_string(),
+        )
         .header(
             "X-Signature-256",
             "sha256=0000000000000000000000000000000000000000000000000000000000000000",
@@ -421,7 +426,7 @@ async fn malformed_json_body_with_a_valid_signature_returns_the_standard_error_e
     let app = simply_ip_sync::create_app(state);
 
     let malformed_body = br#"{"name": "x", invalid}"#;
-    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     let signature = simply_ip_sync::crypto::compute_signature(
         &master.signing_secret,
         "POST",

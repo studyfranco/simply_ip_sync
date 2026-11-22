@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
 use simply_ip_sync::client::{self, BatchMode, BatchRecordInput, RetryPolicy};
 use simply_ip_sync::crypto::SecretCipher;
 use simply_ip_sync::entities::vault_endpoint;
@@ -16,7 +15,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn mock_endpoint(cipher: &SecretCipher, target_url: &str) -> vault_endpoint::Model {
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     vault_endpoint::Model {
         id: Uuid::new_v4(),
         name: "resilience-test-vault".to_owned(),

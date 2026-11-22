@@ -8,7 +8,6 @@ use axum::extract::State;
 use crate::extract::StrictPath;
 use axum::Json;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -60,9 +59,11 @@ pub struct FeedResponse {
     /// group's own setting.
     pub skip_bogon_filtering: Option<bool>,
     /// Creation timestamp.
-    pub created_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
 }
 
 fn to_feed_response(m: external_source::Model) -> FeedResponse {
@@ -100,7 +101,8 @@ pub struct DestinationGroupResponse {
     /// stripped) before push; a feed may override this individually.
     pub skip_bogon_filtering: bool,
     /// Timestamp of the last execution (across every child feed).
-    pub last_run_at: Option<chrono::DateTime<Utc>>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_run_at: Option<time::OffsetDateTime>,
     /// Key holding lifecycle authority over this group (and, transitively, every child feed).
     pub owner_key_id: Option<Uuid>,
     /// Configured target vaults.
@@ -108,9 +110,11 @@ pub struct DestinationGroupResponse {
     /// Child feeds belonging to this group.
     pub feeds: Vec<FeedResponse>,
     /// Creation timestamp.
-    pub created_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
 }
 
 async fn load_targets(
@@ -353,7 +357,7 @@ pub async fn create_destination_group(
     crate::scheduler::validate_cron_expression(&payload.cron_schedule)
         .map_err(|e| AppError::InvalidInput(format!("invalid cron_schedule: {e}")))?;
 
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let id = Uuid::new_v4();
     let txn = state.db.begin().await?;
 
@@ -410,7 +414,7 @@ pub async fn create_destination_group(
     .await?;
     txn.commit().await?;
 
-    state.scheduler.upsert_source(&state, &inserted).await;
+    state.scheduler.upsert_source(&state, &inserted);
 
     Ok(Json(to_group_response(
         inserted,
@@ -462,7 +466,7 @@ pub async fn update_destination_group(
     if let Some(skip_bogon_filtering) = payload.skip_bogon_filtering {
         active.skip_bogon_filtering = Set(skip_bogon_filtering);
     }
-    active.updated_at = Set(Utc::now());
+    active.updated_at = Set(time::OffsetDateTime::now_utc());
     let updated = active.update(&txn).await?;
 
     if let Some(targets) = &payload.targets {
@@ -493,7 +497,7 @@ pub async fn update_destination_group(
     .await?;
     txn.commit().await?;
 
-    state.scheduler.upsert_source(&state, &updated).await;
+    state.scheduler.upsert_source(&state, &updated);
 
     let targets = load_targets(&state.db, id).await?;
     let feeds = load_feeds(&state.db, id).await?;
@@ -524,7 +528,7 @@ pub async fn delete_destination_group(
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
-    state.scheduler.remove_source(id).await;
+    state.scheduler.remove_source(id);
     create_audit_log(
         &state.db,
         &caller,
@@ -704,7 +708,7 @@ pub async fn create_feed(
     validate_feed_parser(&payload.parser_type, payload.parser_config_json.as_deref())?;
     validate_max_age_days(payload.max_age_days)?;
 
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let id = Uuid::new_v4();
     let model = external_source::ActiveModel {
         id: Set(id),
@@ -789,7 +793,7 @@ pub async fn update_feed(
     if let Some(skip_bogon_filtering) = payload.skip_bogon_filtering {
         active.skip_bogon_filtering = Set(Some(skip_bogon_filtering));
     }
-    active.updated_at = Set(Utc::now());
+    active.updated_at = Set(time::OffsetDateTime::now_utc());
     let updated = active.update(&state.db).await?;
 
     create_audit_log(

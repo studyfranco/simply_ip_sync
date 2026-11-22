@@ -3,7 +3,6 @@
 
 pub mod common;
 
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use simply_ip_sync::entities::{vault_endpoint, vault_sync_task, vault_sync_task_target};
 use uuid::Uuid;
@@ -12,7 +11,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn insert_vault(conn: &sea_orm::DatabaseConnection, name: &str, target_url: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext
         .seal("shared-secret")
         .unwrap();
@@ -44,7 +43,7 @@ async fn insert_task(
     target_vault_id: Uuid,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let task = vault_sync_task::ActiveModel {
         id: Set(id),
         name: Set("test-task".to_owned()),
@@ -78,7 +77,7 @@ async fn insert_task_multi(
     target_vault_ids: &[Uuid],
 ) -> Uuid {
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let task = vault_sync_task::ActiveModel {
         id: Set(id),
         name: Set(format!("multi-target-task-{id}")),
@@ -155,7 +154,7 @@ async fn multi_vault_sync_pushes_to_every_target_on_success() {
         .unwrap()
         .unwrap();
     assert!(before.last_sync_at.is_none());
-    let job_start = Utc::now();
+    let job_start = time::OffsetDateTime::now_utc();
 
     let summary = simply_ip_sync::jobs::vault_sync::run(&state, task_id)
         .await
@@ -258,7 +257,7 @@ async fn pre_push_bogon_filtering_strips_reserved_addresses_unless_the_task_opts
     let target_id = insert_vault(&conn, "bogon-target", &target_mock.uri()).await;
 
     let task_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let task = vault_sync_task::ActiveModel {
         id: Set(task_id),
         name: Set(format!("bogon-filter-task-{task_id}")),
@@ -567,7 +566,7 @@ async fn per_target_group_name_override_is_honored_independently_of_the_default(
         insert_vault(&conn, "override-target", &override_target_mock.uri()).await;
 
     let task_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let task = vault_sync_task::ActiveModel {
         id: Set(task_id),
         name: Set(format!("override-task-{task_id}")),
@@ -1003,11 +1002,10 @@ const DELETED_LAST: u32 = 200;
 /// `since = last_sync_at`, so the untouched bulk of the dataset has to sit clearly *outside* that
 /// window for "only the changed records come back" to mean anything. Seeded at "now", every record
 /// would land on the boundary and the differential assertion would pass for the wrong reason.
-async fn build_two_vault_fixture() -> (common::MockVault, common::MockVault, chrono::DateTime<Utc>)
-{
+async fn build_two_vault_fixture() -> (common::MockVault, common::MockVault, time::OffsetDateTime) {
     let vault_a = common::MockVault::start().await;
     let vault_b = common::MockVault::start().await;
-    let seeded_at = Utc::now() - chrono::Duration::hours(1);
+    let seeded_at = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
 
     // Vault A: 1,000 records in each of two groups.
     vault_a.seed(
@@ -1067,7 +1065,7 @@ async fn insert_alpha_task(
     target_vault_id: Uuid,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     vault_sync_task::ActiveModel {
         id: Set(id),
         name: Set("alpha-replication".to_owned()),
@@ -1125,7 +1123,7 @@ async fn insert_alpha_task(
 fn assert_pass_one_convergence(
     vault_a: &common::MockVault,
     vault_b: &common::MockVault,
-    seeded_at: chrono::DateTime<Utc>,
+    seeded_at: time::OffsetDateTime,
 ) {
     let gets = vault_a.gets();
     assert_eq!(
@@ -1202,7 +1200,7 @@ fn assert_pass_one_convergence(
         "the target must hold exactly the union of both datasets"
     );
 
-    let seeded_naive = seeded_at.naive_utc();
+    let seeded_naive = time::PrimitiveDateTime::new(seeded_at.date(), seeded_at.time());
     for address in block_range(ALPHA_BLOCK, OVERLAP_FIRST, OVERLAP_LAST) {
         let record = converged
             .get(&address)
@@ -1305,7 +1303,7 @@ async fn test_inter_vault_sync_high_volume_partial_overlap() {
         .last_sync_at
         .expect("a fully successful pass must advance last_sync_at");
 
-    let mutated_at = Utc::now();
+    let mutated_at = time::OffsetDateTime::now_utc();
     let deleted = block_range(ALPHA_BLOCK, DELETED_FIRST, DELETED_LAST);
     vault_a.soft_delete("group_alpha", &deleted, mutated_at);
     vault_a.seed(
@@ -1333,7 +1331,7 @@ async fn test_inter_vault_sync_high_volume_partial_overlap() {
     let second_get = &gets2[1];
     assert_eq!(
         second_get.since.as_deref(),
-        Some(first_high_water.timestamp().to_string().as_str())
+        Some(first_high_water.unix_timestamp().to_string().as_str())
     );
     assert_eq!(second_get.include_deleted.as_deref(), Some("true"));
     assert_eq!(second_get.returned, 300);
@@ -1463,7 +1461,9 @@ async fn later_sync_fetching_zero_new_records_stays_a_silent_success() {
         .unwrap()
         .unwrap()
         .into();
-    active.last_sync_at = Set(Some(Utc::now() - chrono::Duration::hours(1)));
+    active.last_sync_at = Set(Some(
+        time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+    ));
     active
         .update(&conn)
         .await

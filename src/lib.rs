@@ -50,8 +50,8 @@ pub fn max_request_body_bytes() -> usize {
 /// # Errors
 ///
 /// Returns [`StartupConfigError`] if environment configuration or scheduler initialization fails.
-pub async fn setup_state(db: DatabaseConnection) -> Result<AppState, StartupConfigError> {
-    AppState::new(db).await
+pub fn setup_state(db: DatabaseConnection) -> Result<AppState, StartupConfigError> {
+    AppState::new(db)
 }
 
 /// Assembles the full route table: public probes outside authentication, every `/api/*` route

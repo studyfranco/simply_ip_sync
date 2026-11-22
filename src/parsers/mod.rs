@@ -27,7 +27,7 @@ pub struct ParsedRecord {
     /// Normalized IP address or CIDR subnet.
     pub address: String,
     /// When known, the timestamp this feed reported the address as last seen/active.
-    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_seen_at: Option<time::OffsetDateTime>,
 }
 
 /// A pluggable algorithm turning a raw fetched feed body into a list of extracted records.

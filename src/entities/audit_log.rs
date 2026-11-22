@@ -28,7 +28,8 @@ pub struct Model {
     /// Additional payload context.
     pub details: Option<String>,
     /// Event timestamp.
-    pub timestamp: DateTimeUtc,
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: time::OffsetDateTime,
 }
 
 /// Relations from `audit_logs`.

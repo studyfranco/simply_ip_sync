@@ -2,14 +2,21 @@
 //! `api_keys.master_marker` is added separately by
 //! `m20260101_013241_derive_master_marker` using a generated column definition.
 
-use sea_orm_migration::prelude::*;
+use super::runner::{MigrationTrait, SchemaManager};
+use sea_orm::sea_query::{
+    ColumnDef, ForeignKey, ForeignKeyAction, Index, Table, TableCreateStatement,
+};
+use sea_orm::{DbErr, DeriveIden};
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    fn name(&self) -> &'static str {
+        stringify!(m20260101_013240_initial_schema)
+    }
+
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         create_api_keys_table(manager).await?;
         create_vault_endpoints_table(manager).await?;
         create_external_sources_table(manager).await?;
@@ -21,7 +28,7 @@ impl MigrationTrait for Migration {
         create_audit_logs_table(manager).await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
             .await?;

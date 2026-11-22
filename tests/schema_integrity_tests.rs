@@ -295,3 +295,73 @@ async fn scalar_count(db: &DatabaseConnection, query: &str) -> i64 {
         .try_get("", "n")
         .expect("count")
 }
+
+#[tokio::test]
+async fn runner_preserves_legacy_ledger_and_applies_only_the_pending_version() {
+    use simply_ip_sync::migration::{Migrator, MigratorTrait};
+
+    const APPLIED: [&str; 7] = [
+        "m20260101_013240_initial_schema",
+        "m20260101_013241_derive_master_marker",
+        "m20260818_010217_audit_attribution_not_null",
+        "m20260928_033617_destination_groups",
+        "m20260928_034145_vault_sync_task_bogon_filtering",
+        "m20261109_000001_add_performance_indexes",
+        "m20261110_000001_add_scheduling_and_lookup_indexes",
+    ];
+    const PENDING: &str = "m20261119_112000_unify_text_columns";
+
+    let db = db::connect("sqlite::memory:").await.expect("connect");
+    Migrator::up(&db, Some(7))
+        .await
+        .expect("pre-upgrade schema");
+    db.execute_unprepared(
+        "DROP TABLE seaql_migrations;
+         CREATE TABLE seaql_migrations (version varchar NOT NULL PRIMARY KEY, applied_at bigint NOT NULL);",
+    )
+    .await
+    .expect("create legacy ledger");
+    for version in APPLIED {
+        db.execute(
+            sea_orm::sea_query::Query::insert()
+                .into_table("seaql_migrations")
+                .columns(["version", "applied_at"])
+                .values_panic([version.into(), 123_i64.into()]),
+        )
+        .await
+        .expect("seed historical migration");
+    }
+
+    let pending = Migrator::get_pending_migrations(&db)
+        .await
+        .expect("pending");
+    assert_eq!(
+        pending
+            .iter()
+            .map(simply_ip_sync::migration::Migration::name)
+            .collect::<Vec<_>>(),
+        [PENDING]
+    );
+    Migrator::up(&db, None).await.expect("apply pending");
+    Migrator::up(&db, None).await.expect("idempotent rerun");
+    Migrator::status(&db).await.expect("status");
+    let applied = Migrator::get_applied_migrations(&db)
+        .await
+        .expect("applied");
+    assert_eq!(
+        applied
+            .iter()
+            .map(simply_ip_sync::migration::Migration::name)
+            .collect::<Vec<_>>(),
+        APPLIED.into_iter().chain([PENDING]).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT COUNT(*) AS n FROM seaql_migrations WHERE applied_at = 123",
+        )
+        .await,
+        7
+    );
+    assert_column_types(&db, "TEXT").await;
+}

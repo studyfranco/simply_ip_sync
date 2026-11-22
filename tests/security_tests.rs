@@ -59,7 +59,7 @@ async fn stale_timestamp_outside_skew_window_is_rejected() {
     let (_conn, state, master) = common::setup().await;
     let app = simply_ip_sync::create_app(state);
 
-    let stale_ts = (chrono::Utc::now().timestamp() - 3600).to_string();
+    let stale_ts = (time::OffsetDateTime::now_utc().unix_timestamp() - 3600).to_string();
     let signature = simply_ip_sync::crypto::compute_signature(
         &master.signing_secret,
         "GET",
@@ -93,7 +93,7 @@ async fn replayed_signature_is_rejected_on_second_use() {
     // One signature, computed once, sent twice — the second use must be rejected even though it
     // is byte-identical to the first (a genuinely fresh request would carry a new timestamp).
     let target = "/api/keys";
-    let ts = chrono::Utc::now().timestamp().to_string();
+    let ts = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     let sig =
         simply_ip_sync::crypto::compute_signature(&master.signing_secret, "GET", target, &ts, b"")
             .unwrap();
@@ -293,8 +293,8 @@ async fn outbound_post_batch_signs_correctly() {
         signing_secret: sealed_secret,
         description: None,
         owner_key_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
     };
     let http = simply_ip_sync::client::build_http_client().expect("http client");
     let records = vec![simply_ip_sync::client::BatchRecordInput {
@@ -333,7 +333,7 @@ async fn outbound_post_batch_signs_correctly() {
 async fn outbound_get_ips_delta_signs_correctly_with_since_and_include_deleted() {
     let mock_server = MockServer::start().await;
     let shared_secret = "outbound-delta-test-secret";
-    let since = chrono::Utc::now() - chrono::Duration::hours(1);
+    let since = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
 
     Mock::given(method("GET"))
         .and(path("/api/ips"))
@@ -347,7 +347,7 @@ async fn outbound_get_ips_delta_signs_correctly_with_since_and_include_deleted()
             let params: std::collections::HashMap<_, _> = req.url.query_pairs().into_owned().collect();
             assert_eq!(params.get("group_name"), Some(&"delta-group".to_owned()));
             assert_eq!(params.get("include_deleted"), Some(&"true".to_owned()), "the client must always request tombstones");
-            assert_eq!(params.get("since"), Some(&since.timestamp().to_string()));
+            assert_eq!(params.get("since"), Some(&since.unix_timestamp().to_string()));
             assert!(params.contains_key("limit"));
             assert!(params.contains_key("offset"));
 
@@ -366,8 +366,8 @@ async fn outbound_get_ips_delta_signs_correctly_with_since_and_include_deleted()
         signing_secret: sealed_secret,
         description: None,
         owner_key_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
     };
     let http = simply_ip_sync::client::build_http_client().expect("http client");
     let records = simply_ip_sync::client::get_ips_delta(
@@ -460,8 +460,8 @@ async fn outbound_get_ips_delta_preserves_a_reverse_proxy_subpath_in_target_url(
         signing_secret: sealed_secret,
         description: None,
         owner_key_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
     };
     let http = simply_ip_sync::client::build_http_client().expect("http client");
     let records =
@@ -509,8 +509,8 @@ async fn outbound_post_batch_preserves_a_reverse_proxy_subpath_in_target_url() {
         signing_secret: sealed_secret,
         description: None,
         owner_key_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
     };
     let http = simply_ip_sync::client::build_http_client().expect("http client");
     let records = vec![simply_ip_sync::client::BatchRecordInput {
@@ -564,7 +564,7 @@ async fn tampering_a_single_byte_deep_in_a_large_body_is_still_detected() {
         "the payload must be large enough that a prefix-only signature bug wouldn't be caught by chance"
     );
 
-    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     let valid_signature = simply_ip_sync::crypto::compute_signature(
         &master.signing_secret,
         "POST",
@@ -617,7 +617,7 @@ async fn two_concurrent_replays_of_the_same_signature_only_one_succeeds() {
     let app = simply_ip_sync::create_app(state);
 
     let target = "/api/auth/me";
-    let ts = chrono::Utc::now().timestamp().to_string();
+    let ts = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     let sig =
         simply_ip_sync::crypto::compute_signature(&master.signing_secret, "GET", target, &ts, b"")
             .expect("sign");
@@ -735,8 +735,8 @@ async fn vault_endpoint_api_key_is_sealed_at_rest_and_legacy_plaintext_opens() {
         signing_secret: Set(cipher_arc.seal("legacy-secret").expect("seal")),
         description: Set(None),
         owner_key_id: Set(Some(master.id)),
-        created_at: Set(chrono::Utc::now()),
-        updated_at: Set(chrono::Utc::now()),
+        created_at: Set(time::OffsetDateTime::now_utc()),
+        updated_at: Set(time::OffsetDateTime::now_utc()),
     }
     .insert(&conn)
     .await
@@ -757,30 +757,45 @@ async fn vault_endpoint_api_key_is_sealed_at_rest_and_legacy_plaintext_opens() {
 
 #[tokio::test]
 async fn audit_logs_until_filter_is_inclusive() {
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{
+        ActiveModelTrait, ConnectionTrait, ExprTrait, Set,
+        sea_query::{Expr, Query},
+    };
 
     let (conn, state, master) = common::setup().await;
-    let exact_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
-    let exact_ts = chrono::DateTime::from_timestamp(exact_ts.timestamp(), 0).expect("ts");
-
-    simply_ip_sync::entities::audit_log::ActiveModel {
-        id: Set(uuid::Uuid::new_v4()),
-        api_key_id: Set(Some(master.id)),
-        api_key_name: Set("Master".to_owned()),
-        api_key_prefix: Set(master.plaintext_key.chars().take(8).collect()),
-        action: Set("INCLUSIVE_PROBE".to_owned()),
-        target_resource: Set(None),
-        client_ip: Set("127.0.0.1".to_owned()),
-        details: Set(None),
-        timestamp: Set(exact_ts),
+    let exact_ts = time::macros::datetime!(2026-11-22 12:00:00.123 UTC);
+    let legacy_id = uuid::Uuid::new_v4();
+    for id in [legacy_id, uuid::Uuid::new_v4()] {
+        simply_ip_sync::entities::audit_log::ActiveModel {
+            id: Set(id),
+            api_key_id: Set(Some(master.id)),
+            api_key_name: Set("Master".to_owned()),
+            api_key_prefix: Set(master.plaintext_key.chars().take(8).collect()),
+            action: Set("INCLUSIVE_PROBE".to_owned()),
+            target_resource: Set(None),
+            client_ip: Set("127.0.0.1".to_owned()),
+            details: Set(None),
+            timestamp: Set(exact_ts),
+        }
+        .insert(&conn)
+        .await
+        .expect("insert audit row");
     }
-    .insert(&conn)
+
+    conn.execute(
+        Query::update()
+            .table("audit_logs")
+            .value("timestamp", "2026-11-22T12:00:00.123000+00:00")
+            .and_where(Expr::col("id").eq(legacy_id)),
+    )
     .await
-    .expect("insert audit row");
+    .expect("seed an equivalent legacy spelling");
 
     let app = simply_ip_sync::create_app(state);
-    let until_str = exact_ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let uri = format!("/api/audit-logs?action=INCLUSIVE_PROBE&until={until_str}");
+    let until_str = exact_ts
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("format timestamp");
+    let uri = format!("/api/audit-logs?action=INCLUSIVE_PROBE&since={until_str}&until={until_str}");
     let req = common::signed_request(&master, "GET", &uri, None);
     let resp = app.oneshot(req).await.expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
@@ -790,7 +805,11 @@ async fn audit_logs_until_filter_is_inclusive() {
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(
         rows.len(),
-        1,
-        "until filter must include rows at the exact boundary timestamp (<=)"
+        2,
+        "both stored timestamp formats must match the inclusive bounds"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["timestamp"] == "2026-11-22T12:00:00.123Z")
     );
 }

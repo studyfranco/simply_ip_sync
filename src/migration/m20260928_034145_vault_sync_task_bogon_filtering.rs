@@ -10,9 +10,10 @@
 //! column removals and no new foreign key, which is squarely within what SQLite's `ALTER TABLE`
 //! supports directly. No rebuild needed.
 
-use sea_orm_migration::prelude::*;
+use super::runner::{MigrationTrait, SchemaManager};
+use sea_orm::sea_query::{ColumnDef, Table};
+use sea_orm::{DbErr, DeriveIden};
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[derive(DeriveIden)]
@@ -23,7 +24,11 @@ enum VaultSyncTasks {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    fn name(&self) -> &'static str {
+        stringify!(m20260928_034145_vault_sync_task_bogon_filtering)
+    }
+
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -39,7 +44,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

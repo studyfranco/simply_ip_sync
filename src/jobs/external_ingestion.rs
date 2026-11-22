@@ -6,11 +6,11 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::JobContext;
 use super::{JobSummary, MAX_BATCH_SIZE, chunk_records};
 use crate::client::{self, BatchMode, BatchRecordInput};
 use crate::entities::{
@@ -18,7 +18,6 @@ use crate::entities::{
 };
 use crate::error::AppError;
 use crate::parsers::{self, ParsedRecord};
-use crate::state::AppState;
 
 /// Runs one execution of destination group `group_id`: fetches every child feed concurrently,
 /// aggregates the results into one deduplicated set, sanitizes and pushes it to every configured
@@ -29,8 +28,8 @@ use crate::state::AppState;
 ///
 /// Returns [`AppError::NotFound`] if the group no longer exists or [`AppError::DbError`] on
 /// database failures.
-pub async fn run(state: &AppState, group_id: Uuid) -> Result<JobSummary, AppError> {
-    let started_at = Utc::now();
+pub async fn run(state: &JobContext, group_id: Uuid) -> Result<JobSummary, AppError> {
+    let started_at = time::OffsetDateTime::now_utc();
 
     let group = destination_group::Entity::find_by_id(group_id)
         .one(&state.db)
@@ -237,7 +236,7 @@ struct FeedResult {
 /// their fetch latency overlaps instead of stacking, and one feed's slow host doesn't gate every
 /// other feed's already-available response.
 async fn fetch_all_feeds_concurrently(
-    state: &AppState,
+    state: &JobContext,
     feeds: &[external_source::Model],
 ) -> Vec<FeedResult> {
     let allow_private_urls = state.allow_private_ingest_urls;
@@ -290,7 +289,7 @@ fn apply_temporal_filter(
     let Some(max_age_days) = max_age_days else {
         return records;
     };
-    let cutoff = Utc::now() - chrono::Duration::days(i64::from(max_age_days));
+    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(i64::from(max_age_days));
     records
         .into_iter()
         .filter(|r| r.last_seen_at.is_none_or(|last_seen| last_seen >= cutoff))
@@ -351,7 +350,7 @@ fn aggregate_feed_results(
 }
 
 async fn push_aggregated_chunks(
-    state: &AppState,
+    state: &JobContext,
     group: &destination_group::Model,
     targets: &[(
         destination_group_vault_target::Model,
@@ -419,7 +418,7 @@ async fn push_aggregated_chunks(
 }
 
 async fn execute(
-    state: &AppState,
+    state: &JobContext,
     group: &destination_group::Model,
     feeds: &[external_source::Model],
     targets: &[(

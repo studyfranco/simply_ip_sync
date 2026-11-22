@@ -201,6 +201,14 @@ fn manifest_policy(source: &str) -> Vec<String> {
             violations.push(format!("lints.clippy.{lint} must not be allow"));
         }
     }
+    for dependency in FORBIDDEN_CRATES {
+        if values.keys().any(|path| {
+            path.windows(2)
+                .any(|pair| pair[0].ends_with("dependencies") && pair[1] == dependency)
+        }) {
+            violations.push(format!("forbidden Cargo dependency {dependency}"));
+        }
+    }
     let sqlx_features = |dependency| -> BTreeSet<_> {
         get(&["dependencies", dependency, "features"])
             .into_iter()
@@ -210,12 +218,19 @@ fn manifest_policy(source: &str) -> Vec<String> {
             .collect()
     };
     let orm = sqlx_features("sea-orm");
-    let migration = sqlx_features("sea-orm-migration");
+    let migration = sqlx_features("sea-schema");
     for feature in orm.difference(&migration) {
-        violations.push(format!("sea-orm-migration is missing {feature}"));
+        violations.push(format!("sea-schema is missing {feature}"));
     }
     for feature in migration.difference(&orm) {
         violations.push(format!("sea-orm is missing {feature}"));
+    }
+    if get(&["dependencies", "time", "features"])
+        .into_iter()
+        .flatten()
+        .any(|token| toml_text(token) == "local-offset")
+    {
+        violations.push("time feature local-offset is forbidden".to_owned());
     }
     violations
 }
@@ -240,7 +255,7 @@ fn manifest_policy_rejects_drift() {
         features = ["sqlx-sqlite", # Keep database support in sync.
             "sqlx-postgres"]
         [dependencies]
-        sea-orm-migration = { features = ['sqlx-postgres', 'sqlx-sqlite'] }
+        sea-schema = { features = ['sqlx-postgres', 'sqlx-sqlite'] }
     "#;
     assert!(manifest_policy(manifest).is_empty());
     for (before, after, diagnostic) in [
@@ -1452,4 +1467,176 @@ fn offline_asset_check_rejects_external_resources_and_svg_data() {
         const local = `<img src="./local.png" alt="try https://example.test">`;
         fetch(this.requestBase + path);"#;
     assert!(external_asset_violations(benign, "js").is_empty());
+}
+
+const FORBIDDEN_CRATES: [&str; 4] = [
+    "chrono",
+    "chrono-tz",
+    "sea-orm-migration",
+    "tokio-cron-scheduler",
+];
+
+#[test]
+fn dependency_lockfile_and_rust_paths_exclude_removed_crates() {
+    let lock = read("Cargo.lock");
+    for name in FORBIDDEN_CRATES {
+        assert!(
+            !lock
+                .lines()
+                .any(|line| line == format!("name = \"{name}\"")),
+            "{name} in Cargo.lock"
+        );
+    }
+
+    let import = regex(r"\b(?:chrono|chrono_tz|sea_orm_migration|tokio_cron_scheduler)\s*::");
+    for root in ["src", "tests"] {
+        for path in files_under(root, true) {
+            if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path).expect("read Rust source");
+                assert!(
+                    !import.is_match(&source),
+                    "removed dependency path in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cargo_audit_has_no_advisory_exclusions() {
+    let ignored = regex(r"(?mi)--ignore\s+(?:['\x22])?RUSTSEC-|\bignore\s*=|^\s*ignore\s*:");
+    let paths = [repo_path(".cargo/audit.toml")]
+        .into_iter()
+        .chain(
+            files_under(".github/workflows", true)
+                .into_iter()
+                .filter(|path| {
+                    matches!(
+                        path.extension().and_then(|extension| extension.to_str()),
+                        Some("yml" | "yaml")
+                    )
+                }),
+        )
+        .chain(
+            files_under("scripts", false)
+                .into_iter()
+                .filter(|path| path.extension().is_some_and(|extension| extension == "sh")),
+        )
+        .chain(files_under(".githooks", true));
+    for path in paths {
+        let source = std::fs::read_to_string(&path).expect("read audit policy input");
+        assert!(
+            !ignored.is_match(&source),
+            "advisory exclusion in {}",
+            path.display()
+        );
+    }
+}
+
+fn documented_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            ip.is_documentation()
+                || ip.is_loopback()
+                || ip.is_unspecified()
+                || (a == 100 && (64..128).contains(&b))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let [a, b, ..] = ip.segments();
+            ip.is_loopback() || ip.is_unspecified() || (a == 0x2001 && b == 0x0db8)
+        }
+    }
+}
+
+fn documented_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']', '.']).to_ascii_lowercase();
+    if let Ok(ip) = host.parse() {
+        return documented_ip(ip);
+    }
+    host == "localhost"
+        || [
+            "example.com",
+            "example.org",
+            "example.net",
+            "example.test",
+            "invalid",
+        ]
+        .iter()
+        .any(|suffix| {
+            host == *suffix
+                || host
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+}
+
+fn production_endpoints(source: &str) -> Vec<&str> {
+    let explicit = regex(
+        r"(?i)(?:https?|postgres(?:ql)?|mysql)://(?:[^/\s@`]+@)?(\[[0-9a-f:]+\]|[a-z0-9_][a-z0-9_.-]*)",
+    );
+    let domain = regex(
+        r"(?i)\b(?:[a-z0-9-]+\.)+(?:com|org|net|edu|gov|io|ovh|internal|local|test|invalid|dev|app|cloud|co|fr|uk|de)\b",
+    );
+    let ipv4 = regex(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b");
+    let ipv6 = regex(r"(?i)[0-9a-f:]*:[0-9a-f:]+:[0-9a-f:]*");
+    explicit
+        .captures_iter(source)
+        .filter_map(|capture| capture.get(1))
+        .chain(domain.find_iter(source))
+        .chain(
+            ipv4.find_iter(source)
+                .filter(|value| value.as_str().parse::<std::net::Ipv4Addr>().is_ok()),
+        )
+        .chain(ipv6.find_iter(source).filter(|value| {
+            value.as_str().contains("::") && value.as_str().parse::<std::net::Ipv6Addr>().is_ok()
+        }))
+        .map(|value| value.as_str())
+        .filter(|value| !documented_host(value))
+        .collect()
+}
+
+#[test]
+fn onboarding_and_root_documentation_use_placeholder_endpoints() {
+    for document in ["README.md", "AGENT.MD"] {
+        assert!(
+            read(document)
+                .lines()
+                .take(10)
+                .any(|line| line.contains("](GOALS.md)"))
+        );
+    }
+    assert!(!read("GOALS.md").trim().is_empty());
+    for path in files_under(".", false) {
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
+            let source = std::fs::read_to_string(&path).expect("read documentation");
+            let violations = production_endpoints(&source);
+            assert!(
+                violations.is_empty(),
+                "{} has non-placeholder endpoints: {violations:?}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn documentation_policy_detects_non_placeholder_endpoints() {
+    assert_eq!(
+        production_endpoints(
+            "http://vault-prod:3000, vault.prod.internal, 192.168.1.3, [2001:4860::8888]"
+        )
+        .len(),
+        4
+    );
+    assert!(
+        production_endpoints(
+            "https://feeds.example.org, 203.0.113.4, 100.64.0.1, http://[::1]:3000, [2001:db8::1]"
+        )
+        .is_empty()
+    );
 }

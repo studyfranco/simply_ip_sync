@@ -4,7 +4,6 @@
 
 use std::net::IpAddr;
 
-use chrono::Utc;
 use rand::RngExt;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use sha2::{Digest, Sha256};
@@ -76,7 +75,7 @@ pub async fn grant_full_permission<C: ConnectionTrait>(
         can_sync: Set(true),
         can_manage: Set(true),
         can_view_logs: Set(true),
-        created_at: Set(Utc::now()),
+        created_at: Set(time::OffsetDateTime::now_utc()),
     };
     api_key_sync_permission::Entity::insert(row)
         .exec(db)
@@ -104,7 +103,7 @@ pub async fn create_audit_log<C: ConnectionTrait>(
         action: Set(action.to_owned()),
         target_resource: Set(target_resource),
         details: Set(details),
-        timestamp: Set(Utc::now()),
+        timestamp: Set(time::OffsetDateTime::now_utc()),
     };
     audit_log::Entity::insert(log).exec(db).await?;
     Ok(())

@@ -97,7 +97,6 @@ async fn doh_ipv6_blocklist_parses_to_valid_entries() {
 /// Exercises the external ingestion job with one destination group and one mock feed.
 #[tokio::test]
 async fn mock_feed_ingests_successfully_through_the_full_job_pipeline() {
-    use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
     use simply_ip_sync::entities::{destination_group, external_source};
     use uuid::Uuid;
@@ -110,7 +109,7 @@ async fn mock_feed_ingests_successfully_through_the_full_job_pipeline() {
         .await
         .expect("migrate");
     let master_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let master = simply_ip_sync::entities::api_key::ActiveModel {
         id: Set(master_id),
         name: Set("Master".to_owned()),
@@ -128,7 +127,6 @@ async fn mock_feed_ingests_successfully_through_the_full_job_pipeline() {
     };
     master.insert(&conn).await.expect("insert master");
     let mut state = simply_ip_sync::state::AppState::for_tests(conn.clone(), master_id)
-        .await
         .expect("build test state");
     state.http = local_http_client();
 

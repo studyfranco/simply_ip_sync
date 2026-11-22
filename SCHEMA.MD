@@ -80,7 +80,7 @@ Stores configuration and authentication credentials for target/source `simply_ip
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique identifier for the vault endpoint |
 | `name` | `String` | Not Null, Unique, Indexed | Human-readable endpoint name (e.g., `Vault-Paris-DMZ`) |
-| `target_url` | `Text` | Not Null | Base HTTP/HTTPS URL of the distant vault (e.g., `https://vault-paris.internal:3000`) |
+| `target_url` | `Text` | Not Null | Base HTTP/HTTPS URL of the distant vault (e.g., `https://vault-site-a.example.test:3000`) |
 | `api_key` | `Text` | Not Null | Plaintext `X-API-Key` sent to the remote Vault |
 | `signing_secret` | `Text` | Not Null | HMAC signing secret used to compute `X-Signature-256` for remote Vault calls. Encrypted at rest via XChaCha20-Poly1305 (`v1.xchacha20poly1305...`) |
 | `description` | `Text` | Nullable | Optional description |

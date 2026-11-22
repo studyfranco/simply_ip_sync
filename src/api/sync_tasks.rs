@@ -5,7 +5,6 @@ use axum::extract::State;
 use crate::extract::StrictPath;
 use axum::Json;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -39,7 +38,8 @@ pub struct VaultSyncTaskResponse {
     /// Cron expression for periodic delta polling.
     pub cron_schedule: String,
     /// High-water mark used for `since=` delta queries.
-    pub last_sync_at: Option<chrono::DateTime<Utc>>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_sync_at: Option<time::OffsetDateTime>,
     /// Sync mode. Always `"upsert"`.
     pub mode: String,
     /// Whether automatic scheduling is enabled.
@@ -53,9 +53,11 @@ pub struct VaultSyncTaskResponse {
     /// Configured target vaults.
     pub targets: Vec<TargetSpec>,
     /// Creation timestamp.
-    pub created_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: chrono::DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
 }
 
 async fn load_targets(
@@ -258,7 +260,7 @@ pub async fn create_vault_sync_task(
     crate::scheduler::validate_cron_expression(&payload.cron_schedule)
         .map_err(|e| AppError::InvalidInput(format!("invalid cron_schedule: {e}")))?;
 
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let id = Uuid::new_v4();
     let txn = state.db.begin().await?;
 
@@ -317,7 +319,7 @@ pub async fn create_vault_sync_task(
     .await?;
     txn.commit().await?;
 
-    state.scheduler.upsert_task(&state, &inserted).await;
+    state.scheduler.upsert_task(&state, &inserted);
 
     Ok(Json(to_response(inserted, payload.targets)))
 }
@@ -365,7 +367,7 @@ pub async fn update_vault_sync_task(
     if let Some(skip_bogon_filtering) = payload.skip_bogon_filtering {
         active.skip_bogon_filtering = Set(skip_bogon_filtering);
     }
-    active.updated_at = Set(Utc::now());
+    active.updated_at = Set(time::OffsetDateTime::now_utc());
     let updated = active.update(&txn).await?;
 
     if let Some(targets) = &payload.targets {
@@ -396,7 +398,7 @@ pub async fn update_vault_sync_task(
     .await?;
     txn.commit().await?;
 
-    state.scheduler.upsert_task(&state, &updated).await;
+    state.scheduler.upsert_task(&state, &updated);
 
     let targets = load_targets(&state.db, id).await?;
     Ok(Json(to_response(updated, targets)))
@@ -424,7 +426,7 @@ pub async fn delete_vault_sync_task(
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
-    state.scheduler.remove_task(id).await;
+    state.scheduler.remove_task(id);
     create_audit_log(
         &state.db,
         &caller,
@@ -474,4 +476,38 @@ pub async fn trigger_vault_sync_task(
         "duration_ms": summary.duration_ms,
         "error_message": summary.error_message,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VaultSyncTaskResponse;
+
+    #[test]
+    fn api_timestamps_use_rfc3339_strings_and_null() {
+        let utc = time::macros::datetime!(2026-11-22 12:00 UTC);
+        let offset = time::macros::datetime!(2026-11-22 17:30 +05:30);
+        let mut task = VaultSyncTaskResponse {
+            id: uuid::Uuid::nil(),
+            name: "nightly".into(),
+            source_vault_id: uuid::Uuid::nil(),
+            source_group_name: "source".into(),
+            target_group_name: "target".into(),
+            cron_schedule: "0 0 * * *".into(),
+            last_sync_at: Some(offset),
+            mode: "upsert".into(),
+            is_active: true,
+            skip_bogon_filtering: false,
+            owner_key_id: None,
+            targets: vec![],
+            created_at: utc,
+            updated_at: utc,
+        };
+        let json = serde_json::to_value(&task).expect("serialize task");
+        assert_eq!(json["created_at"], "2026-11-22T12:00:00Z");
+        assert_eq!(json["updated_at"], "2026-11-22T12:00:00Z");
+        assert_eq!(json["last_sync_at"], "2026-11-22T17:30:00+05:30");
+
+        task.last_sync_at = None;
+        assert!(serde_json::to_value(&task).expect("serialize task")["last_sync_at"].is_null());
+    }
 }

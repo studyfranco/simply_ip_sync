@@ -22,7 +22,7 @@ pub struct Model {
     /// Cron expression for periodic delta polling.
     pub cron_schedule: String,
     /// High-water mark timestamp used for `since=` delta queries.
-    pub last_sync_at: Option<DateTimeUtc>,
+    pub last_sync_at: Option<time::OffsetDateTime>,
     /// Sync mode. Strictly `"upsert"`.
     pub mode: String,
     /// Enable/disable task execution.
@@ -37,9 +37,9 @@ pub struct Model {
     /// Key holding lifecycle authority over this task (RBAC §3).
     pub owner_key_id: Option<Uuid>,
     /// Creation timestamp.
-    pub created_at: DateTimeUtc,
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: DateTimeUtc,
+    pub updated_at: time::OffsetDateTime,
 }
 
 /// Relations from `vault_sync_tasks`.

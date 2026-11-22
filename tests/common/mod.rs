@@ -7,7 +7,6 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
 use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set};
 use simply_ip_sync::crypto::SecretCipher;
 use simply_ip_sync::entities::api_key;
@@ -35,9 +34,7 @@ pub async fn setup() -> (DatabaseConnection, AppState, TestKey) {
     let conn = Database::connect("sqlite::memory:").await.expect("connect");
     db::run_migrations(&conn).await.expect("migrate");
     let master = insert_key_inner(&conn, "Master", true, (true, true, true), None).await;
-    let state = AppState::for_tests(conn.clone(), master.id)
-        .await
-        .expect("build test state");
+    let state = AppState::for_tests(conn.clone(), master.id).expect("build test state");
     (conn, state, master)
 }
 
@@ -72,7 +69,7 @@ async fn insert_key_inner(
     let plaintext_key = api::generate_random_key();
     let signing_secret = crypto::generate_signing_secret();
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let sealed = SecretCipher::Plaintext.seal(&signing_secret).expect("seal");
 
     let model = api_key::ActiveModel {
@@ -105,7 +102,7 @@ async fn insert_key_inner(
 /// If the test credentials cannot sign the request.
 #[must_use]
 pub fn sign(key: &TestKey, method: &str, target: &str, body: &[u8]) -> (String, String, String) {
-    let timestamp = Utc::now().timestamp().to_string();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     let signature =
         crypto::compute_signature(&key.signing_secret, method, target, &timestamp, body)
             .expect("sign");
@@ -155,6 +152,15 @@ pub fn signed_request(
 // MockVault — a stateful stand-in for a remote `simply_ip_vault`
 // =============================================================================================
 
+time::serde::format_description!(
+    vault_timestamp,
+    PrimitiveDateTime,
+    "[year]-[month]-[day]T[hour]:[minute]:[second][optional [.[subsecond]]]"
+);
+
+const VAULT_TIMESTAMP: &[time::format_description::BorrowedFormatItem<'_>] =
+    time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]");
+
 /// One stored record inside a [`MockVault`] group.
 #[derive(Debug, Clone)]
 pub struct StoredRecord {
@@ -166,14 +172,14 @@ pub struct StoredRecord {
     /// Tombstone flag.
     pub is_deleted: bool,
     /// When the tombstone was set. `None` while the record is live.
-    pub deleted_at: Option<NaiveDateTime>,
+    pub deleted_at: Option<time::PrimitiveDateTime>,
     /// Creation timestamp. Never overwritten by a later upsert.
-    pub created_at: NaiveDateTime,
+    pub created_at: time::PrimitiveDateTime,
     /// Last modification timestamp.
-    pub updated_at: NaiveDateTime,
+    pub updated_at: time::PrimitiveDateTime,
     /// Last time the record was observed. **A soft delete deliberately does not touch this** —
     /// see [`MockVault::soft_delete`].
-    pub last_seen_at: NaiveDateTime,
+    pub last_seen_at: time::PrimitiveDateTime,
 }
 
 /// A `GET /api/ips` call as the vault received it, for asserting what the sync engine actually
@@ -317,9 +323,9 @@ impl MockVault {
         &self,
         group: &str,
         addresses: impl IntoIterator<Item = String>,
-        seen_at: DateTime<Utc>,
+        seen_at: time::OffsetDateTime,
     ) {
-        let stamp = seen_at.naive_utc();
+        let stamp = time::PrimitiveDateTime::new(seen_at.date(), seen_at.time());
         let mut data = self.lock();
         let entries = data.groups.entry(group.to_owned()).or_default();
         for address in addresses {
@@ -354,8 +360,8 @@ impl MockVault {
     ///
     /// # Panics
     /// If the group or any supplied address is missing from the fixture.
-    pub fn soft_delete(&self, group: &str, addresses: &[String], deleted_at: DateTime<Utc>) {
-        let stamp = deleted_at.naive_utc();
+    pub fn soft_delete(&self, group: &str, addresses: &[String], deleted_at: time::OffsetDateTime) {
+        let stamp = time::PrimitiveDateTime::new(deleted_at.date(), deleted_at.time());
         let mut data = self.lock();
         let entries = data
             .groups
@@ -442,8 +448,8 @@ impl MockVault {
         let since = since_raw
             .as_deref()
             .and_then(|v| v.parse::<i64>().ok())
-            .and_then(|secs| DateTime::from_timestamp(secs, 0))
-            .map(|dt| dt.naive_utc());
+            .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs).ok())
+            .map(|dt| time::PrimitiveDateTime::new(dt.date(), dt.time()));
 
         let mut guard = data.lock().expect("mock vault state lock");
         let mut matched: Vec<serde_json::Value> = Vec::new();
@@ -476,10 +482,10 @@ impl MockVault {
                     "group_name": group,
                     "cause": record.cause,
                     "is_deleted": record.is_deleted,
-                    "deleted_at": record.deleted_at,
-                    "created_at": record.created_at,
-                    "updated_at": record.updated_at,
-                    "last_seen_at": record.last_seen_at,
+                    "deleted_at": record.deleted_at.map(|dt| dt.format(VAULT_TIMESTAMP).expect("format vault timestamp")),
+                    "created_at": record.created_at.format(VAULT_TIMESTAMP).expect("format vault timestamp"),
+                    "updated_at": record.updated_at.format(VAULT_TIMESTAMP).expect("format vault timestamp"),
+                    "last_seen_at": record.last_seen_at.format(VAULT_TIMESTAMP).expect("format vault timestamp"),
                 }));
             }
         }
@@ -512,7 +518,7 @@ impl MockVault {
     fn apply_batch_records(
         entries: &mut BTreeMap<String, StoredRecord>,
         records: Vec<MockBatchRecord>,
-        now: NaiveDateTime,
+        now: time::PrimitiveDateTime,
     ) -> (Vec<String>, u64, u64, u64, u64) {
         let mut present: Vec<String> = Vec::with_capacity(records.len());
         let mut created = 0u64;
@@ -571,7 +577,7 @@ impl MockVault {
     fn apply_full_replace(
         entries: &mut BTreeMap<String, StoredRecord>,
         present: &[String],
-        now: NaiveDateTime,
+        now: time::PrimitiveDateTime,
     ) -> u64 {
         let omitted: Vec<String> = entries
             .keys()
@@ -608,7 +614,8 @@ impl MockVault {
         };
 
         let mode = payload.mode.unwrap_or_else(|| "upsert".to_owned());
-        let now = Utc::now().naive_utc();
+        let now = time::OffsetDateTime::now_utc();
+        let now = time::PrimitiveDateTime::new(now.date(), now.time());
 
         let mut guard = data.lock().expect("mock vault state lock");
         guard.batches.push(RecordedBatch {
@@ -654,12 +661,12 @@ struct MockBatchRecord {
     cause: Option<String>,
     #[serde(default)]
     is_deleted: Option<bool>,
-    #[serde(default)]
-    created_at: Option<NaiveDateTime>,
-    #[serde(default)]
-    updated_at: Option<NaiveDateTime>,
-    #[serde(default)]
-    last_seen_at: Option<NaiveDateTime>,
-    #[serde(default)]
-    deleted_at: Option<NaiveDateTime>,
+    #[serde(default, with = "vault_timestamp::option")]
+    created_at: Option<time::PrimitiveDateTime>,
+    #[serde(default, with = "vault_timestamp::option")]
+    updated_at: Option<time::PrimitiveDateTime>,
+    #[serde(default, with = "vault_timestamp::option")]
+    last_seen_at: Option<time::PrimitiveDateTime>,
+    #[serde(default, with = "vault_timestamp::option")]
+    deleted_at: Option<time::PrimitiveDateTime>,
 }

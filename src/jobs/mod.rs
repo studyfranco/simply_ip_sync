@@ -1,5 +1,5 @@
 //! Background execution pipelines: external feed ingestion and inter-vault delta replication.
-//! Both are plain async functions taking `(&AppState, Uuid)`, callable identically from the cron
+//! Both are async functions taking a shared job context and resource ID, callable identically from the cron
 //! scheduler and from the manual-trigger HTTP handlers.
 
 pub mod decompress;
@@ -9,11 +9,23 @@ pub mod vault_sync;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
 use sea_orm::{EntityTrait, Set};
 use uuid::Uuid;
 
 use crate::entities::sync_log;
+
+/// Shared dependencies for running jobs without retaining the scheduler.
+#[derive(Clone)]
+pub struct JobContext {
+    /// Database connection pool.
+    pub db: sea_orm::DatabaseConnection,
+    /// Secrets-at-rest cipher.
+    pub cipher: std::sync::Arc<crate::crypto::SecretCipher>,
+    /// Outbound HTTP client.
+    pub http: reqwest::Client,
+    /// Whether this instance permits private feed URLs for testing.
+    pub allow_private_ingest_urls: bool,
+}
 
 /// The set of resource ids (external source or sync task) with a job currently in flight.
 /// Prevents two overlapping executions of the *same* resource — a manual trigger racing a cron
@@ -128,7 +140,7 @@ pub async fn write_sync_log<C: sea_orm::ConnectionTrait>(
     job_id: Uuid,
     job_name: &str,
     summary: &JobSummary,
-    started_at: chrono::DateTime<Utc>,
+    started_at: time::OffsetDateTime,
 ) -> Result<(), sea_orm::DbErr> {
     let log = sync_log::ActiveModel {
         id: Set(Uuid::new_v4()),

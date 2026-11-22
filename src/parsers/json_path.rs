@@ -43,7 +43,6 @@
 //! otherwise well-formed ones should only fail that line, the same way any other malformed line
 //! already does — not the whole feed.
 
-use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 
 use super::{FeedParser, ParseError, ParsedRecord, normalize_ip_or_cidr};
@@ -76,14 +75,18 @@ fn walk_selector<'a>(item: &'a Value, selector: &[String]) -> Option<&'a Value> 
 /// midnight UTC (SANS ISC's `erratasec` list's own shape). Returns `None` for anything else,
 /// rather than an error — a record with an unparseable or absent timestamp is still kept, simply
 /// without an age `jobs::external_ingestion` can filter on.
-fn parse_last_seen_at(raw: &str) -> Option<DateTime<Utc>> {
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
-        return Some(parsed.with_timezone(&Utc));
+fn parse_last_seen_at(raw: &str) -> Option<time::OffsetDateTime> {
+    if let Ok(parsed) =
+        time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+    {
+        return Some(parsed.to_offset(time::UtcOffset::UTC));
     }
-    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|dt| dt.and_utc())
+    time::Date::parse(
+        raw,
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .ok()
+    .map(|date| date.midnight().assume_utc())
 }
 
 struct JsonPathConfig {
@@ -362,7 +365,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].last_seen_at,
-            Some("2026-09-26T15:17:01+00:00".parse().unwrap())
+            Some(time::macros::datetime!(2026-09-26 15:17:01 UTC))
         );
     }
 
@@ -378,7 +381,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].last_seen_at,
-            Some("2026-09-28T00:00:00Z".parse().unwrap())
+            Some(time::macros::datetime!(2026-09-28 00:00 UTC))
         );
     }
 

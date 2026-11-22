@@ -3,7 +3,6 @@
 //! graceful shutdown. `bootstrap_master_key` is the only writer of `is_master = true` in the
 //! entire service.
 
-use chrono::Utc;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, Set};
 use simply_ip_sync::entities::api_key;
 use simply_ip_sync::entities::prelude::ApiKey;
@@ -36,7 +35,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     bootstrap_master_key(&db).await?;
     verify_encryption_key(&db).await?;
 
-    let state = simply_ip_sync::setup_state(db).await?;
+    let state = simply_ip_sync::setup_state(db)?;
     let pinned = state.master_pin.pin_at_boot(&state.db).await?;
     tracing::info!("Master key identity pinned: {pinned}");
 
@@ -188,7 +187,7 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
         }
         _ => simply_ip_sync::crypto::generate_signing_secret(),
     };
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
 
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),

@@ -24,9 +24,9 @@ pub struct Model {
     /// Key holding lifecycle authority over this endpoint (RBAC §3).
     pub owner_key_id: Option<Uuid>,
     /// Creation timestamp.
-    pub created_at: DateTimeUtc,
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: DateTimeUtc,
+    pub updated_at: time::OffsetDateTime,
 }
 
 /// Relations from `vault_endpoints`.

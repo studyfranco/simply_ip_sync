@@ -6,9 +6,10 @@
 //! - Foreign key lookups: `external_sources(destination_group_id)`, `vault_sync_tasks(source_vault_id)`,
 //!   `vault_sync_task_targets(target_vault_id)`, and `destination_group_vault_targets(vault_endpoint_id)`.
 
-use sea_orm_migration::prelude::*;
+use super::runner::{MigrationTrait, SchemaManager};
+use sea_orm::sea_query::{Index, IndexOrder};
+use sea_orm::{DbErr, DeriveIden};
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[derive(DeriveIden)]
@@ -53,7 +54,11 @@ enum DestinationGroupVaultTargets {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    fn name(&self) -> &'static str {
+        stringify!(m20261109_000001_add_performance_indexes)
+    }
+
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Audit logs: default search newest-first
         manager
             .create_index(
@@ -160,7 +165,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

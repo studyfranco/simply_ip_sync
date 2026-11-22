@@ -29,8 +29,9 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
-use sea_orm::{ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter};
+use sea_orm::{DatabaseConnection, DbErr, EntityTrait, ExprTrait, QueryFilter};
+
+use crate::db::{timestamp_bound, timestamp_order};
 
 use crate::entities::{audit_log, sync_log};
 
@@ -84,11 +85,10 @@ fn retention_days_from_env(env_var: &str, default_days: i64) -> i64 {
 /// Reads the configured sweep interval, clamped to at least one second.
 fn sweep_seconds_from_env() -> u64 {
     match std::env::var(RETENTION_SWEEP_ENV) {
-        Ok(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .unwrap_or(DEFAULT_SWEEP_SECONDS)
-            .max(1),
+        Ok(raw) => std::cmp::max(
+            raw.trim().parse::<u64>().unwrap_or(DEFAULT_SWEEP_SECONDS),
+            1,
+        ),
         Err(_) => DEFAULT_SWEEP_SECONDS,
     }
 }
@@ -106,9 +106,9 @@ pub async fn purge_expired_sync_logs(
     if retention_days <= 0 {
         return Ok(0);
     }
-    let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
+    let threshold = time::OffsetDateTime::now_utc() - time::Duration::days(retention_days);
     let result = sync_log::Entity::delete_many()
-        .filter(sync_log::Column::Timestamp.lt(threshold))
+        .filter(timestamp_order(db, sync_log::Column::Timestamp).lt(timestamp_bound(db, threshold)))
         .exec(db)
         .await?;
     Ok(result.rows_affected)
@@ -127,9 +127,11 @@ pub async fn purge_expired_audit_logs(
     if retention_days <= 0 {
         return Ok(0);
     }
-    let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
+    let threshold = time::OffsetDateTime::now_utc() - time::Duration::days(retention_days);
     let result = audit_log::Entity::delete_many()
-        .filter(audit_log::Column::Timestamp.lt(threshold))
+        .filter(
+            timestamp_order(db, audit_log::Column::Timestamp).lt(timestamp_bound(db, threshold)),
+        )
         .exec(db)
         .await?;
     Ok(result.rows_affected)
@@ -202,7 +204,7 @@ mod tests {
         db
     }
 
-    async fn insert_sync_log(db: &DatabaseConnection, timestamp: chrono::DateTime<Utc>) {
+    async fn insert_sync_log(db: &DatabaseConnection, timestamp: time::OffsetDateTime) {
         sync_log::ActiveModel {
             id: Set(Uuid::new_v4()),
             job_type: Set("EXTERNAL_FEED".to_owned()),
@@ -220,7 +222,7 @@ mod tests {
         .expect("insert sync_log");
     }
 
-    async fn insert_audit_log(db: &DatabaseConnection, timestamp: chrono::DateTime<Utc>) {
+    async fn insert_audit_log(db: &DatabaseConnection, timestamp: time::OffsetDateTime) {
         audit_log::ActiveModel {
             id: Set(Uuid::new_v4()),
             api_key_id: Set(None),
@@ -240,9 +242,9 @@ mod tests {
     #[tokio::test]
     async fn purge_removes_only_sync_logs_older_than_the_window() {
         let db = memory_db().await;
-        let now = Utc::now();
-        insert_sync_log(&db, now - chrono::Duration::days(100)).await;
-        insert_sync_log(&db, now - chrono::Duration::days(10)).await;
+        let now = time::OffsetDateTime::now_utc();
+        insert_sync_log(&db, now - time::Duration::days(100)).await;
+        insert_sync_log(&db, now - time::Duration::days(10)).await;
 
         let purged = purge_expired_sync_logs(&db, 92).await.expect("purge");
         assert_eq!(
@@ -257,9 +259,9 @@ mod tests {
     #[tokio::test]
     async fn purge_removes_only_audit_logs_older_than_the_window() {
         let db = memory_db().await;
-        let now = Utc::now();
-        insert_audit_log(&db, now - chrono::Duration::days(400)).await;
-        insert_audit_log(&db, now - chrono::Duration::days(30)).await;
+        let now = time::OffsetDateTime::now_utc();
+        insert_audit_log(&db, now - time::Duration::days(400)).await;
+        insert_audit_log(&db, now - time::Duration::days(30)).await;
 
         let purged = purge_expired_audit_logs(&db, 365).await.expect("purge");
         assert_eq!(
@@ -274,9 +276,9 @@ mod tests {
     #[tokio::test]
     async fn a_non_positive_retention_window_disables_purging() {
         let db = memory_db().await;
-        let now = Utc::now();
-        insert_sync_log(&db, now - chrono::Duration::days(9999)).await;
-        insert_audit_log(&db, now - chrono::Duration::days(9999)).await;
+        let now = time::OffsetDateTime::now_utc();
+        insert_sync_log(&db, now - time::Duration::days(9999)).await;
+        insert_audit_log(&db, now - time::Duration::days(9999)).await;
 
         assert_eq!(purge_expired_sync_logs(&db, 0).await.expect("purge"), 0);
         assert_eq!(purge_expired_audit_logs(&db, 0).await.expect("purge"), 0);

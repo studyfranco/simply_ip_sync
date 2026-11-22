@@ -11,7 +11,6 @@ pub mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ConnectionTrait, DbErr, Set};
 use serde_json::json;
 use simply_ip_sync::entities::{api_key_sync_permission, destination_group, external_source};
@@ -42,7 +41,7 @@ async fn insert_source(
     owner_key_id: Uuid,
 ) -> Uuid {
     let group_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let group = destination_group::ActiveModel {
         id: Set(group_id),
         name: Set(format!("group-{group_id}")),
@@ -91,7 +90,7 @@ async fn grant_permission(
         can_sync: Set(can_sync),
         can_manage: Set(can_manage),
         can_view_logs: Set(can_view_logs),
-        created_at: Set(Utc::now()),
+        created_at: Set(time::OffsetDateTime::now_utc()),
     }
     .insert(conn)
     .await
@@ -309,7 +308,7 @@ async fn r6_revocation_requires_only_manage_not_the_verb_itself() {
         can_sync: Set(true),
         can_manage: Set(false),
         can_view_logs: Set(false),
-        created_at: Set(Utc::now()),
+        created_at: Set(time::OffsetDateTime::now_utc()),
     }
     .insert(&conn)
     .await
@@ -427,7 +426,7 @@ async fn s4_out_of_scope_and_nonexistent_vaults_are_indistinguishable() {
         common::insert_key(&conn, "Stranger", false, false, false, Some(master.id)).await;
     let out_of_scope_id = {
         let id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = time::OffsetDateTime::now_utc();
         let sealed = simply_ip_sync::crypto::SecretCipher::Plaintext
             .seal("secret")
             .unwrap();
@@ -765,7 +764,7 @@ async fn concurrent_deletes_of_the_same_resource_do_not_both_succeed() {
     let source_id = insert_source(&conn, "http://127.0.0.1:1/unused", master.id).await;
 
     let app = simply_ip_sync::create_app(state);
-    let now = Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     // Distinct timestamps (not distinct in any way that matters to the property under test — see
     // this helper's doc comment) so both requests carry distinct, individually-valid signatures.
     let target = format!("/api/destination-groups/{source_id}");

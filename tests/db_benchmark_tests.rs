@@ -9,7 +9,6 @@ pub mod common;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
 };
@@ -24,7 +23,7 @@ async fn seed_destination_groups_fixture(
     master_id: Uuid,
     count: usize,
 ) {
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let vault_id = Uuid::new_v4();
     let v_model = vault_endpoint::ActiveModel {
         id: Set(vault_id),
@@ -163,7 +162,7 @@ async fn benchmark_destination_groups_n_plus_one_vs_batched() {
 #[tokio::test]
 async fn benchmark_sync_tasks_n_plus_one_vs_batched() {
     let (conn, _state, master) = common::setup().await;
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
 
     let v1 = Uuid::new_v4();
     let v2 = Uuid::new_v4();
@@ -273,7 +272,7 @@ async fn benchmark_sync_tasks_n_plus_one_vs_batched() {
 #[tokio::test]
 async fn benchmark_sync_logs_index_scan_vs_table_scan() {
     let (conn, _state, _master) = common::setup().await;
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let job_id = Uuid::new_v4();
 
     // Seed 500 sync_logs rows with mixed statuses
@@ -293,7 +292,7 @@ async fn benchmark_sync_logs_index_scan_vs_table_scan() {
             chunks_sent: Set(1),
             duration_ms: Set(50),
             error_message: Set(None),
-            timestamp: Set(now - chrono::Duration::seconds(i)),
+            timestamp: Set(now - time::Duration::seconds(i)),
         }
         .insert(&conn)
         .await
@@ -344,7 +343,7 @@ async fn benchmark_sync_logs_index_scan_vs_table_scan() {
 #[tokio::test]
 async fn benchmark_destination_groups_is_active_index_scan() {
     let (conn, _state, master) = common::setup().await;
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
 
     // Seed 400 destination groups: 50 active, 350 inactive
     for i in 0..400 {

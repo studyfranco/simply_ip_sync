@@ -1,5 +1,7 @@
 # simply_ip_sync
 
+See [GOALS.md](GOALS.md) for the service scope and the `ext` and `isolate` boundary.
+
 Enterprise-grade threat intelligence ingestion orchestrator and multi-site inter-vault replication
 daemon. `simply_ip_sync` is the active synchronization engine in the `simply_ip_*` security
 ecosystem: it pulls external threat feeds (Spamhaus, FireHOL, AbuseIPDB, pfSense exports, …),
@@ -18,8 +20,8 @@ and it replicates delta changes (including tombstones) between vault instances o
                                ▼
 ┌──────────────┐   cron / manual trigger   ┌───────────────────────────┐
 │  Scheduler   │──────────────────────────▶│  POST /api/records/batch  │──▶ simply_ip_vault #1
-│ (tokio-cron- │                           │  (mode="upsert", signed   │──▶ simply_ip_vault #2
-│  scheduler)  │                           │   CANONICAL_V1 HMAC)      │──▶ …
+│   (croner + │                           │  (mode="upsert", signed   │──▶ simply_ip_vault #2
+│     Tokio)   │                           │   CANONICAL_V1 HMAC)      │──▶ …
 └──────┬───────┘                           └───────────────────────────┘
        │
        │ vault_sync_tasks
@@ -64,7 +66,7 @@ On first boot, if no Master key exists yet, the service bootstraps one:
   deterministically is mainly useful for test harnesses (e.g. `scripts/test_e2e.sh`) that need to
   sign requests as Master without scraping a redirected server log.
 
-Open `http://<host>:3003/` for the dashboard, or drive the API directly (see **Signing a request
+Open `http://sync.example.test:3003/` for the dashboard, or drive the API directly (see **Signing a request
 by hand** below).
 
 ## Configuration
@@ -168,17 +170,14 @@ of the parser: `user_agent` and `headers` (an object of extra request headers).
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo test -- --ignored     # live network feed tests, normally skipped
+./scripts/pre_push.sh
 cargo doc --no-deps
 ./scripts/test_e2e.sh       # boots the real binary; see below
 ```
 
 Integration tests (`tests/`) run entirely against an in-memory SQLite database and a real router
 via `tower::ServiceExt::oneshot`; outbound calls to remote vaults are exercised against
-`wiremock`-backed mock servers, so no network access or external services are required. A handful
-of tests in `tests/live_feed_ingestion_tests.rs` are `#[ignore]`d because they hit real, public
-threat-intelligence feeds over the network — run them explicitly with `cargo test -- --ignored`
-when network access is available; they are not part of the default `cargo test` run.
+`wiremock`-backed mock servers, so no network access or external services are required. Feed-ingestion tests use local fixtures and run in the default suite.
 
 `scripts/test_e2e.sh` is the one gate that exercises the **actual compiled binary** end-to-end
 rather than the in-process router: it boots `target/debug/simply_ip_sync` against an isolated

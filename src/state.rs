@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use reqwest::Client;
 use sea_orm::DatabaseConnection;
 
 use crate::config::TrustedProxies;
@@ -30,18 +29,12 @@ pub enum StartupConfigError {
     /// The outbound HTTP client could not be built.
     #[error("failed to build outbound HTTP client: {0}")]
     HttpClient(#[from] reqwest::Error),
-    /// The cron scheduler could not be started.
-    #[error("failed to start scheduler: {0}")]
-    Scheduler(String),
 }
 
 /// Shared, cloneable application state passed to every handler and background job.
 #[derive(Clone)]
 pub struct AppState {
-    /// Database connection pool.
-    pub db: DatabaseConnection,
-    /// Secrets-at-rest cipher.
-    pub cipher: Arc<SecretCipher>,
+    pub(crate) jobs: crate::jobs::JobContext,
     /// Inbound anti-replay guard.
     pub replay: Arc<ReplayGuard>,
     /// Master identity pin.
@@ -50,16 +43,11 @@ pub struct AppState {
     /// request time via `TrustedProxies::resolved`. Already `Arc`-backed internally, so this field
     /// carries no extra `Arc` wrapper of its own.
     pub trusted_proxies: TrustedProxies,
-    /// Outbound HTTP client used to call remote vault endpoints.
-    pub http: Client,
     /// The cron scheduler handle.
     pub scheduler: Arc<SchedulerHandle>,
     /// Resource ids with a sync job currently executing (`jobs::try_start_job`/`JobGuard`) — guards
     /// against two overlapping executions of the same external source or sync task.
     pub running_jobs: RunningJobs,
-    /// Whether external feed ingestion and `/api/sources/test-fetch` permit private/loopback IPs.
-    /// Always `false` in production unless `ALLOW_PRIVATE_INGEST_URLS_FOR_TEST=true` is set.
-    pub allow_private_ingest_urls: bool,
 }
 
 impl AppState {
@@ -69,26 +57,25 @@ impl AppState {
     ///
     /// # Errors
     ///
-    /// Returns [`StartupConfigError`] if environment configuration, HTTP client creation, or
-    /// scheduler startup fails.
-    pub async fn new(db: DatabaseConnection) -> Result<Self, StartupConfigError> {
+    /// Returns [`StartupConfigError`] if environment configuration or HTTP client creation fails.
+    pub fn new(db: DatabaseConnection) -> Result<Self, StartupConfigError> {
         let cipher = SecretCipher::from_env()?;
         let trusted_proxies = TrustedProxies::from_env()?;
         let http = crate::client::build_http_client()?;
-        let scheduler = SchedulerHandle::new()
-            .await
-            .map_err(|e| StartupConfigError::Scheduler(e.to_string()))?;
+        let scheduler = SchedulerHandle::new();
 
         Ok(Self {
-            db,
-            cipher: Arc::new(cipher),
+            jobs: crate::jobs::JobContext {
+                db,
+                cipher: Arc::new(cipher),
+                http,
+                allow_private_ingest_urls: crate::config::allow_private_ingest_urls(),
+            },
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::new()),
             trusted_proxies,
-            http,
             scheduler: Arc::new(scheduler),
             running_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            allow_private_ingest_urls: crate::config::allow_private_ingest_urls(),
         })
     }
 
@@ -99,25 +86,25 @@ impl AppState {
     ///
     /// # Errors
     ///
-    /// Returns [`StartupConfigError`] if the HTTP client or scheduler fails to initialize.
-    pub async fn for_tests(
+    /// Returns [`StartupConfigError`] if the HTTP client fails to initialize.
+    pub fn for_tests(
         db: DatabaseConnection,
         master_id: uuid::Uuid,
     ) -> Result<Self, StartupConfigError> {
-        let scheduler = SchedulerHandle::new()
-            .await
-            .map_err(|e| StartupConfigError::Scheduler(e.to_string()))?;
+        let scheduler = SchedulerHandle::new();
         let http = crate::client::build_http_client()?;
         Ok(Self {
-            db,
-            cipher: Arc::new(SecretCipher::Plaintext),
+            jobs: crate::jobs::JobContext {
+                db,
+                cipher: Arc::new(SecretCipher::Plaintext),
+                http,
+                allow_private_ingest_urls: true,
+            },
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::pinned_to(master_id)),
             trusted_proxies: TrustedProxies::default(),
-            http,
             scheduler: Arc::new(scheduler),
             running_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            allow_private_ingest_urls: true,
         })
     }
 
@@ -126,5 +113,19 @@ impl AppState {
     pub fn with_allow_private_ingest_urls(mut self, allow: bool) -> Self {
         self.allow_private_ingest_urls = allow;
         self
+    }
+}
+
+impl std::ops::Deref for AppState {
+    type Target = crate::jobs::JobContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.jobs
+    }
+}
+
+impl std::ops::DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.jobs
     }
 }

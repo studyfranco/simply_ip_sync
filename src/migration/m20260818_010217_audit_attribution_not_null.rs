@@ -41,8 +41,13 @@
 //! backend, and a near miss would silently change a column's affinity while every test still
 //! passed.
 
+use super::runner::{MigrationTrait, SchemaManager};
 use sea_orm::DatabaseBackend;
-use sea_orm_migration::prelude::*;
+use sea_orm::sea_query::{
+    ColumnDef, Expr, ExprTrait, ForeignKey, ForeignKeyAction, Index, IntoTableRef, Query, Table,
+    TableCreateStatement, TableRef,
+};
+use sea_orm::{DbErr, DeriveIden};
 
 /// The value written where attribution was never recorded.
 ///
@@ -52,7 +57,6 @@ const UNRECORDED: &str = "(unknown)";
 /// The three columns this migration constrains.
 const ATTRIBUTION_COLUMNS: [&str; 3] = ["api_key_name", "api_key_prefix", "client_ip"];
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 /// `audit_logs`, and the transient name its SQLite rebuild lands in.
@@ -220,7 +224,11 @@ async fn backfill(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    fn name(&self) -> &'static str {
+        stringify!(m20260818_010217_audit_attribution_not_null)
+    }
+
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Order matters: the constraint cannot be applied while a single NULL remains, and on the
         // rebuild path the copy would fail rather than the ALTER.
         backfill(manager).await?;
@@ -246,7 +254,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Relaxing a constraint needs no backfill; the rows already satisfy the looser shape.
         if manager.get_database_backend() == DatabaseBackend::Sqlite {
             return rebuild(manager, false).await;

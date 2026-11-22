@@ -170,7 +170,7 @@ Python `http.server`-based mock downstream servers). Scoped to ~11 sections agai
 boot identity, HMAC signing & anti-replay (missing/wrong/tampered/expired/future/malformed
 timestamp, deliberate replay-of-identical-request), cron validation, multi-vault mock servers,
 successful fan-out, partial failure, live feed ingestion (network-gated — skips with a warning
-rather than failing if `raw.githubusercontent.com` is unreachable), local ZIP/JSONL fixtures
+rather than failing if `feeds.example.org` is unreachable), local ZIP/JSONL fixtures
 (same fixture shapes as the two new Rust tests above, generated fresh each run and served via a
 local `python3 -m http.server`), additional hardening/edge cases (malformed JSON, unexpected
 field, unknown route, RBAC privilege-escalation attempts, Master immutability/rotation refusal),
@@ -1351,7 +1351,7 @@ empty). `cargo test`: unchanged at 183 passed / 0 failed / 5 ignored. `./scripts
 still PASSED, 52 matching / 2 documented / 0 unexplained.
 
 `./scripts/test_e2e.sh` reported **211/213**, two failures, both in the same live-network
-subsection (`live-mass-scanner`, `https://raw.githubusercontent.com/stamparm/maltrail/master/trails/static/mass_scanner.txt`).
+subsection (`live-mass-scanner`, `https://feeds.example.org/stamparm/maltrail/master/trails/static/mass_scanner.txt`).
 Confirmed via a direct `curl` that the upstream file now answers `404` — it has been moved,
 renamed, or removed in the `stamparm/maltrail` repository since this fixture was last verified
 against the live source, unrelated to anything changed this session (`scripts/test_e2e.sh` itself
@@ -1391,7 +1391,7 @@ the test can assert the inter-vault pipeline never sends it — `vault_sync_task
 `upsert`.
 
 **The scenario** (`test_inter_vault_sync_high_volume_partial_overlap`). Vault A: `group_alpha` and
-`group_beta`, 1,000 records each (`10.0.0.1`–`10.0.3.232`, `10.1.0.1`–`10.1.3.232`). Vault B: the
+`group_beta`, 1,000 records each (`192.0.2.1`–`192.0.2.232`, `198.51.100.1`–`198.51.100.232`). Vault B: the
 same two groups, each 1,000 records = 500 overlapping A (`10.x.1.245`–`10.x.3.232`) + 500 unique to
 B (`10.x.4.1`–`10.x.5.244`). Pass 1 replicates `group_alpha` A→B and asserts convergence on exactly
 **1,500 distinct rows** (the 500 overlapping addresses updating in place — verified by checking
@@ -1435,7 +1435,7 @@ is launched as a separate process and curl has to be told where to find it.)
 - `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained.
 - `./scripts/test_e2e.sh`: **211/213**, the same 2 failures Session 12 recorded and for the same
   external reason — `live-mass-scanner`'s upstream URL
-  (`raw.githubusercontent.com/stamparm/maltrail/master/trails/static/mass_scanner.txt`) still
+  (`feeds.example.org/stamparm/maltrail/master/trails/static/mass_scanner.txt`) still
   returns `404`. Re-confirmed this session that the repository itself is reachable (README `200`)
   and the other three live feeds all return `200`, so it is that one file having moved or been
   removed upstream, not a network problem. **Not caused by this session's change and structurally
@@ -1611,7 +1611,7 @@ as designed.
 
 ### 2. `TRUSTED_PROXIES` accepts hostnames — the actual reported crash
 
-`traefik_tomidejetsu` (a Docker Compose service name) previously failed
+`reverse-proxy.example.test` (a Docker Compose service name) previously failed
 `entry.parse::<IpNetwork>()` outright, and `parse_trusted_proxies` had no other spelling to try, so
 `TrustedProxies::from_env` (then just `trusted_proxies_from_env`) returned `Err` and the process
 exited before binding a listener — exactly the reported "crashes startup" symptom.
@@ -1642,7 +1642,7 @@ divergences from the peer.
 clone, no lock) for every deployment that names its proxies by address rather than hostname, which
 remains the common case.
 
-Verified live: booted the compiled binary with `TRUSTED_PROXIES=traefik_tomidejetsu,127.0.0.1/32`
+Verified live: booted the compiled binary with `TRUSTED_PROXIES=reverse-proxy.example.test,127.0.0.1/32`
 (the exact reported value plus a literal to prove mixed configs work) — it now boots, stays up, and
 logs the unresolved hostname as a `TAMPER`-free, non-fatal `ERROR` with a 60s retry, rather than
 exiting.
@@ -1651,8 +1651,8 @@ exiting.
 
 `static/app.js`'s `SyncClient` previously had no path derivation at all — every call site already
 spelled its endpoint as a literal `/api/...`, which `fetch()` resolves against the *domain* root,
-not the page's own directory. Mounted at `https://host/ip_sync/`, every request went to
-`https://host/api/...` instead of through the proxy's `/ip_sync/` prefix.
+not the page's own directory. Mounted at `https://proxy.example.test/ip_sync/`, every request went to
+`https://proxy.example.test/api/...` instead of through the proxy's `/ip_sync/` prefix.
 
 Ported `simply_ip_vault::static/app.js`'s two-base design (`requestBase`/`signingBase`), adapted to
 this service's call-site shape (endpoints already carry `/api/...` themselves, unlike the peer's,
@@ -1798,7 +1798,7 @@ consider a same-second-double-fetch regression case for this exact scenario.
 
 ## Session 18 (2026-09-25): Session 16's subpath fix had an inverted default — signing failed on every real Traefik deployment leaving the override blank
 
-User report from the same real deployment (`https://lab.tomidejetsu.ovh:42363/ip_sync/`): sign-in now
+User report from the same real deployment (`https://admin.example.test:42363/ip_sync/`): sign-in now
 failed with a clean `401 Invalid request signature` (progress from Session 16 — the page itself
 loaded, `app.js`/`style.css` served correctly through the proxy — but auth still failed). Investigated
 by comparing this service's `static/app.js` two-base design (added Session 16) against the
@@ -1872,9 +1872,9 @@ works correctly.
 ## Session 19 (2026-09-26): outbound `Url::join` silently dropped a reverse-proxy subpath from `target_url` — clean 500s on every sync against a subpath-mounted vault
 
 User's Sync Logs tab showed repeated failures: `VAULT_SYNC` against a vault endpoint named
-`MainServ` (`target_url: https://patris.tomidejetsu.ovh/direct/ip_vault/`) failing with `delta
+`site-b` (`target_url: https://vault-site-b.example.test/direct/ip_vault/`) failing with `delta
 fetch from 'MainServ' failed: vault endpoint returned 500: Internal Server Error`, while a second
-endpoint (`Seedbox`, `target_url: http://simply_ip_vault:3000/`, a bare Docker-hostname address
+endpoint (`site-a`, `target_url: http://vault-site-a.example.test:3000/`, a bare Docker-hostname address
 with no subpath) had no reported failures. This is the outbound mirror of Sessions 16/18 (this
 service acting as the *client*, calling out to a `simply_ip_vault` instance that itself sits behind
 a reverse-proxy subpath) — but a different bug class from either of those, not a signature
@@ -1886,10 +1886,10 @@ mismatch.
 `base.join("/api/records/batch")` (a **leading-slash** argument). Per RFC 3986 §5.3, a reference
 beginning with `/` is an absolute-path reference: `Url::join` replaces the base's *entire* path,
 regardless of whether the base path ends in a trailing slash — this is not the commonly-cited
-"file vs directory" trailing-slash gotcha, it's simpler and more total. So for `MainServ`, the
-actual outbound request went to `https://patris.tomidejetsu.ovh/api/ips` — the `/direct/ip_vault`
+"file vs directory" trailing-slash gotcha, it's simpler and more total. So for `site-b`, the
+actual outbound request went to `https://vault-site-b.example.test/api/ips` — the `/direct/ip_vault`
 subpath silently and completely dropped, landing at the domain root instead of the vault's actual
-location. For `Seedbox` the base path was already `/`, so the join was a no-op in effect, which is
+location. For `site-a` the base path was already `/`, so the join was a no-op in effect, which is
 exactly why only the subpath-mounted endpoint failed.
 
 The outbound HMAC signing itself was not the bug: `target` is derived from the already-joined
@@ -1897,16 +1897,16 @@ The outbound HMAC signing itself was not the bug: `target` is derived from the a
 client's `CANONICAL_V1` construction is internally consistent, it just signed the wrong path
 because the URL builder had handed it the wrong path. This is why the symptom was a `500`, not a
 `401`: the malformed request never reached `simply_ip_vault`'s own auth middleware at all — it hit
-whatever unrelated service/vhost/default backend sits at `patris.tomidejetsu.ovh`'s domain root,
+whatever unrelated service/vhost/default backend sits at `vault-site-b.example.test`'s domain root,
 which erred rather than the vault ever seeing (and cleanly rejecting or accepting) a signed
 request.
 
 Confirmed via a scratch `#[cfg(test)]` compiled against the crate's actual `reqwest::Url` (added,
 run, reverted immediately — `git status` confirmed clean before the real fix):
 ```
-trailing-slash base + join("/api/ips")                   = https://patris.tomidejetsu.ovh/api/ips
-no-trailing-slash base + join("/api/ips")                = https://patris.tomidejetsu.ovh/api/ips
-trailing-slash base + join("api/ips") [no leading slash] = https://patris.tomidejetsu.ovh/direct/ip_vault/api/ips
+trailing-slash base + join("/api/ips")                   = https://vault-site-b.example.test/api/ips
+no-trailing-slash base + join("/api/ips")                = https://vault-site-b.example.test/api/ips
+trailing-slash base + join("api/ips") [no leading slash] = https://vault-site-b.example.test/direct/ip_vault/api/ips
 ```
 
 `tests/security_tests.rs`'s two pre-existing outbound tests
@@ -1948,7 +1948,7 @@ one "base" in the outbound direction — the operator-supplied `target_url` itse
 - `./scripts/verify_convergence.sh`: PASSED — 52 matching / 2 documented / 0 unexplained, unchanged.
 
 **Not done:** did not attempt to reproduce the exact production 500 against the real
-`patris.tomidejetsu.ovh` host (out of scope/inappropriate — that's the user's own infrastructure,
+`vault-site-b.example.test` host (out of scope/inappropriate — that's the user's own infrastructure,
 and the root cause was conclusively established from the client-side code and a controlled mock
 without needing to touch it). Did not add SSRF/target-validation hardening to `join_endpoint` —
 `vault_endpoints` are Master-granted, admin-configured targets (see `client.rs`'s existing
@@ -2294,7 +2294,7 @@ documentation-range addresses (`10.x.x.x`, `203.0.113.x`, `198.51.100.x`, `2001:
 throughout the test suite as arbitrary placeholder content — now silently stripped by the new
 filter. Fixed two different ways depending on what each address was actually testing:
 `external_ingestion_tests.rs` (bogon status was incidental to what the test checked) got its
-fixture addresses swapped for genuinely non-reserved ones (`93.184.x.x`, `2606:4700:4700::x`);
+fixture addresses swapped for genuinely non-reserved ones (non-bogon public IPv4/IPv6 test fixtures);
 `vault_sync_tests.rs`'s four shared task-constructor fixtures (where the placeholder-range choice
 is baked into many tests' setup) instead got `skip_bogon_filtering: Set(true)` with an explanatory
 doc comment, and exactly one new dedicated test (above) exercises the real default. Also caught a
@@ -2382,7 +2382,7 @@ Verified both explicitly-named targets against the real live endpoints (never hi
 automated test, per `AGENT.MD`'s "local fixtures... never against the live rate-limited source"
 rule — this was a one-time, human-directed verification pass, same discipline as Session 22's
 AbuseIPDB fixtures) before writing the parser logic:
-- `https://isc.sans.edu/block.txt` is tab-delimited, 7 columns:
+- `https://feeds.example.org/block.txt` is tab-delimited, 7 columns:
   `<start-of-netblock>\t<end-of-netblock>\t<prefix-length>\t<targets>\t<org>\t<country>\t<contact>`.
   A plain whole-line regex scan gets this wrong — it independently matches both the start *and*
   end address as two bogus `/32`s and never notices the `24` is a prefix length meant to combine
@@ -2391,7 +2391,7 @@ AbuseIPDB fixtures) before writing the parser logic:
   ISC shape (first field a bare IP, third a bare small integer) — both fold to `<ip>/<n>`. A bare
   integer can never itself parse as an IP, so there's no ambiguity with an ordinary
   two-address-per-line feed (FireHOL-style), which still falls through to the generic scan.
-- `https://isc.sans.edu/api/threatlist/erratasec?json` (the bare endpoint is XML; `?json` yields a
+- `https://feeds.example.org/api/threatlist/erratasec?json` (the bare endpoint is XML; `?json` yields a
   clean top-level array `[{"ipv4": "...", "date": "...", "lastseen": "..."}]`) reports `lastseen`
   as a bare `YYYY-MM-DD` date, not RFC 3339 like AbuseIPDB. `json_path.rs`'s `parse_last_seen_at`
   tries RFC 3339 first, falls back to the bare-date form, and treats anything else as `None` for
@@ -2627,3 +2627,11 @@ reference for permission reductions, Master targets, and inclusive audit query b
 - SQLite session settings are applied through connection options. Startup index checks use SeaORM's schema manager, and migrations use SeaQuery builders.
 - The additive text migration widens six columns. SQLite stages the affected tables and their junctions in a transaction, drops children before parents, and restores parents before children with foreign keys enabled.
 - Source hygiene checks raw SQL APIs and literals throughout `src/`, including migrations.
+
+## Chantiers 7 and 8
+
+The migration runner preserves the SeaORM ledger and its existing version names. UTC timestamps
+now use `time`, with explicit RFC 3339 for API responses and offset-free ISO 8601 for the vault
+client contract. Croner computes UTC ticks and Tokio owns each cancellable job timer. CI and the
+container workflow share the pre-push script. The onboarding guide documents the `ext` and
+`isolate` network placement.

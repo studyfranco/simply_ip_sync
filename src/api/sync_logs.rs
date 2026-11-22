@@ -55,7 +55,10 @@ pub async fn list_sync_logs(
         find = find.filter(sync_log::Column::Status.eq(status.clone()));
     }
     let rows = find
-        .order_by_desc(sync_log::Column::Timestamp)
+        .order_by_desc(crate::db::timestamp_order(
+            &state.db,
+            sync_log::Column::Timestamp,
+        ))
         .limit(query.limit.unwrap_or(100).min(1000))
         .offset(query.offset.unwrap_or(0))
         .all(&state.db)

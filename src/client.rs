@@ -8,7 +8,6 @@
 //! right. Redirects are refused outright (`redirect::Policy::none()`) since a target silently
 //! redirecting elsewhere isn't a case that should be followed transparently.
 
-use chrono::{DateTime, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +69,13 @@ impl BatchMode {
     }
 }
 
+// The vault contract uses UTC wall-clock strings without an offset.
+time::serde::format_description!(
+    vault_timestamp,
+    PrimitiveDateTime,
+    "[year]-[month]-[day]T[hour]:[minute]:[second][optional [.[subsecond]]]"
+);
+
 /// One record in a `POST /api/records/batch` request, matching `simply_ip_vault`'s
 /// `BatchRecordInput`.
 #[derive(Debug, Clone, Serialize)]
@@ -83,17 +89,29 @@ pub struct BatchRecordInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_deleted: Option<bool>,
     /// Only honoured for genuinely new rows.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<chrono::NaiveDateTime>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "vault_timestamp::option"
+    )]
+    pub created_at: Option<time::PrimitiveDateTime>,
     /// Update timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<chrono::NaiveDateTime>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "vault_timestamp::option"
+    )]
+    pub updated_at: Option<time::PrimitiveDateTime>,
     /// Last-seen timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_seen_at: Option<chrono::NaiveDateTime>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "vault_timestamp::option"
+    )]
+    pub last_seen_at: Option<time::PrimitiveDateTime>,
     /// Deletion timestamp, when `is_deleted` is `Some(true)`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "vault_timestamp::option"
+    )]
+    pub deleted_at: Option<time::PrimitiveDateTime>,
 }
 
 /// Response body of `POST /api/records/batch`.
@@ -149,17 +167,17 @@ pub struct IpRecordResponse {
     #[serde(default)]
     pub is_deleted: bool,
     /// Deletion timestamp, if soft-deleted.
-    #[serde(default)]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    #[serde(default, with = "vault_timestamp::option")]
+    pub deleted_at: Option<time::PrimitiveDateTime>,
     /// Creation timestamp on the source vault.
-    #[serde(default)]
-    pub created_at: Option<chrono::NaiveDateTime>,
+    #[serde(default, with = "vault_timestamp::option")]
+    pub created_at: Option<time::PrimitiveDateTime>,
     /// Last update timestamp.
-    #[serde(default)]
-    pub updated_at: Option<chrono::NaiveDateTime>,
+    #[serde(default, with = "vault_timestamp::option")]
+    pub updated_at: Option<time::PrimitiveDateTime>,
     /// Last-seen timestamp.
-    #[serde(default)]
-    pub last_seen_at: Option<chrono::NaiveDateTime>,
+    #[serde(default, with = "vault_timestamp::option")]
+    pub last_seen_at: Option<time::PrimitiveDateTime>,
 }
 
 /// Builds a `reqwest::Client` suitable for outbound calls to vault endpoints: redirects refused, a
@@ -192,7 +210,7 @@ fn signed_headers(
 ) -> Result<(String, String, String), ClientError> {
     let api_key = cipher.open_legacy_or_sealed(&endpoint.api_key)?;
     let secret = cipher.open(&endpoint.signing_secret)?;
-    let timestamp = Utc::now().timestamp().to_string();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     let signature = crypto::compute_signature(&secret, method, target, &timestamp, body)
         .map_err(|_| ClientError::Signing)?;
     Ok((api_key, timestamp, signature))
@@ -466,7 +484,7 @@ const DELTA_PAGE_SIZE: u64 = 5_000;
 struct DeltaQuery<'a> {
     base: &'a Url,
     group_name: &'a str,
-    since: Option<DateTime<Utc>>,
+    since: Option<time::OffsetDateTime>,
     include_deleted: bool,
 }
 
@@ -500,7 +518,7 @@ async fn get_ips_page(
         pairs.append_pair("limit", &DELTA_PAGE_SIZE.to_string());
         pairs.append_pair("offset", &offset.to_string());
         if let Some(since) = query.since {
-            pairs.append_pair("since", &since.timestamp().to_string());
+            pairs.append_pair("since", &since.unix_timestamp().to_string());
         }
     }
     let target = match url.query() {
@@ -577,7 +595,7 @@ pub async fn get_ips_delta(
     cipher: &SecretCipher,
     endpoint: &vault_endpoint::Model,
     group_name: &str,
-    since: Option<DateTime<Utc>>,
+    since: Option<time::OffsetDateTime>,
     include_deleted: bool,
 ) -> Result<Vec<IpRecordResponse>, ClientError> {
     get_ips_delta_with_policy(
@@ -608,7 +626,7 @@ pub async fn get_ips_delta_with_policy(
     cipher: &SecretCipher,
     endpoint: &vault_endpoint::Model,
     group_name: &str,
-    since: Option<DateTime<Utc>>,
+    since: Option<time::OffsetDateTime>,
     include_deleted: bool,
     policy: RetryPolicy,
 ) -> Result<Vec<IpRecordResponse>, ClientError> {

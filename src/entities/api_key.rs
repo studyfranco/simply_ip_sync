@@ -41,9 +41,9 @@ pub struct Model {
     /// Comma-separated CIDR ranges permitted to use this key. Empty/`None` means unrestricted.
     pub bound_ips: Option<String>,
     /// Creation timestamp.
-    pub created_at: DateTimeUtc,
+    pub created_at: time::OffsetDateTime,
     /// Last update timestamp.
-    pub updated_at: DateTimeUtc,
+    pub updated_at: time::OffsetDateTime,
 }
 
 /// Relations from `api_keys`.

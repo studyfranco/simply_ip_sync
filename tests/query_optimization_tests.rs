@@ -4,7 +4,6 @@
 pub mod common;
 
 use axum::http::StatusCode;
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
 use serde_json::Value;
 use simply_ip_sync::entities::{
@@ -15,7 +14,7 @@ use uuid::Uuid;
 
 async fn seed_vault(conn: &DatabaseConnection, name: &str, owner_key_id: Option<Uuid>) -> Uuid {
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let model = vault_endpoint::ActiveModel {
         id: Set(id),
         name: Set(name.to_owned()),
@@ -38,7 +37,7 @@ async fn seed_group(
     vault_id: Uuid,
 ) -> Uuid {
     let group_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let group = destination_group::ActiveModel {
         id: Set(group_id),
         name: Set(name.to_owned()),
@@ -86,7 +85,7 @@ async fn seed_task(
     target_vault_id: Uuid,
 ) -> Uuid {
     let task_id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let task = vault_sync_task::ActiveModel {
         id: Set(task_id),
         name: Set(name.to_owned()),
@@ -134,7 +133,7 @@ async fn test_destination_groups_batch_fetching_and_scoping() {
         can_sync: Set(true),
         can_manage: Set(false),
         can_view_logs: Set(true),
-        created_at: Set(Utc::now()),
+        created_at: Set(time::OffsetDateTime::now_utc()),
     };
     perm.insert(&conn).await.expect("insert perm");
 
@@ -195,7 +194,7 @@ async fn test_sync_tasks_batch_fetching_and_scoping() {
         can_sync: Set(false),
         can_manage: Set(false),
         can_view_logs: Set(true),
-        created_at: Set(Utc::now()),
+        created_at: Set(time::OffsetDateTime::now_utc()),
     };
     perm.insert(&conn).await.expect("insert perm");
 
@@ -238,7 +237,7 @@ async fn test_sync_logs_filtering_by_status_and_batch_scoping() {
 
     let job1 = Uuid::new_v4();
     let job2 = Uuid::new_v4();
-    let now = Utc::now();
+    let now = time::OffsetDateTime::now_utc();
 
     // Insert 3 logs: SUCCESS, FAILED, PARTIAL
     let log1 = sync_log::ActiveModel {
@@ -332,7 +331,7 @@ async fn test_sync_logs_filtering_by_status_and_batch_scoping() {
         can_sync: Set(false),
         can_manage: Set(false),
         can_view_logs: Set(true),
-        created_at: Set(Utc::now()),
+        created_at: Set(time::OffsetDateTime::now_utc()),
     };
     perm.insert(&conn).await.expect("insert perm");
 

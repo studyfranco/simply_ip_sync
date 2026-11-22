@@ -7,9 +7,10 @@
 //! - Granular permission lookups: `api_key_sync_permissions(resource_type, resource_id)`.
 //! - Master key lookups & validation: `api_keys(is_master)`.
 
-use sea_orm_migration::prelude::*;
+use super::runner::{MigrationTrait, SchemaManager};
+use sea_orm::sea_query::{Index, IndexOrder};
+use sea_orm::{DbErr, DeriveIden};
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[derive(DeriveIden)]
@@ -64,12 +65,16 @@ enum ExternalSources {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    fn name(&self) -> &'static str {
+        stringify!(m20261110_000001_add_scheduling_and_lookup_indexes)
+    }
+
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         create_job_indexes(manager).await?;
         create_lookup_indexes(manager).await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         drop_lookup_indexes(manager).await?;
         drop_job_indexes(manager).await
     }

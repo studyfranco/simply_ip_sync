@@ -1,5 +1,7 @@
 # Simply IP Sync - AI Agent Context & Directives
 
+See [GOALS.md](GOALS.md) for the service scope and the `ext` and `isolate` boundary.
+
 Hello AI Agent! You are assisting with the development of `simply_ip_sync`. Read and strictly adhere to these guidelines before inspecting or writing any code.
 
 ---
@@ -106,12 +108,12 @@ directory that contains a `.git` — see that script for the graceful offline-mo
     - **Secret Reveal:** One-time API keys and signing secrets render in `#secret-reveal-modal` using `.key-reveal-value` with a **1-line ellipsis** (`white-space: nowrap; overflow: hidden; text-overflow: ellipsis`) and dedicated Copy buttons.
     - **RBAC & Audit Parity:** Master privilege scope badge uses the red `.badge-scope-master` style, `.scope-badges` wraps with explicit `row-gap`/`line-height` spacing, and Audit Logs display the uniform 6-column layout (`Timestamp | API Key | Client IP | Action | Target | Details`).
     - **No inline `onclick=`:** Use `addEventListener` / `data-*` delegation.
-  - **Reverse-proxy subpath aware:** `static/app.js`'s `SyncClient` derives its request path from `window.location.pathname` (`deriveRequestBase`), so mounting the dashboard under a prefix (e.g. `https://host/ip_sync/`) needs no build-time configuration. A separate, operator-overridable `signingBase` (the "API base path override" login field, persisted in `localStorage`) covers the one thing the browser cannot discover: whether the proxy strips that prefix before forwarding to this service, which changes what path `middleware.rs::signed_target` actually verifies against.
+  - **Reverse-proxy subpath aware:** `static/app.js`'s `SyncClient` derives its request path from `window.location.pathname` (`deriveRequestBase`), so mounting the dashboard under a prefix (e.g. `https://sync.example.test/ip_sync/`) needs no build-time configuration. A separate, operator-overridable `signingBase` (the "API base path override" login field, persisted in `localStorage`) covers the one thing the browser cannot discover: whether the proxy strips that prefix before forwarding to this service, which changes what path `middleware.rs::signed_target` actually verifies against.
 - **Quality & Safety:**
   - Zero compiler warnings, zero `clippy` warnings.
   - **Zero `.unwrap()` or `.expect()`** in production or HTTP handlers. Use structured `AppError` and Axum's `IntoResponse`.
   - **Mandatory `rustdoc`**: Document all public items with `///`. Enforce `#![warn(missing_docs)]` in `lib.rs`.
-  - **Dependency Updates & Security Audits**: All external libraries/Cargo dependencies must always be kept at their latest compatible versions (`cargo update`, latest semver). `scripts/test_e2e.sh` and GitHub CI workflows strictly enforce `cargo update` and `cargo audit` before building, testing, or publishing.
+  - **Dependency updates and audits:** Run `cargo update` when refreshing the lockfile. The mandatory audit gate is `cargo audit --deny warnings` with zero ignores. Do not pass `--ignore RUSTSEC-*` or add advisory exclusions. Keep `chrono`, `chrono-tz`, and `sea-orm-migration` out of the dependency graph and lockfile.
 
 ---
 
@@ -135,9 +137,9 @@ directory that contains a `.git` — see that script for the graceful offline-mo
 #### IP Extraction & Trusted Proxies
 - Respect `X-Forwarded-For` / `X-Real-IP` **only** when TCP peer is in `TRUSTED_PROXIES`.
 - Walk `X-Forwarded-For` right-to-left, skipping trusted proxy hops.
-- `TRUSTED_PROXIES` accepts three spellings, comma-separated: a CIDR (`172.16.0.0/12`), a bare IP
+- `TRUSTED_PROXIES` accepts three spellings, comma-separated: a CIDR (`192.0.2.0/24`), a bare IP
   (`127.0.0.1`, promoted to a single-host network), or a **hostname** (`traefik`,
-  `traefik_tomidejetsu`) — the shape a Docker Compose service name or a Kubernetes service takes.
+  `reverse-proxy.example.test`) — the shape a Docker Compose service name or a Kubernetes service takes.
   A hostname is resolved via DNS **at request time**, not once at startup, and re-resolved on a
   short TTL (`config::TrustedProxies`), so a proxy container's restart-and-new-IP is picked up
   without restarting this service. See `src/config.rs`'s module doc for the full mechanism
@@ -242,7 +244,7 @@ own URL/parser, fetched **concurrently**, and merged into one deduplicated set p
 
 ### 4. Scheduler & Manual Execution
 
-- **Background Cron Scheduler:** Uses an in-process async scheduler (`tokio-cron-scheduler`) reading active `destination_groups` (one job per group, covering every child feed) and `vault_sync_tasks` schedules.
+- **Background Cron Scheduler:** Uses an in-process async scheduler (Croner 5 and Tokio) reading active `destination_groups` (one job per group, covering every child feed) and `vault_sync_tasks` schedules.
 - **Manual Trigger Endpoints:**
   - `POST /api/destination-groups/{id}/trigger`
   - `POST /api/sync-tasks/{id}/trigger`
@@ -349,14 +351,14 @@ change and audited whenever a new migration is added:
   9. `static/app.js` source hygiene: zero JavaScript syntax errors, and every
      `document.getElementById()` reference resolvable against `static/index.html` (statically or
      dynamically injected).
-- **Live network tests** (`tests/live_feed_ingestion_tests.rs`) are `#[ignore]`d and excluded from
-  the default `cargo test` run; they must still pass when run explicitly via
-  `cargo test -- --ignored` before merging a change that touches the parser or ingestion pipeline.
+- Feed ingestion runs against local fixtures in the default test suite.
+- Before every push, run `./scripts/pre_push.sh`. Enable the repository hook with
+  `git config core.hooksPath .githooks` so `.githooks/pre-push` runs the same checks automatically.
 - **`./scripts/test_e2e.sh`** is a mandatory quality gate alongside `cargo check`/`clippy`/`test`.
   It boots the real compiled binary (not the in-process router) against an isolated temp database
   and port, drives it with hand-signed `curl` requests, and is the only gate that proves actual
   multi-vault delivery over a real socket and a clean process shutdown on `SIGTERM`. It enforces
-  `cargo update` and `cargo audit` with error logging prior to building.
+  `cargo audit --deny warnings` against the committed lockfile before building.
 - **CI/CD Enforcement**: Automated testing is a mandatory prerequisite for deployments. In GitHub
   Actions, all `push` and `pull_request` events to `master` execute `cargo test --workspace --verbose`
   via `.github/workflows/ci.yml`, and `.github/workflows/docker-publish.yml` requires the `test`
