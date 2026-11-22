@@ -23,3 +23,7 @@ The daemon connects these networks at the application layer. It parses and appli
 - RBAC scopes configuration, job triggers, and logs to authorized keys and resources.
 
 Use documentation-only addresses such as `192.0.2.10`, `198.51.100.20`, and `203.0.113.30`, and reserved domains such as `vault-site-a.example.test`. Keep production endpoints, addresses, and credentials out of documentation.
+
+## Agent Skill
+
+See [`.agents/skills/use-ip-sync/SKILL.md`](.agents/skills/use-ip-sync/SKILL.md) for the in-repo operational skill covering `CANONICAL_V1` signing, `OriginalUri`, API endpoints, curated feed configs, and SSRF/anti-bogon guardrails.

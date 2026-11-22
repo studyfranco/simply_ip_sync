@@ -228,8 +228,9 @@ fn html_error_page_yields_zero_entries_from_regex_line_no_panic() {
     let records = parser
         .parse(CLOUDFLARE_ERROR_PAGE.as_bytes(), None)
         .expect("parse must not error");
-    assert!(
-        records.is_empty(),
+    assert_eq!(
+        records,
+        [] as [ParsedRecord; 0],
         "an HTML error page with no IP-shaped text must yield zero entries, got {records:?}"
     );
 }
@@ -286,7 +287,7 @@ fn large_html_body_parses_quickly_with_zero_matches() {
         .expect("parse must not error");
     let elapsed = start.elapsed();
 
-    assert!(records.is_empty());
+    assert_eq!(records, [] as [ParsedRecord; 0]);
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "parsing ~{} bytes took {elapsed:?}, expected well under 5s",

@@ -1178,8 +1178,9 @@ fn assert_pass_one_convergence(
         "500 pre-existing B-only + 500 overlapping (updated in place, not duplicated) + 500 newly \
          pushed from A = 1,500 distinct records"
     );
-    assert!(
-        vault_b.deleted_addresses("group_alpha").is_empty(),
+    assert_eq!(
+        vault_b.deleted_addresses("group_alpha"),
+        [] as [String; 0],
         "an upsert pass must never tombstone anything"
     );
 
@@ -1216,8 +1217,9 @@ fn assert_pass_one_convergence(
         1_000,
         "group_beta must not gain records from an alpha-only task"
     );
-    assert!(
-        vault_b.deleted_addresses("group_beta").is_empty(),
+    assert_eq!(
+        vault_b.deleted_addresses("group_beta"),
+        [] as [String; 0],
         "group_beta must not gain tombstones either"
     );
     assert!(
@@ -1264,7 +1266,7 @@ fn assert_pass_two_convergence(vault_b: &common::MockVault, deleted: &[String]) 
 
     assert_eq!(vault_b.live_addresses("group_alpha").len(), 1_400);
     assert_eq!(vault_b.record_count("group_beta"), 1_000);
-    assert!(vault_b.deleted_addresses("group_beta").is_empty());
+    assert_eq!(vault_b.deleted_addresses("group_beta"), [] as [String; 0]);
 }
 
 #[tokio::test]

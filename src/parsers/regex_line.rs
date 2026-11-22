@@ -85,7 +85,12 @@ fn netblock_and_prefix(trimmed: &str) -> Option<String> {
         _ => return None,
     };
     let prefix: u8 = prefix_field.parse().ok()?;
-    normalize_ip_or_cidr(&format!("{base}/{prefix}"))
+    let cidr = format!("{base}/{prefix}");
+    let net: ipnet::IpNet = cidr.parse().ok()?;
+    if net.addr() != net.network() {
+        return None;
+    }
+    normalize_ip_or_cidr(&cidr)
 }
 
 /// Parses newline-delimited text, stripping full-line and inline comments (`#`, `;`, `//`) and
@@ -173,11 +178,11 @@ mod tests {
     fn non_utf8_body_degrades_to_zero_entries_instead_of_erroring() {
         let parser = RegexLineParser;
         let body: &[u8] = &[0xff, 0xfe, 0x00];
-        assert!(
+        assert_eq!(
             parser
                 .parse(body, None)
-                .expect("must not error on invalid UTF-8")
-                .is_empty()
+                .expect("must not error on invalid UTF-8"),
+            [] as [ParsedRecord; 0]
         );
     }
 

@@ -515,12 +515,11 @@ impl FetchOptions {
         let headers = map
             .get("headers")
             .and_then(Value::as_object)
-            .map(|h| {
+            .map_or_default(|h| {
                 h.iter()
                     .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         Self {
             user_agent,
             headers,

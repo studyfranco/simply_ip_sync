@@ -1,6 +1,6 @@
 # simply_ip_sync
 
-See [GOALS.md](GOALS.md) for the service scope and the `ext` and `isolate` boundary.
+See [GOALS.md](GOALS.md) for the service scope and the `ext` and `isolate` boundary, and [`.agents/skills/use-ip-sync/SKILL.md`](.agents/skills/use-ip-sync/SKILL.md) for the operator/agent API cookbook.
 
 Enterprise-grade threat intelligence ingestion orchestrator and multi-site inter-vault replication
 daemon. `simply_ip_sync` is the active synchronization engine in the `simply_ip_*` security
@@ -163,6 +163,20 @@ Built-in parsers:
 
 `parser_config_json` may also carry two generic keys read by the ingestion job itself, independent
 of the parser: `user_agent` and `headers` (an object of extra request headers).
+
+### Curated Threat-Intel Feed Catalog (`Problematics IPS`)
+
+| Feed Name | Parser Type | Wire Format / Notes | `parser_config_json` |
+| :--- | :--- | :--- | :--- |
+| `feodo_tracker` | `REGEX_LINE` | `#`-commented IPv4 blocklist | *(none)* |
+| `sans_isc_block` | `REGEX_LINE` | Tab-separated `<start>\t<end>\t24\t...` netblocks | *(none)* |
+| `sans_isc_shodan` | `JSON_PATH` | Top-level JSON array (`ipv4`, `lastseen`); requires `user_agent` (empty `User-Agent` triggers 302 redirect) | `{"target_address":"$.ipv4","last_seen_at":"$.lastseen","user_agent":"simply_ip_sync/1.0"}` |
+| `ipsum_level3` | `REGEX_LINE` | `#`-commented header + `<ip>` or `<ip>\t<score>` | *(none)* |
+| `binarydefense` | `REGEX_LINE` | `#`-commented IPv4 banlist | *(none)* |
+| `dataplane_sshclient` | `REGEX_LINE` | `#`-commented header + `ASN \| IP \| ts \| desc` | *(none)* |
+| `dataplane_sshpwauth` | `REGEX_LINE` | `#`-commented header + `ASN \| IP \| ts \| desc` | *(none)* |
+| `dataplane_dnsrd` | `REGEX_LINE` | `#`-commented header + `ASN \| IP \| ts \| desc` | *(none)* |
+| `dataplane_vncrfb` | `REGEX_LINE` | `#`-commented header + `ASN \| IP \| ts \| desc` | *(none)* |
 
 ## Development
 

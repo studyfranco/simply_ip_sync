@@ -192,7 +192,7 @@ mod tests {
     fn empty_input_yields_no_chunks() {
         let items: Vec<u32> = Vec::new();
         let chunks = chunk_records(items, 5000);
-        assert!(chunks.is_empty());
+        assert_eq!(chunks, [] as [Vec<u32>; 0]);
     }
 
     #[test]

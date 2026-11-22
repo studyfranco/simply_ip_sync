@@ -1,6 +1,6 @@
 # Simply IP Sync - AI Agent Context & Directives
 
-See [GOALS.md](GOALS.md) for the service scope and the `ext` and `isolate` boundary.
+See [GOALS.md](GOALS.md) for the service scope and the `ext` and `isolate` boundary, and [`.agents/skills/use-ip-sync/SKILL.md`](.agents/skills/use-ip-sync/SKILL.md) for the operational API skill.
 
 Hello AI Agent! You are assisting with the development of `simply_ip_sync`. Read and strictly adhere to these guidelines before inspecting or writing any code.
 

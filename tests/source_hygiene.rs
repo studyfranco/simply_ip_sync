@@ -238,7 +238,7 @@ fn manifest_policy(source: &str) -> Vec<String> {
 #[test]
 fn cargo_manifest_enforces_ecosystem_policy() {
     let violations = manifest_policy(&read("Cargo.toml"));
-    assert!(violations.is_empty(), "{}", violations.join("\n"));
+    assert_eq!(violations, [] as [String; 0], "{}", violations.join("\n"));
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn manifest_policy_rejects_drift() {
         [dependencies]
         sea-schema = { features = ['sqlx-postgres', 'sqlx-sqlite'] }
     "#;
-    assert!(manifest_policy(manifest).is_empty());
+    assert_eq!(manifest_policy(manifest), [] as [String; 0]);
     for (before, after, diagnostic) in [
         ("'2024'", "'2021'", "package.edition"),
         (
@@ -655,8 +655,9 @@ fn rust_sources_only_use_the_entity_lint_expectation() {
     for path in rust_files("src").chain(rust_files("tests")) {
         let source = read(path.to_str().expect("UTF-8 path"));
         let violations = lint_attribute_violations(&path, &rust_source(&source));
-        assert!(
-            violations.is_empty(),
+        assert_eq!(
+            violations,
+            [] as [usize; 0],
             "{}: forbidden lint attributes at byte offsets {violations:?}",
             path.display()
         );
@@ -676,13 +677,19 @@ fn lint_policy_rejects_attributes_outside_the_entity_exception() {
         ENTITY_EXPECT_REASON
     );
     let entity = Path::new("src/entities/example.rs");
-    assert!(lint_attribute_violations(entity, &rust_source(&permitted)).is_empty());
+    assert_eq!(
+        lint_attribute_violations(entity, &rust_source(&permitted)),
+        [] as [usize; 0]
+    );
     for path in [
         "src/api/example.rs",
         "tests/example.rs",
         "src/entities/nested/example.rs",
     ] {
-        assert!(!lint_attribute_violations(Path::new(path), &rust_source(&permitted)).is_empty());
+        assert_ne!(
+            lint_attribute_violations(Path::new(path), &rust_source(&permitted)),
+            [] as [usize; 0]
+        );
     }
     for source in [
         concat!("#[", "allow(clippy::", "all)] fn f() {}").to_owned(),
@@ -696,8 +703,9 @@ fn lint_policy_rejects_attributes_outside_the_entity_exception() {
         permitted.replace("d: bool", "d: u8"),
         permitted.replace(ENTITY_EXPECT_REASON, "different reason"),
     ] {
-        assert!(
-            !lint_attribute_violations(entity, &rust_source(&source)).is_empty(),
+        assert_ne!(
+            lint_attribute_violations(entity, &rust_source(&source)),
+            [] as [usize; 0],
             "{source}"
         );
     }
@@ -724,8 +732,9 @@ fn rust_production_code_is_panic_free_and_safe() {
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
             .unwrap_or(rust.code.len());
         let violations = production_code_violations(&rust.code[..end]);
-        assert!(
-            violations.is_empty(),
+        assert_eq!(
+            violations,
+            [] as [&str; 0],
             "{}: forbidden Rust constructs {violations:?}",
             path.display()
         );
@@ -763,7 +772,10 @@ fn production_check_rejects_panics_and_unsafe_code() {
         " { } \"#\"##;\n",
         "let character = '\"'; let label = 'x';",
     );
-    assert!(production_code_violations(&rust_source(ignored).code).is_empty());
+    assert_eq!(
+        production_code_violations(&rust_source(ignored).code),
+        [] as [&str; 0]
+    );
 }
 
 const RAW_SQL_MARKERS: &str = concat!(
@@ -855,13 +867,19 @@ fn raw_sql_check_rejects_raw_apis_and_sql_literals() {
         assert_eq!(raw_sql_violations(&rust, source.len()).len(), 1, "{source}");
     }
     let source = r#""SELECT 1""#;
-    assert!(raw_sql_violations(&rust_source(source), source.len()).is_empty());
+    assert_eq!(
+        raw_sql_violations(&rust_source(source), source.len()),
+        [] as [&str; 0]
+    );
     let source = concat!(
         "// SELECT",
         " * FROM records\n\"Statement::",
         "from_string\""
     );
-    assert!(raw_sql_violations(&rust_source(source), source.len()).is_empty());
+    assert_eq!(
+        raw_sql_violations(&rust_source(source), source.len()),
+        [] as [&str; 0]
+    );
 }
 
 fn syntax_errors(relative: &str, source: &str) -> Vec<String> {
@@ -897,7 +915,7 @@ fn dashboard_assets_exist() {
 #[test]
 fn app_js_parses_without_syntax_errors() {
     let errors = syntax_errors("static/app.js", &read("static/app.js"));
-    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    assert_eq!(errors, [] as [String; 0], "{}", errors.join("\n"));
 }
 
 #[test]
@@ -1100,7 +1118,7 @@ fn subpath_violations(js: &str) -> Vec<&'static str> {
 #[test]
 fn dashboard_requests_and_signatures_use_independent_bases() {
     let violations = subpath_violations(&read("static/app.js"));
-    assert!(violations.is_empty(), "{violations:?}");
+    assert_eq!(violations, [] as [&str; 0], "{violations:?}");
 }
 
 #[test]
@@ -1282,8 +1300,9 @@ fn key_payload_violations(js: &str) -> Vec<&str> {
 fn the_dashboard_never_sends_is_master_in_a_key_payload() {
     let js = read("static/app.js");
     let violations = key_payload_violations(&js);
-    assert!(
-        violations.is_empty(),
+    assert_eq!(
+        violations,
+        [] as [&str; 0],
         "is_master sent in key payloads: {violations:?}"
     );
 }
@@ -1319,7 +1338,7 @@ fn key_payload_check_covers_the_dashboard_create_and_update_forms() {
     ] {
         let broken = js.replace(field, &format!("is_master: true, {field}"));
         assert_ne!(js, broken, "expected dashboard form field {field}");
-        assert!(!key_payload_violations(&broken).is_empty(), "{field}");
+        assert_ne!(key_payload_violations(&broken), [] as [&str; 0], "{field}");
     }
 }
 
@@ -1406,8 +1425,9 @@ fn frontend_has_no_external_assets_or_svg_data_uris() {
         {
             let source = read(path.to_str().expect("UTF-8 path"));
             let violations = external_asset_violations(&source, extension);
-            assert!(
-                violations.is_empty(),
+            assert_eq!(
+                violations,
+                [] as [&str; 0],
                 "{}: forbidden frontend assets {violations:?}",
                 path.display()
             );
@@ -1456,8 +1476,9 @@ fn offline_asset_check_rejects_external_resources_and_svg_data() {
             "node.innerHTML = `<img src='http://example.test/image'>`;",
         ),
     ] {
-        assert!(
-            !external_asset_violations(source, extension).is_empty(),
+        assert_ne!(
+            external_asset_violations(source, extension),
+            [] as [&str; 0],
             "{source}"
         );
     }
@@ -1466,7 +1487,7 @@ fn offline_asset_check_rejects_external_resources_and_svg_data() {
         const svg = `<svg xmlns="http://www.w3.org/2000/svg"></svg>`;
         const local = `<img src="./local.png" alt="try https://example.test">`;
         fetch(this.requestBase + path);"#;
-    assert!(external_asset_violations(benign, "js").is_empty());
+    assert_eq!(external_asset_violations(benign, "js"), [] as [&str; 0]);
 }
 
 const FORBIDDEN_CRATES: [&str; 4] = [
@@ -1607,7 +1628,7 @@ fn onboarding_and_root_documentation_use_placeholder_endpoints() {
                 .any(|line| line.contains("](GOALS.md)"))
         );
     }
-    assert!(!read("GOALS.md").trim().is_empty());
+    assert_ne!(read("GOALS.md").trim(), "");
     for path in files_under(".", false) {
         if path
             .extension()
@@ -1615,8 +1636,9 @@ fn onboarding_and_root_documentation_use_placeholder_endpoints() {
         {
             let source = std::fs::read_to_string(&path).expect("read documentation");
             let violations = production_endpoints(&source);
-            assert!(
-                violations.is_empty(),
+            assert_eq!(
+                violations,
+                [] as [&str; 0],
                 "{} has non-placeholder endpoints: {violations:?}",
                 path.display()
             );
@@ -1633,10 +1655,53 @@ fn documentation_policy_detects_non_placeholder_endpoints() {
         .len(),
         4
     );
-    assert!(
+    assert_eq!(
         production_endpoints(
             "https://feeds.example.org, 203.0.113.4, 100.64.0.1, http://[::1]:3000, [2001:db8::1]"
-        )
-        .is_empty()
+        ),
+        [] as [&str; 0]
+    );
+}
+
+#[test]
+fn in_repo_skill_is_valid_linked_and_uses_placeholder_endpoints() {
+    let skill_rel = ".agents/skills/use-ip-sync/SKILL.md";
+    assert!(repo_path(skill_rel).is_file(), "missing {skill_rel}");
+    let skill = read(skill_rel);
+    assert!(
+        skill.starts_with("---\n"),
+        "{skill_rel} must start with YAML frontmatter"
+    );
+    let frontmatter = skill
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .expect("closing YAML frontmatter delimiter")
+        .0;
+    assert!(
+        frontmatter
+            .lines()
+            .any(|line| line.trim() == "name: use-ip-sync"),
+        "{skill_rel} frontmatter must declare name: use-ip-sync"
+    );
+    assert!(
+        frontmatter
+            .lines()
+            .any(|line| line.starts_with("description:")
+                && !line["description:".len()..].trim().is_empty()),
+        "{skill_rel} frontmatter must declare a non-empty description"
+    );
+
+    for document in ["AGENT.MD", "README.md", "GOALS.md"] {
+        assert!(
+            read(document).contains(skill_rel),
+            "{document} must link to {skill_rel}"
+        );
+    }
+
+    let violations = production_endpoints(&skill);
+    assert_eq!(
+        violations,
+        [] as [&str; 0],
+        "{skill_rel} has non-placeholder endpoints: {violations:?}"
     );
 }
