@@ -146,6 +146,39 @@ pub(crate) async fn validate_feed_url(url_str: &str, allow_private: bool) -> Res
     Ok(())
 }
 
+const MAX_REDIRECTS: usize = 5;
+
+fn is_redirect_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+fn is_sensitive_auth_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("x-api-key")
+        || name.eq_ignore_ascii_case("x-signature-256")
+}
+
+fn url_origin_key(url: &reqwest::Url) -> (&str, Option<&str>, Option<u16>) {
+    (url.scheme(), url.host_str(), url.port_or_known_default())
+}
+
+async fn resolve_redirect_url(
+    current_url: &reqwest::Url,
+    location: &str,
+    allow_private_urls: bool,
+) -> Result<reqwest::Url, String> {
+    let next_url = current_url
+        .join(location)
+        .map_err(|e| format!("invalid redirect Location '{location}': {e}"))?;
+    if current_url.scheme() == "https" && next_url.scheme() != "https" {
+        return Err("blocked redirect: refusing HTTPS-to-HTTP downgrade".to_owned());
+    }
+    validate_feed_url(next_url.as_str(), allow_private_urls).await?;
+    Ok(next_url)
+}
+
 /// Fetches `source_url` (with `parser_config_json`'s `headers`/`user_agent`, if any, applied —
 /// see [`FetchOptions`]) and runs it through the `parser_type` parser, returning the raw
 /// (non-deduplicated) extracted records. This is the entire "does this feed actually work"
@@ -153,6 +186,10 @@ pub(crate) async fn validate_feed_url(url_str: &str, allow_private: bool) -> Res
 /// [`execute`] (per child feed) and the `WebUI`'s "Test Fetch" preview
 /// (`api::test_fetch_external_source`) both need; factored out once so there is exactly one
 /// implementation of the fetch/decompress/parse pipeline, not two that could quietly drift apart.
+///
+/// Follows HTTP redirects (`301`/`302`/`303`/`307`/`308`) up to [`MAX_REDIRECTS`] hops,
+/// refusing HTTPS-to-HTTP downgrades, re-running SSRF validation on every hop before issuing the
+/// next request, and stripping sensitive auth headers when a redirect crosses origins.
 ///
 /// Errors are returned as a formatted `String` rather than a typed error, matching how every
 /// caller already needs to render them.
@@ -165,13 +202,19 @@ pub(crate) async fn fetch_and_parse(
 ) -> Result<Vec<ParsedRecord>, String> {
     let source_url = source_url.trim();
     validate_feed_url(source_url, allow_private_urls).await?;
+    let mut current_url =
+        reqwest::Url::parse(source_url).map_err(|e| format!("invalid source URL: {e}"))?;
+    let mut same_origin_headers = true;
     let fetch_options = FetchOptions::from_config(parser_config_json);
-    let build_request = |http: &reqwest::Client| {
-        let mut request = http.get(source_url);
+    let build_request = |http: &reqwest::Client, url: &reqwest::Url, same_origin: bool| {
+        let mut request = http.get(url.clone());
         if let Some(user_agent) = &fetch_options.user_agent {
             request = request.header(reqwest::header::USER_AGENT, user_agent);
         }
         for (name, value) in &fetch_options.headers {
+            if !same_origin && is_sensitive_auth_header(name) {
+                continue;
+            }
             request = request.header(name, value);
         }
         request
@@ -183,9 +226,46 @@ pub(crate) async fn fetch_and_parse(
     // immediately, same as before.
     let max_retries = crate::config::outbound_max_retries();
     let mut attempt: u32 = 0;
+    let mut redirects: usize = 0;
     let response = loop {
-        match build_request(http).send().await {
+        match build_request(http, &current_url, same_origin_headers)
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => break r,
+            Ok(r) if is_redirect_status(r.status()) => {
+                if redirects >= MAX_REDIRECTS {
+                    return Err(format!(
+                        "too many redirects (exceeded {MAX_REDIRECTS} hops) while fetching '{source_url}'"
+                    ));
+                }
+                let Some(location) = r
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                else {
+                    return Err(format!(
+                        "fetch returned status {} without a valid Location header",
+                        r.status()
+                    ));
+                };
+                let next_url =
+                    resolve_redirect_url(&current_url, location, allow_private_urls).await?;
+                if url_origin_key(&current_url) != url_origin_key(&next_url) {
+                    same_origin_headers = false;
+                }
+                redirects += 1;
+                attempt = 0;
+                tracing::debug!(
+                    status = %r.status(),
+                    hop = redirects,
+                    from = %current_url,
+                    to = %next_url,
+                    same_origin_headers,
+                    "following SSRF-validated feed redirect"
+                );
+                current_url = next_url;
+            }
             Ok(r)
                 if crate::retry::is_transient_status(r.status().as_u16())
                     && attempt < max_retries =>
@@ -193,7 +273,7 @@ pub(crate) async fn fetch_and_parse(
                 attempt += 1;
                 let delay = crate::retry::backoff_with_jitter(attempt);
                 tracing::warn!(
-                    "fetching '{source_url}' returned {}; retrying in {delay:?} (attempt {attempt}/{max_retries})",
+                    "fetching '{current_url}' returned {}; retrying in {delay:?} (attempt {attempt}/{max_retries})",
                     r.status()
                 );
                 tokio::time::sleep(delay).await;
@@ -562,5 +642,69 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_feed_url("file:///etc/passwd", true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_redirect_url_validates_downgrade_ssrf_and_relative_locations() {
+        let https_public = reqwest::Url::parse("https://1.1.1.1/feeds/list.txt").unwrap();
+        let resolved_rel = resolve_redirect_url(&https_public, "/v2/list.txt", false)
+            .await
+            .unwrap();
+        assert_eq!(resolved_rel.as_str(), "https://1.1.1.1/v2/list.txt");
+
+        let resolved_abs = resolve_redirect_url(&https_public, "https://8.8.8.8/other.txt", false)
+            .await
+            .unwrap();
+        assert_eq!(resolved_abs.as_str(), "https://8.8.8.8/other.txt");
+
+        let downgrade_err = resolve_redirect_url(&https_public, "http://8.8.8.8/other.txt", false)
+            .await
+            .unwrap_err();
+        assert!(
+            downgrade_err.contains("HTTPS-to-HTTP downgrade"),
+            "expected downgrade error, got: {downgrade_err}"
+        );
+
+        for ssrf_target in [
+            "https://127.0.0.1/secret",
+            "https://169.254.169.254/latest/meta-data/",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                resolve_redirect_url(&https_public, ssrf_target, false)
+                    .await
+                    .is_err(),
+                "redirect to {ssrf_target} must be blocked"
+            );
+        }
+
+        let http_private = reqwest::Url::parse("http://127.0.0.1:8080/start").unwrap();
+        let resolved_local = resolve_redirect_url(&http_private, "/next", true)
+            .await
+            .unwrap();
+        assert_eq!(resolved_local.as_str(), "http://127.0.0.1:8080/next");
+    }
+
+    #[test]
+    fn sensitive_auth_header_and_origin_key_helpers() {
+        for name in [
+            "Authorization",
+            "authorization",
+            "Proxy-Authorization",
+            "Cookie",
+            "X-API-Key",
+            "x-signature-256",
+        ] {
+            assert!(is_sensitive_auth_header(name));
+        }
+        for name in ["User-Agent", "Accept", "X-Custom-Feed-Header"] {
+            assert!(!is_sensitive_auth_header(name));
+        }
+
+        let a = reqwest::Url::parse("https://1.1.1.1/a").unwrap();
+        let b = reqwest::Url::parse("https://1.1.1.1:443/b").unwrap();
+        let c = reqwest::Url::parse("https://1.1.1.1:8443/b").unwrap();
+        assert_eq!(url_origin_key(&a), url_origin_key(&b));
+        assert_ne!(url_origin_key(&a), url_origin_key(&c));
     }
 }

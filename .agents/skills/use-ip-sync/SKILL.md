@@ -115,6 +115,6 @@ Example RFC 5737 / 3849 records handled cleanly by these parsers: `192.0.2.10`, 
 
 ## SSRF & Anti-Bogon Guardrails
 
-- **SSRF Protection (`src/jobs/external_ingestion.rs`)**: Outbound feed fetches validate the scheme (`http`/`https`), resolve DNS before connecting, reject loopback, private (RFC 1918), link-local, CGNAT, and reserved/multicast targets, and disable automatic HTTP redirects.
+- **SSRF Protection (`src/jobs/external_ingestion.rs`)**: Outbound feed fetches validate the scheme (`http`/`https`), resolve DNS before connecting, reject loopback, private (RFC 1918), link-local, CGNAT, and reserved/multicast targets, and follow SSRF-validated HTTP redirects (`301`/`302`/`303`/`307`/`308`) up to 5 hops (rejecting HTTPS-to-HTTP downgrades, re-validating every hop before connecting, and stripping sensitive auth headers cross-origin; vault calls in `src/client.rs` still refuse redirects outright).
 - **Anti-Bogon Sanitization (`src/bogon.rs`)**: By default (`skip_bogon_filtering = false`), `bogon::sanitize` drops any parsed IP or CIDR overlapping loopback, RFC 1918, link-local, CGNAT, RFC 5737/3849 documentation nets, or multicast/reserved ranges before pushing batches to vaults.
 - **Decompression & Body Bounds (`src/jobs/decompress.rs`, `src/config.rs`)**: `MAX_DECOMPRESSED_BYTES` (default 50 MiB) is enforced mid-stream on both HTTP `Content-Encoding` and ZIP archive members.

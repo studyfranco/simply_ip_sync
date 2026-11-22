@@ -1026,3 +1026,105 @@ async fn abuseipdb_v2_json_feed_with_authenticated_headers_ingests_and_pushes_to
     let records = pushed_body["records"].as_array().expect("records array");
     assert_eq!(records.len(), 2);
 }
+
+#[tokio::test]
+async fn external_ingestion_follows_301_absolute_and_302_307_308_relative_redirects() {
+    let (conn, state, _master) = common::setup().await;
+    let feed_mock = MockServer::start().await;
+    let target_mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/start"))
+        .respond_with(
+            ResponseTemplate::new(301)
+                .insert_header("Location", format!("{}/hop2", target_mock.uri())),
+        )
+        .mount(&feed_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/hop2"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "hop3"))
+        .mount(&target_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/hop3"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/v2/hop4"))
+        .mount(&target_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/hop4"))
+        .respond_with(ResponseTemplate::new(308).insert_header("Location", "/final.txt"))
+        .mount(&target_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/final.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("93.184.216.50\n93.184.216.51\n"))
+        .mount(&target_mock)
+        .await;
+
+    let vault_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_response()))
+        .mount(&vault_mock)
+        .await;
+
+    let group_id = insert_source(
+        &conn,
+        &format!("{}/start", feed_mock.uri()),
+        "redirect-group",
+    )
+    .await;
+    let target_vault_id = insert_vault(&conn, "redirect-vault", &vault_mock.uri()).await;
+    insert_target(&conn, group_id, target_vault_id, None).await;
+
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id)
+        .await
+        .expect("ingestion run completes");
+    assert_eq!(summary.status, "SUCCESS");
+    assert_eq!(summary.items_processed, 2);
+
+    let received = vault_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert_eq!(received.len(), 1);
+}
+
+#[tokio::test]
+async fn external_ingestion_blocks_redirect_to_non_http_scheme() {
+    let (conn, state, _master) = common::setup().await;
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/evil"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "file:///etc/passwd"))
+        .mount(&feed_mock)
+        .await;
+
+    let vault_mock = MockServer::start().await;
+    let group_id = insert_source(&conn, &format!("{}/evil", feed_mock.uri()), "evil-group").await;
+    let target_vault_id = insert_vault(&conn, "evil-vault", &vault_mock.uri()).await;
+    insert_target(&conn, group_id, target_vault_id, None).await;
+
+    let summary = simply_ip_sync::jobs::external_ingestion::run(&state, group_id)
+        .await
+        .expect("ingestion run completes");
+    assert_eq!(summary.status, "FAILED");
+    let err = summary.error_message.expect("error message");
+    assert!(
+        err.contains("only http and https schemes are permitted"),
+        "expected scheme error, got: {err}"
+    );
+    assert_eq!(
+        vault_mock
+            .received_requests()
+            .await
+            .expect("recording enabled")
+            .len(),
+        0
+    );
+}

@@ -391,12 +391,222 @@ async fn private_source_url_is_blocked_when_allow_private_ingest_urls_is_false()
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "FAILED");
-    assert!(
-        feed_mock
-            .received_requests()
-            .await
-            .expect("received")
-            .is_empty(),
+    assert_eq!(
+        feed_mock.received_requests().await.expect("received").len(),
+        0,
         "SSRF guard must block loopback request before any HTTP call is sent"
     );
+}
+
+#[tokio::test]
+async fn test_fetch_follows_301_absolute_and_302_307_308_relative_redirects() {
+    let (_conn, state, master) = common::setup().await;
+    let feed_mock = MockServer::start().await;
+    let target_mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/start"))
+        .respond_with(
+            ResponseTemplate::new(301)
+                .insert_header("Location", format!("{}/hop2", target_mock.uri())),
+        )
+        .mount(&feed_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/hop2"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "hop3"))
+        .mount(&target_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/hop3"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/v2/hop4"))
+        .mount(&target_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/hop4"))
+        .respond_with(ResponseTemplate::new(308).insert_header("Location", "/final.txt"))
+        .mount(&target_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/final.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("203.0.113.10\n198.51.100.20\n"))
+        .mount(&target_mock)
+        .await;
+
+    let app = simply_ip_sync::create_app(state);
+    let (status, body) = call(
+        app,
+        &master,
+        json!({
+            "source_url": format!("{}/start", feed_mock.uri()),
+            "parser_type": "REGEX_LINE"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "SUCCESS");
+    assert_eq!(body["total_extracted"], 2);
+}
+
+#[tokio::test]
+async fn test_fetch_fails_on_too_many_redirects() {
+    let (_conn, state, master) = common::setup().await;
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/loop"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/loop"))
+        .mount(&feed_mock)
+        .await;
+
+    let app = simply_ip_sync::create_app(state);
+    let (status, body) = call(
+        app,
+        &master,
+        json!({
+            "source_url": format!("{}/loop", feed_mock.uri()),
+            "parser_type": "REGEX_LINE"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "FAILED");
+    let err = body["error"].as_str().expect("error string");
+    assert!(
+        err.contains("too many redirects"),
+        "expected too many redirects error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_fails_on_redirect_without_location_header() {
+    let (_conn, state, master) = common::setup().await;
+    let feed_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/missing-loc"))
+        .respond_with(ResponseTemplate::new(301))
+        .mount(&feed_mock)
+        .await;
+
+    let app = simply_ip_sync::create_app(state);
+    let (status, body) = call(
+        app,
+        &master,
+        json!({
+            "source_url": format!("{}/missing-loc", feed_mock.uri()),
+            "parser_type": "REGEX_LINE"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "FAILED");
+    let err = body["error"].as_str().expect("error string");
+    assert!(
+        err.contains("Location"),
+        "expected missing Location error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_cross_origin_redirect_strips_sensitive_auth_headers_and_preserves_user_agent() {
+    let (_conn, state, master) = common::setup().await;
+    let origin_a = MockServer::start().await;
+    let origin_b = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/same-hop"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/same-hop-2"))
+        .mount(&origin_a)
+        .await;
+
+    let target_url_b = format!("{}/final.txt", origin_b.uri());
+    Mock::given(method("GET"))
+        .and(path("/same-hop-2"))
+        .respond_with(move |req: &wiremock::Request| {
+            assert_eq!(
+                req.headers.get("user-agent").and_then(|v| v.to_str().ok()),
+                Some("simply_ip_sync-test/1.0")
+            );
+            assert_eq!(
+                req.headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer secret-token")
+            );
+            assert_eq!(
+                req.headers.get("cookie").and_then(|v| v.to_str().ok()),
+                Some("session=abc")
+            );
+            assert_eq!(
+                req.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+                Some("key-123")
+            );
+            assert_eq!(
+                req.headers
+                    .get("x-signature-256")
+                    .and_then(|v| v.to_str().ok()),
+                Some("sig-123")
+            );
+            ResponseTemplate::new(301).insert_header("Location", target_url_b.clone())
+        })
+        .mount(&origin_a)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/final.txt"))
+        .respond_with(|req: &wiremock::Request| {
+            assert_eq!(
+                req.headers.get("user-agent").and_then(|v| v.to_str().ok()),
+                Some("simply_ip_sync-test/1.0")
+            );
+            assert_eq!(
+                req.headers
+                    .get("x-feed-custom")
+                    .and_then(|v| v.to_str().ok()),
+                Some("keep-me")
+            );
+            for forbidden in [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "x-api-key",
+                "x-signature-256",
+            ] {
+                assert!(
+                    req.headers.get(forbidden).is_none(),
+                    "sensitive header '{forbidden}' must be stripped on cross-origin redirect"
+                );
+            }
+            ResponseTemplate::new(200).set_body_string("203.0.113.55\n")
+        })
+        .mount(&origin_b)
+        .await;
+
+    let app = simply_ip_sync::create_app(state);
+    let (status, body) = call(
+        app,
+        &master,
+        json!({
+            "source_url": format!("{}/same-hop", origin_a.uri()),
+            "parser_type": "REGEX_LINE",
+            "parser_config_json": serde_json::to_string(&json!({
+                "user_agent": "simply_ip_sync-test/1.0",
+                "headers": {
+                    "Authorization": "Bearer secret-token",
+                    "Proxy-Authorization": "Basic cHJveHk=",
+                    "Cookie": "session=abc",
+                    "X-API-Key": "key-123",
+                    "X-Signature-256": "sig-123",
+                    "X-Feed-Custom": "keep-me"
+                }
+            })).expect("config json")
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "SUCCESS");
+    assert_eq!(body["total_extracted"], 1);
 }

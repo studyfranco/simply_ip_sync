@@ -813,3 +813,70 @@ async fn audit_logs_until_filter_is_inclusive() {
             .all(|row| row["timestamp"] == "2026-11-22T12:00:00.123Z")
     );
 }
+
+#[tokio::test]
+async fn vault_client_refuses_redirects_on_post_batch_and_get_ips_delta() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/records/batch"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/redirected"))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/ips"))
+        .respond_with(ResponseTemplate::new(301).insert_header("Location", "/redirected"))
+        .mount(&mock_server)
+        .await;
+    Mock::given(path("/redirected"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let cipher = simply_ip_sync::crypto::SecretCipher::Plaintext;
+    let sealed_secret = cipher.seal("vault-redirect-test-secret").expect("seal");
+    let endpoint = simply_ip_sync::entities::vault_endpoint::Model {
+        id: uuid::Uuid::new_v4(),
+        name: "RedirectingVault".to_owned(),
+        target_url: mock_server.uri(),
+        api_key: "remote-key".to_owned(),
+        signing_secret: sealed_secret,
+        description: None,
+        owner_key_id: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
+    };
+    let http = simply_ip_sync::client::build_http_client().expect("http client");
+
+    let batch_err = simply_ip_sync::client::post_batch(
+        &http,
+        &cipher,
+        &endpoint,
+        "test-group",
+        &[],
+        simply_ip_sync::client::BatchMode::FullReplace,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        batch_err.to_string().contains("302"),
+        "expected 302 rejection on post_batch, got: {batch_err}"
+    );
+
+    let delta_err =
+        simply_ip_sync::client::get_ips_delta(&http, &cipher, &endpoint, "test-group", None, true)
+            .await
+            .unwrap_err();
+    assert!(
+        delta_err.to_string().contains("301"),
+        "expected 301 rejection on get_ips_delta, got: {delta_err}"
+    );
+
+    let received = mock_server
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    assert!(
+        received.iter().all(|req| req.url.path() != "/redirected"),
+        "vault client must never follow redirects"
+    );
+}
