@@ -17,7 +17,7 @@ description: Operate, configure, and troubleshoot simply_ip_sync via its CANONIC
 ## `CANONICAL_V1` Request Signing & `OriginalUri`
 
 Every `/api/*` request is verified by `src/middleware.rs` using `OriginalUri`:
-- `TARGET` is the **exact, unrewritten request path and query string** as received by the router (e.g. `/api/sync-logs?job_type=INGESTION&limit=20`). If a reverse proxy strips a subpath prefix before forwarding, `TARGET` is the post-strip path.
+- `TARGET` is the **exact, unrewritten request path and query string** as received by the router (e.g. `/api/sync-logs?job_type=EXTERNAL_FEED&limit=20`). If a reverse proxy strips a subpath prefix before forwarding, `TARGET` is the post-strip path.
 - Canonical string (`METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`, no trailing newline):
   ```sh
   API_KEY="<64-hex-char key>"
@@ -62,9 +62,16 @@ Every `/api/*` request is verified by `src/middleware.rs` using `OriginalUri`:
   "mode": "upsert",
   "is_active": true,
   "skip_bogon_filtering": false,
-  "target_vault_ids": ["<vault-uuid>"]
+  "targets": [
+    {
+      "vault_endpoint_id": "<vault-uuid>",
+      "target_group_name": null
+    }
+  ]
 }
 ```
+- `targets` is a list of `{ "vault_endpoint_id": "<uuid>", "target_group_name": "<optional-override-or-null>" }` objects (`null` falls back to the group's `target_group_name`). Both `CreateDestinationGroupPayload` and `UpdateDestinationGroupPayload` use `#[serde(deny_unknown_fields)]`.
+- Manage groups with `GET /api/destination-groups`, `GET /api/destination-groups/{id}`, `PATCH /api/destination-groups/{id}`, and `DELETE /api/destination-groups/{id}`.
 
 ### 3. Dry-Run a Feed Before Saving (`POST /api/sources/test-fetch`)
 ```json
@@ -76,10 +83,27 @@ Every `/api/*` request is verified by `src/middleware.rs` using `OriginalUri`:
 ```
 Returns normalized sample records, parse counts, and any SSRF/fetch/parse errors without persisting a feed row.
 
-### 4. Attach a Feed & Trigger Ingestion
-- `POST /api/destination-groups/{group_id}/feeds` with `name`, `source_url`, `parser_type` (`REGEX_LINE` or `JSON_PATH`), optional `parser_config_json`, optional `max_age_days`, optional `skip_bogon_filtering`.
-- `POST /api/destination-groups/{id}/trigger` to run all feeds in the group immediately.
-- `GET /api/sync-logs?job_type=INGESTION&limit=20` to inspect execution status (`SUCCESS`, `PARTIAL`, `FAILED`), `items_processed`, and `error_message`.
+### 4. Feed CRUD, Formats & Triggering Ingestion
+- **Create a feed (`POST /api/destination-groups/{group_id}/feeds`)**:
+  ```json
+  {
+    "name": "problematics_ips_threatlist",
+    "source_url": "https://feeds.example.org/threatlist.json",
+    "parser_type": "JSON_PATH",
+    "parser_config_json": "{\"jsonl\":true,\"target_address\":\"$.cidr\",\"last_seen_at\":\"$.lastseen\"}",
+    "max_age_days": 30,
+    "skip_bogon_filtering": null
+  }
+  ```
+  - Fields (`CreateFeedPayload`, `#[serde(deny_unknown_fields)]`): `name`, `source_url`, `parser_type` (`"REGEX_LINE"` default or `"JSON_PATH"`), optional `parser_config_json` (mandatory for `JSON_PATH`), optional `max_age_days` (positive integer; requires a `JSON_PATH` `last_seen_at` selector), optional `skip_bogon_filtering` (`null` inherits the owning group's setting).
+  - **Global uniqueness of feed `name`**: Feed `name` is **globally unique across all destination groups** (enforced on `external_sources.name`). When adding the same upstream feed to multiple destination groups, prefix or namespace the feed `name` (e.g. `group_a_feodo_tracker`, `group_b_feodo_tracker`).
+- **Update / delete feeds**: `PATCH /api/destination-groups/{group_id}/feeds/{feed_id}` (`UpdateFeedPayload`, `#[serde(deny_unknown_fields)]`) and `DELETE /api/destination-groups/{group_id}/feeds/{feed_id}`.
+- **Formats & archives**:
+  - `JSON_PATH` supports `"jsonl": true` for newline-delimited JSON feeds (one JSON object per line, no enclosing array, omitting `array_path` — e.g. `{"jsonl":true,"target_address":"$.cidr"}`). Lines missing `target_address` (such as metadata footers) are silently skipped.
+  - `.zip` archives downloaded from `source_url` are transparently extracted (`src/jobs/decompress.rs`), concatenating all non-directory members with newlines before passing the bytes to `REGEX_LINE` or `JSON_PATH` (bounded by `MAX_DECOMPRESSED_BYTES`).
+- **Trigger & inspect logs**:
+  - `POST /api/destination-groups/{id}/trigger` to run all feeds in the group immediately.
+  - `GET /api/sync-logs?job_type=EXTERNAL_FEED&limit=20` to inspect execution history. Valid `job_type` values: `"EXTERNAL_FEED"`, `"VAULT_SYNC"`. Valid `status` values: `"SUCCESS"`, `"FAILED"`, `"PARTIAL"`. Optional filters: `job_id`, `status`, `limit`, `offset`.
 
 ### 5. Inter-Vault Delta Replication (`POST /api/sync-tasks`)
 ```json
@@ -91,10 +115,15 @@ Returns normalized sample records, parse counts, and any SSRF/fetch/parse errors
   "cron_schedule": "*/15 * * * *",
   "is_active": true,
   "skip_bogon_filtering": false,
-  "target_vault_ids": ["<target-vault-uuid>"]
+  "targets": [
+    {
+      "vault_endpoint_id": "<target-vault-uuid>",
+      "target_group_name": null
+    }
+  ]
 }
 ```
-- Trigger immediately with `POST /api/sync-tasks/{id}/trigger`.
+- Manage sync tasks with `GET /api/sync-tasks`, `GET /api/sync-tasks/{id}`, `PATCH /api/sync-tasks/{id}`, `DELETE /api/sync-tasks/{id}`, and trigger immediately with `POST /api/sync-tasks/{id}/trigger`.
 - Inspect `GET /api/audit-logs` (Master-only) and `GET /api/settings` for runtime configuration.
 
 ## Curated Threat-Intel Feed Catalog (`Problematics IPS`)
