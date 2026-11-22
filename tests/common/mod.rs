@@ -392,31 +392,23 @@ impl MockVault {
     /// Canonical addresses in `group` that are currently tombstoned.
     #[must_use]
     pub fn deleted_addresses(&self, group: &str) -> Vec<String> {
-        self.lock()
-            .groups
-            .get(group)
-            .map(|g| {
-                g.values()
-                    .filter(|r| r.is_deleted)
-                    .map(|r| r.target_address.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.lock().groups.get(group).map_or_default(|g| {
+            g.values()
+                .filter(|r| r.is_deleted)
+                .map(|r| r.target_address.clone())
+                .collect()
+        })
     }
 
     /// Canonical addresses in `group` that are currently live.
     #[must_use]
     pub fn live_addresses(&self, group: &str) -> Vec<String> {
-        self.lock()
-            .groups
-            .get(group)
-            .map(|g| {
-                g.values()
-                    .filter(|r| !r.is_deleted)
-                    .map(|r| r.target_address.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.lock().groups.get(group).map_or_default(|g| {
+            g.values()
+                .filter(|r| !r.is_deleted)
+                .map(|r| r.target_address.clone())
+                .collect()
+        })
     }
 
     /// Every `GET /api/ips` this vault has served, in order.
